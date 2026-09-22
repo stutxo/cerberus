@@ -113,7 +113,7 @@ use bitcoin::{
 };
 use bitcoin::taproot::TapTweakHash;
 use bitcoin::secp256k1::{schnorr, Keypair, PublicKey};
-use bitcoin_ext::{fee, P2TR_DUST, TxOutExt};
+use bitcoin_ext::{fee, P2TR_DUST, TaprootSpendInfoExt, TxOutExt};
 use secp256k1_musig::musig::PublicNonce;
 
 use crate::{musig, scripts, Vtxo, VtxoId, ServerVtxo};
@@ -1024,13 +1024,8 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 		input: &Vtxo<G>,
 		outputs: &[ArkoorDestination],
 		dust_isolation_amount: Option<Amount>,
+		checkpoint_spk: &bitcoin::Script,
 	) -> Transaction {
-
-		// All outputs on the checkpoint transaction will use exactly the same policy.
-		let output_policy = ServerVtxoPolicy::new_checkpoint(input.user_pubkey());
-		let checkpoint_spk = output_policy
-			.script_pubkey(input.server_pubkey(), input.exit_delta(), input.expiry_height());
-
 		Transaction {
 			version: bitcoin::transaction::Version(3),
 			lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -1043,14 +1038,14 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 			output: outputs.iter().map(|o| {
 				TxOut {
 					value: o.total_amount,
-					script_pubkey: checkpoint_spk.clone(),
+					script_pubkey: checkpoint_spk.to_owned(),
 				}
 			})
 				// add dust isolation output when required
 				.chain(dust_isolation_amount.map(|amt| {
 					TxOut {
 						value: amt,
-						script_pubkey: checkpoint_spk.clone(),
+						script_pubkey: checkpoint_spk.to_owned(),
 					}
 				}))
 				.chain([fee::fee_anchor()]).collect()
@@ -1062,6 +1057,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 		outputs: &[ArkoorDestination],
 		checkpoint_txid: Option<Txid>,
 		dust_isolation_amount: Option<Amount>,
+		checkpoint_spk: &bitcoin::Script,
 	) -> Vec<Transaction> {
 
 		if let Some(checkpoint_txid) = checkpoint_txid {
@@ -1094,13 +1090,6 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 			arkoor_txs
 		} else {
 			// Direct mode: create single arkoor tx with all outputs + optional isolation output
-			let checkpoint_policy = ServerVtxoPolicy::new_checkpoint(input.user_pubkey());
-			let checkpoint_spk = checkpoint_policy.script_pubkey(
-				input.server_pubkey(),
-				input.exit_delta(),
-				input.expiry_height()
-			);
-
 			let transaction = Transaction {
 				version: bitcoin::transaction::Version(3),
 				lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -1120,7 +1109,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 					// Add isolation output if dust is present
 					.chain(dust_isolation_amount.map(|amt| TxOut {
 						value: amt,
-						script_pubkey: checkpoint_spk.clone(),
+						script_pubkey: checkpoint_spk.to_owned(),
 					}))
 					.chain([fee::fee_anchor()])
 					.collect()
@@ -1384,12 +1373,26 @@ impl ArkoorBuilder<state::Initial> {
 			None
 		};
 
+		// Derive each policy once for both its transaction outputs and signing tweak.
+		let input_taproot = input.output_taproot();
+		let input_tweak = input_taproot.tap_tweak();
+		let input_txout = TxOut {
+			value: input.amount(),
+			script_pubkey: input_taproot.script_pubkey(),
+		};
+		let checkpoint_taproot = ServerVtxoPolicy::new_checkpoint(input.user_pubkey()).taproot(
+			input.server_pubkey(), input.exit_delta(), input.expiry_height(),
+		);
+		let checkpoint_policy_tweak = checkpoint_taproot.tap_tweak();
+		let checkpoint_spk = checkpoint_taproot.script_pubkey();
+
 		// Conditionally construct checkpoint transaction
 		let unsigned_checkpoint_tx = if use_checkpoint {
 			let tx = Self::construct_unsigned_checkpoint_tx(
 				&input,
 				&outputs,
 				combined_dust_amount,
+				&checkpoint_spk,
 			);
 			let txid = tx.compute_txid();
 			Some((tx, txid))
@@ -1403,6 +1406,7 @@ impl ArkoorBuilder<state::Initial> {
 			&outputs,
 			unsigned_checkpoint_tx.as_ref().map(|t| t.1),
 			combined_dust_amount,
+			&checkpoint_spk,
 		);
 
 		// Construct dust fanout tx if dust isolation is needed
@@ -1439,7 +1443,7 @@ impl ArkoorBuilder<state::Initial> {
 
 		if let Some((checkpoint_tx, _txid)) = &unsigned_checkpoint_tx {
 			// Checkpoint signature
-			sighashes.push(arkoor_sighash(&input.txout(), checkpoint_tx));
+			sighashes.push(arkoor_sighash(&input_txout, checkpoint_tx));
 
 			// Arkoor transaction signatures (one per tx)
 			for vout in 0..outputs.len() {
@@ -1448,7 +1452,7 @@ impl ArkoorBuilder<state::Initial> {
 			}
 		} else {
 			// Single direct arkoor transaction signature
-			sighashes.push(arkoor_sighash(&input.txout(), &unsigned_arkoor_txs[0]));
+			sighashes.push(arkoor_sighash(&input_txout, &unsigned_arkoor_txs[0]));
 		}
 
 		// Add dust sighash
@@ -1462,15 +1466,6 @@ impl ArkoorBuilder<state::Initial> {
 			};
 			sighashes.push(arkoor_sighash(&prevout, tx));
 		}
-
-		// Compute taptweaks
-		let policy = ServerVtxoPolicy::new_checkpoint(input.user_pubkey());
-		let input_tweak = input.output_taproot().tap_tweak();
-		let checkpoint_policy_tweak = policy.taproot(
-			input.server_pubkey(),
-			input.exit_delta(),
-			input.expiry_height(),
-		).tap_tweak();
 
 		Ok(Self {
 			input: input,
