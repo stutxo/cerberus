@@ -599,11 +599,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 					GenesisItem {
 						transition: GenesisTransition::new_arkoor(
 							vec![self.input.user_pubkey()],
-							self.input.policy().taproot(
-								self.input.server_pubkey,
-								self.input.exit_delta,
-								self.input.expiry_height,
-							).tap_tweak(),
+							self.input_tweak,
 							checkpoint_sig,
 						),
 						output_idx: u8::try_from(output_idx).expect("arkoor output index fits in u8"),
@@ -634,7 +630,6 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 
 		if let Some((checkpoint_tx, _txid)) = &self.checkpoint_data {
 			// Two-transition genesis: Input → Checkpoint → Arkoor
-			let checkpoint_policy = ServerVtxoPolicy::new_checkpoint(self.input.user_pubkey());
 
 			Vtxo {
 				amount: output.total_amount,
@@ -649,11 +644,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 						GenesisItem {
 							transition: GenesisTransition::new_arkoor(
 								vec![self.input.user_pubkey()],
-								self.input.policy.taproot(
-									self.input.server_pubkey,
-									self.input.exit_delta,
-									self.input.expiry_height,
-								).tap_tweak(),
+								self.input_tweak,
 								checkpoint_sig,
 							),
 							output_idx: u8::try_from(output_idx).expect("arkoor output index fits in u8"),
@@ -672,11 +663,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 						GenesisItem {
 							transition: GenesisTransition::new_arkoor(
 								vec![self.input.user_pubkey()],
-								checkpoint_policy.taproot(
-									self.input.server_pubkey,
-									self.input.exit_delta,
-									self.input.expiry_height,
-								).tap_tweak(),
+								self.checkpoint_policy_tweak,
 								arkoor_sig,
 							),
 							output_idx: 0,
@@ -703,11 +690,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 						GenesisItem {
 							transition: GenesisTransition::new_arkoor(
 								vec![self.input.user_pubkey()],
-								self.input.policy.taproot(
-									self.input.server_pubkey,
-									self.input.exit_delta,
-									self.input.expiry_height,
-								).tap_tweak(),
+								self.input_tweak,
 								arkoor_sig,
 							),
 							output_idx: u8::try_from(output_idx).expect("arkoor output index fits in u8"),
@@ -743,7 +726,6 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 		isolation_fanout_tx_sig: Option<schnorr::Signature>,
 	) -> Vtxo<Full> {
 		let output = &self.isolated_outputs[isolated_idx];
-		let checkpoint_policy = ServerVtxoPolicy::new_checkpoint(self.input.user_pubkey());
 
 		let fanout_tx = self.unsigned_isolation_fanout_tx.as_ref()
 			.expect("construct_dust_vtxo_at called without dust isolation");
@@ -767,11 +749,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 						GenesisItem {
 							transition: GenesisTransition::new_arkoor(
 								vec![self.input.user_pubkey()],
-								self.input.policy.taproot(
-									self.input.server_pubkey,
-									self.input.exit_delta,
-									self.input.expiry_height,
-								).tap_tweak(),
+								self.input_tweak,
 								pre_fanout_tx_sig,
 							),
 							output_idx: u8::try_from(dust_isolation_output_idx).expect("arkoor output index fits in u8"),
@@ -794,11 +772,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 						GenesisItem {
 							transition: GenesisTransition::new_arkoor(
 								vec![self.input.user_pubkey()],
-								checkpoint_policy.taproot(
-									self.input.server_pubkey,
-									self.input.exit_delta,
-									self.input.expiry_height,
-								).tap_tweak(),
+								self.checkpoint_policy_tweak,
 								isolation_fanout_tx_sig,
 							),
 							output_idx: u8::try_from(isolated_idx).expect("arkoor output index fits in u8"),
@@ -837,11 +811,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 						GenesisItem {
 							transition: GenesisTransition::new_arkoor(
 								vec![self.input.user_pubkey()],
-								self.input.policy.taproot(
-									self.input.server_pubkey,
-									self.input.exit_delta,
-									self.input.expiry_height,
-								).tap_tweak(),
+								self.input_tweak,
 								pre_fanout_tx_sig,
 							),
 							output_idx: u8::try_from(dust_isolation_output_idx).expect("arkoor output index fits in u8"),
@@ -861,11 +831,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 						GenesisItem {
 							transition: GenesisTransition::new_arkoor(
 								vec![self.input.user_pubkey()],
-								checkpoint_policy.taproot(
-									self.input.server_pubkey,
-									self.input.exit_delta,
-									self.input.expiry_height,
-								).tap_tweak(),
+								self.checkpoint_policy_tweak,
 								isolation_fanout_tx_sig,
 							),
 							output_idx: u8::try_from(isolated_idx).expect("arkoor output index fits in u8"),
