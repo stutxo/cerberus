@@ -395,6 +395,22 @@ pub trait WalletExt: BorrowMut<Wallet> {
 		let wallet = self.borrow_mut();
 		let (fee_anchor_point, fee_anchor_txout) = tx.fee_anchor()
 			.ok_or_else(|| CpfpInternalError::NoFeeAnchor(tx.compute_txid()))?;
+		// Reuse the confirmed fee inputs of our pending child. Starting a new
+		// coin selection excludes those already-spent coins and can prevent RBF
+		// when the wallet has only one fee-funding UTXO.
+		let replacement = if matches!(fees, MakeCpfpFees::Rbf { .. }) {
+			wallet.transactions().find(|pending| {
+				pending.tx_node.tx.input.iter().any(|input| input.previous_output == fee_anchor_point)
+					&& wallet.sent_and_received(&pending.tx_node.tx).0 > Amount::ZERO
+			}).map(|pending| pending.tx_node.tx.compute_txid())
+		} else {
+			None
+		};
+		if replacement.is_some() {
+			// Fee-bump construction needs the external parent to calculate the
+			// old child's fee because the child spends its P2A anchor.
+			wallet.apply_unconfirmed_txs([(tx.clone(), 0)]);
+		}
 
 		// Since BDK doesn't support adding extra weight for fees, we have to loop to achieve the
 		// effective fee rate and potential minimum fee we need.
@@ -411,8 +427,14 @@ pub trait WalletExt: BorrowMut<Wallet> {
 		for i in 0..100 {
 			// The change is this transaction's only output, so use a coin selection that
 			// guarantees it stays above the dust limit.
-			let mut b = wallet.build_tx()
-				.coin_selection(WithGuaranteedChange(DefaultCoinSelectionAlgorithm::default()));
+			let mut b = match replacement {
+				Some(txid) => wallet.build_fee_bump(txid)
+					.map_err(|e| CpfpInternalError::General(format!("can't replace fee child {txid}: {e}")))?
+					.coin_selection(WithGuaranteedChange(DefaultCoinSelectionAlgorithm::default())),
+				None => wallet.build_tx()
+					.coin_selection(WithGuaranteedChange(DefaultCoinSelectionAlgorithm::default())),
+			};
+			b.set_recipients(Vec::new());
 			b.only_witness_utxo();
 			b.exclude_unconfirmed();
 			b.version(3); // for 1p1c package relay, all inputs must be confirmed
@@ -441,8 +463,15 @@ pub trait WalletExt: BorrowMut<Wallet> {
 				"Missing anchor spend, tx is {}", serialize_hex(&tx),
 			);
 
-			// We can finally check the fees and weight
+			// We can finally check the fees and weight. A v3 parent may have only
+			// one v3 child, and that child may not exceed 1000 vB.
 			let tx_weight = tx.weight();
+			if tx.version == bitcoin::transaction::Version(3)
+				&& tx_weight > Weight::from_vb(1_000).expect("valid TRUC child limit") {
+				return Err(CpfpInternalError::General(format!(
+					"TRUC CPFP child weight {tx_weight} exceeds the 1000-vB package limit",
+				)));
+			}
 			let total_weight = tx_weight + parent_weight;
 			if tx_weight != final_child_weight {
 				// Since the weight changed, we can drop the transaction and recalculate the
