@@ -39,6 +39,7 @@ bark-wallet = { version = "0.7.1", path = "../bark", default-features = false, f
 bark-bitcoin-ext = { version = "0.7.1", path = "../bitcoin-ext", features = ["rpc-socks5-proxy"] }
 bark-server-rpc = { version = "0.7.1", path = "../server-rpc", default-features = false, features = ["tonic-native", "socks5-proxy"] }
 bark-rest = { version = "0.7.1", path = "../bark-rest", default-features = false }
+bark-btc-ark-swap = { version = "0.7.1", path = "../bark-btc-ark-swap" }
 
 anyhow.workspace = true
 bitcoin.workspace = true

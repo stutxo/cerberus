@@ -1,0 +1,4 @@
+- Add private three-message BTC-Ark adaptor swaps
+  Bob can exchange BTC for Ark VTXOs without a swap-aware Ark server, while both wallets retain automatic claim, refund, and unilateral recovery paths. The flow uses durable nonce/transcript pinning, fixed-height refunds, live Ark ancestry checks, CPFP/RBF fee management, and ordinary operator-visible arkoor requests only.
+  [#2](https://github.com/stutxo/cerberus/pull/2)
+  - **BREAKING:** Replaces the legacy swap commands and rejects legacy relay/state files; unfinished legacy swaps cannot be migrated.
