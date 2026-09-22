@@ -16,6 +16,7 @@ members = [
   "cln-rpc",
   "bark-rest-client",
   "bip321",
+  "bark-btc-ark-swap",
   "wasm-testing"
 ]
 

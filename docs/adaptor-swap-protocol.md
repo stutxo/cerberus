@@ -1,383 +1,301 @@
-# Bark BTC-Ark Swap Protocol
-
-This document specifies the BTC-for-Ark VTXO swap implemented by
-`bark swap btc-ark`.
-
-The protocol lets Bob pay BTC on-chain and receive an Ark VTXO from Alice. Alice
-receives BTC only by revealing the adaptor secret Bob needs to complete the Ark
-receive. If either party stops before that reveal, the other party has an
-on-chain recovery path.
-
-This is a client-only protocol. The Ark server is not modified and is not told
-that a swap is happening. It sees ordinary Ark wallet operations: an
-adaptor-locked arkoor package, transaction-chain registration, and possible
-emergency exits.
-
-## TLDR Flow
-
-1. Alice chooses adaptor secret `t` and publishes only `T = t*G`.
-2. Bob funds the BTC lock.
-3. Alice creates an Ark transfer with public nonces already adapted to `T`; the
-   Ark server co-signs those nonces.
-4. Bob accepts the adaptor-locked Ark package and gives Alice a BTC claim
-   adaptor signature locked to `T`.
-5. Alice claims BTC with `t`; Bob recovers `t` from that BTC signature and uses
-   it to finalize the Ark receive.
-
-## Security Summary
-
-Under the assumptions below, neither party can steal the other party's principal:
-
-- Alice cannot take Bob's BTC without revealing the adaptor secret `t`.
-- Bob cannot complete the Ark receive without learning `t`.
-- If Alice never reveals `t`, Bob refunds the BTC lock after its CSV delay.
-- If Bob stalls before `t` is revealed, Alice can abort by starting emergency
-  exits for the original Ark input VTXOs.
-- If Alice reveals `t` and then tries an old-state Ark exit, Bob has the Ark
-  `vtxo_exit_delta` response window to complete, register, and import the Ark
-  transfer.
-
-This is not grief-free. Either party can force the other into delay, monitoring,
-and on-chain fees. The atomicity property is "no counterparty rug with correct
-monitoring and fallback execution", not "instant off-chain rollback".
-
-## Roles
-
-- Alice: `ark_payer`. Pays an Ark VTXO and receives BTC on-chain.
-- Bob: `btc_payer`. Funds a BTC Taproot lock and receives an Ark VTXO.
-
-## Notation
-
-- `t`: Alice's adaptor secret.
-- `T = t*G`: Alice's public adaptor point.
-- `A_btc`: Alice's BTC claim public key.
-- `B_btc`: Bob's BTC claim public key.
-- `K = MuSig2(A_btc, B_btc)`: aggregate BTC claim public key.
-- `refund_key`: Bob's BTC refund key.
-- `refund_delay`: CSV delay on Bob's BTC refund path.
-- `exit_delta`: Ark VTXO unilateral-exit delay.
-- `ark_inputs`: Alice's original Ark input VTXOs selected for the transfer.
-- `ark_transfer`: adaptor-locked arkoor transfer package.
-
-## BTC Lock
-
-Bob funds a Taproot output with:
-
-- Key path: cooperative MuSig2 spend by `K = MuSig2(A_btc, B_btc)`.
-- Script path: Bob's `refund_key` after `refund_delay`.
-
-Alice has no unilateral BTC spend. Bob has no key-path spend without Alice's
-MuSig2 participation.
-
-The cooperative BTC claim transaction pays Alice's requested BTC payout script.
-Bob creates a MuSig2 adaptor signature for that exact transaction, locked to
-Alice's adaptor point `T`. Alice can finalize the BTC claim only with `t`, and
-the final Schnorr signature lets Bob recover `t`.
-
-## Ark Transfer
-
-Alice creates an adaptor-locked arkoor package that pays Bob's Ark receive
-policy. The package contains server partial signatures and Alice adaptor
-pre-signatures, but not final signatures. Bob can only finalize the received
-VTXO package with `t`.
-
-The Ark transfer sets up the adaptor lock before server co-signing. For each
-arkoor/checkpoint signature, Alice publishes a user public nonce whose first
-nonce point is offset by `T` and keeps the corresponding secret nonce local. The
-Ark server co-signs against those already-adapted public nonces. Alice then
-combines the server partial signatures with her secret nonces into adaptor
-pre-signatures. Those pre-signatures are safe to send to Bob because they verify
-only as adaptor pre-signatures against `T`; they do not become valid Ark
-transaction signatures until Bob learns `t`.
-
-When Alice prepares the transfer, her client stores:
-
-- The commitment hash of the accepted `ark_transfer`.
-- The original Ark input VTXO IDs.
-- Her adaptor secret `t`.
-
-Her client also locks the original inputs locally so they are not accidentally
-selected for another spend while the swap is pending.
-
-## Relay Artifacts
-
-The current POC uses a JSON relay file. The relay file is public coordination
-data and must never contain mnemonics, secret nonces, or adaptor secrets.
-
-- `request`: Bob's amount, Ark receive address, BTC claim public key, BTC
-  refund key, fee rate, and refund delay.
-- `terms`: Alice's BTC payout script, BTC claim public key, and adaptor point
-  `T`.
-- `btc_funding`: Bob's BTC lock funding transaction data.
-- `claim_request`: unsigned BTC claim transaction, sighash, tap tweak, and Bob's
-  BTC claim nonce.
-- `ark_transfer`: adaptor-locked arkoor package plus public offer metadata.
-- `ark_claim_partial`: Alice's BTC claim nonce and partial signature.
-- `btc_claim_adaptor`: Bob's BTC claim adaptor signature package.
-- `btc_refund`: Bob's BTC refund transaction, if the refund path is used.
-
-The relay status is only coordination state. It is not a security boundary. Each
-client must verify local pinned state and chain state.
-
-## Happy Path
-
-Funding preconditions:
-
-- Bob, the BTC payer, must have enough on-chain BTC to fund the BTC lock and
-  pay the funding transaction fee.
-- Alice, the Ark payer, must have enough spendable Ark VTXOs to create the
-  adaptor-locked Ark transfer.
-
-### 1. Bob Creates A Request
-
-Bob chooses:
-
-- Swap amount.
-- Ark receive address.
-- BTC claim public key `B_btc`.
-- BTC refund key.
-- BTC fee rate.
-- BTC refund delay.
-
-Bob writes `request` and local `BtcPayer` state.
-
-Command:
-
-```sh
-bark swap btc-ark btc-request \
-  --coordinator "$RELAY" \
-  --amount "$AMOUNT" \
-  --ark-receive "$BOB_ARK_RECEIVE" \
-  --fee-rate "$FEE_RATE" \
-  --refund-delay "$REFUND_DELAY"
-```
-
-### 2. Alice Publishes Terms
-
-Alice verifies Bob's Ark receive address. She chooses:
-
-- BTC payout address.
-- BTC claim public key `A_btc`.
-- Adaptor secret `t`, publishing only `T`.
-
-Alice writes `terms` and local `ArkPayer` state.
-
-Command:
-
-```sh
-bark swap btc-ark ark-offer \
-  --coordinator "$RELAY" \
-  --swap "$SWAP_ID" \
-  --btc-payout "$ALICE_BTC_PAYOUT"
-```
-
-### 3. Bob Funds The BTC Lock
-
-Bob verifies Alice's terms, constructs the Taproot lock, broadcasts the funding
-transaction, and constructs the exact cooperative BTC claim transaction.
-
-Bob stores the BTC claim nonce locally and writes `btc_funding` plus
-`claim_request`.
-
-Command:
-
-```sh
-bark swap btc-ark btc-fund \
-  --coordinator "$RELAY" \
-  --swap "$SWAP_ID"
-```
-
-### 4. Alice Creates The Adaptor-Locked Ark Transfer
-
-Alice waits for the BTC lock to confirm. She verifies:
-
-- The BTC lock pays the expected Taproot contract.
-- The claim transaction pays her expected BTC payout script.
-- The claim sighash matches the expected transaction and Taproot tweak.
-
-Alice then creates an adaptor-locked arkoor transfer to Bob's Ark receive policy
-using adaptor point `T`. This is the first Ark-side step that consumes the
-original inputs from the server's perspective. Bob still cannot import the
-outputs because the package is only adaptor-signed.
-
-Alice stores the accepted transfer hash and original input IDs locally, locks
-the inputs locally, and writes `ark_transfer`.
-
-Command:
-
-```sh
-bark swap btc-ark ark-transfer \
-  --coordinator "$RELAY" \
-  --swap "$SWAP_ID"
-```
-
-### 5. Alice Signs Her BTC Claim Partial
-
-Alice signs a MuSig2 partial signature for the exact BTC claim transaction and
-Bob's published BTC claim nonce. This does not reveal `t`.
-
-Command:
-
-```sh
-bark swap btc-ark ark-sign-btc-claim \
-  --coordinator "$RELAY" \
-  --swap "$SWAP_ID"
-```
-
-### 6. Bob Builds The BTC Claim Adaptor Signature
-
-Bob verifies the Ark transfer before accepting it:
-
-- The transfer package matches the offered amount and BTC payout script.
-- The transfer pays Bob's Ark receive policy.
-- The server pubkey and adaptor point match the terms.
-- The output VTXOs expire after the BTC refund window.
-- The transfer package hash matches Bob's locally pinned state once accepted.
-
-Bob then combines Alice's BTC claim partial with his secret nonce into a BTC
-claim adaptor signature package bound to `T`. After building the adaptor
-package, Bob no longer needs the secret nonce for refund safety.
-
-Command:
-
-```sh
-bark swap btc-ark btc-build-claim-adaptor \
-  --coordinator "$RELAY" \
-  --swap "$SWAP_ID"
-```
-
-### 7. Alice Claims BTC And Reveals `t`
-
-Alice verifies Bob's adaptor package:
-
-- The adaptor pre-signature verifies against `T`.
-- The sighash matches the pinned BTC claim transaction.
-- The aggregate key matches the Taproot BTC lock key.
-
-Alice finalizes the BTC claim signature with `t` and broadcasts the BTC claim.
-The published final Schnorr signature reveals `t` to Bob.
-
-Command:
-
-```sh
-bark swap btc-ark ark-finalize-btc-claim \
-  --coordinator "$RELAY" \
-  --swap "$SWAP_ID"
-```
-
-### 8. Bob Completes The Ark Receive
-
-Bob watches for the BTC claim transaction. Once it is visible, Bob recovers `t`
-from the final BTC signature and his adaptor package. Bob finalizes the
-adaptor-locked Ark transfer, registers the signed transaction chain with the Ark
-server, and imports the received Ark VTXO.
-
-Command:
-
-```sh
-bark swap btc-ark btc-complete-ark \
-  --coordinator "$RELAY" \
-  --swap "$SWAP_ID"
-```
-
-Bob should run this promptly after Alice's BTC claim becomes visible. If Alice
-maliciously attempts to exit old Ark state after revealing `t`, Bob's practical
-response window is until Alice's old exit confirms plus the Ark `exit_delta`.
-For example, with `vtxo_exit_delta = 144`, Bob has roughly 144 blocks after that
-old exit confirms. This window is a fallback margin, not the intended response
-time.
-
-Check the server's value:
-
-```sh
-bark ark-info | jq '.vtxo_exit_delta'
-```
-
-## Abort Paths
-
-### Bob Stops Before Funding
-
-No funds are locked. Either party can discard the relay.
-
-### Alice Stops After Offer
-
-No Ark funds are spent. Bob should not fund until he has verified terms. Either
-party can discard the relay.
-
-### Alice Stops After BTC Funding, Before Ark Transfer
-
-Bob waits until the BTC lock refund path matures and refunds:
-
-```sh
-bark swap btc-ark btc-refund \
-  --coordinator "$RELAY" \
-  --swap "$SWAP_ID"
-```
-
-Alice has not created the Ark transfer, so Alice has no Ark-side loss.
-
-### Bob Stops After Ark Transfer, Before BTC Claim Is Visible
-
-Bob cannot complete the Ark receive because `t` has not been revealed. Alice can
-abort by starting emergency exits for the original Ark input VTXOs:
-
-```sh
-bark swap btc-ark ark-abort \
-  --coordinator "$RELAY" \
-  --swap "$SWAP_ID"
-```
-
-Alice then progresses her normal emergency exit:
-
-```sh
-bark exit progress
-```
-
-Bob recovers his BTC after the BTC refund delay:
-
-```sh
-bark swap btc-ark btc-refund \
-  --coordinator "$RELAY" \
-  --swap "$SWAP_ID"
-```
-
-### Alice Tries To Abort After BTC Claim Is Visible
-
-This is not a valid abort. The BTC claim signature may reveal `t`, so Bob should
-complete the Ark receive regardless of relay status. The client checks chain
-visibility and refuses `ark-abort` once the BTC claim is visible.
-
-Bob's `btc-complete-ark` path should not trust a `Cancelled` relay status over
-chain evidence. If the BTC claim is visible and the adaptor package is valid,
-Bob should recover `t`, register the Ark transfer chain, and import the VTXO.
-
-### Alice Reveals `t` Then Publishes An Old Ark Exit
-
-This is the main old-state attack to review.
-
-Once Bob has completed and registered the finalized Ark transfer, Alice's old
-exit should not steal Bob's funds. The server/watchman knows the original Ark
-VTXO was spent out-of-round and can progress the registered spend/checkpoint
-path. Alice can still cause delay and on-chain work.
-
-Bob's operational requirement is to complete/register/import before the old exit
-becomes claimable:
+# BTC-to-Ark adaptor swap protocol
+
+This document describes version 3 of `bark swap btc-ark`. Alice pays Ark VTXOs
+and receives on-chain BTC; Bob pays BTC and receives Ark VTXOs. The protocol
+uses exactly three one-way peer messages, followed by chain observation. See the
+[CLI walkthrough](../bark-btc-ark-swap/btc-ark-swap.md) for commands and setup.
+
+The adaptor signatures link the two payments: a valid signature for the pinned
+BTC claim lets Bob recover the secret needed to finalize the Ark transfer.
+**Publishing that signature is not the same as confirming the BTC claim.**
+Safety also depends on deadlines, transaction inclusion, ordinary Ark recovery,
+and continuous monitoring. This is not a production-security guarantee, an
+offline-safe protocol, or a grief-free exchange.
+
+## Roles and assumptions
+
+- **Alice (`ark-payer`)** chooses the adaptor secret `t`, publishes `T = t*G`,
+  and prepares the Ark transfer before Bob funds.
+- **Bob (`btc-payer`)** supplies the BTC funding template, pays into a Taproot
+  lock, and retains its independent refund key.
+- **The Ark server** performs ordinary arkoor co-signing and transaction-chain
+  registration. There is no swap-specific server policy or RPC.
+
+The security argument assumes correct signature/adaptor verification, fresh
+secret nonces, uncompromised keys and durable local state, honest normal Ark
+policy issuance, and a trusted, live chain backend. It also assumes bounded
+transaction-inclusion delays and reorgs, sufficient on-chain fee reserves, and
+monitoring with timely fee bumps and emergency-exit execution until settlement
+or recovery is stable. The configured margins are budgets for these assumptions,
+not guarantees that miners or the server will respond in time.
+
+Full VTXO-genesis validation does not establish an unconditional guarantee
+against a malicious Ark operator: historical policies committed through tweaks
+do not expose their complete script trees. This protocol does not remove the
+underlying Ark issuance and recovery assumptions.
+
+Bitcoin Core backends must be version 29.0 or newer for P2A package relay and
+must have `-txindex=1` with a fully synchronized transaction index. Commands
+reject an unavailable index rather than treating confirmed
+transactions as absent; monitoring repeats this check. They must also retain
+block data for the recovery scan window; a node pruned inside that window fails
+closed. Esplora supplies indexed transaction lookup. Losing the backend still
+requires restoring reliable chain access before the recovery deadlines.
+
+Keep Bob's funding wallet idle between M1 and M3. Requests reject funding-input
+overlap with other open local swaps, but ordinary wallet sends, boards, exits,
+or external spends do not participate in that reservation. A spent template
+input fails closed; after M2, that failure still forces Alice's emergency exit.
+
+## The three messages
+
+Each message is a snapshot of a public JSON relay file, copied in the indicated
+direction. Relay status is coordination data, not authority to sign, abort, or
+consider a payment settled. Each side verifies the message against its private
+state and live chain data.
+
+| Message | Direction | Command | New public material |
+| --- | --- | --- | --- |
+| M1 | Bob → Alice | `btc-request` | Terms, unsigned funding template and prevouts, lock-output slot, fixed refund height, Bob's keys and one-use public nonce |
+| M2 | Alice → Bob | `ark-offer` | Alice's payout and claim key, `T`, final unsigned funding transaction, exact claim, Alice's adapted BTC nonce and partial signature, server-co-signed Ark adaptor package |
+| M3 | Bob → Alice | `btc-fund` | Signed funding transaction with the same txid and the verified aggregate BTC claim adaptor signature |
+
+There is no fourth peer handoff. Once Alice has imported M3 into her local state,
+both sides can continue without either relay file, using
+`progress --role btc-payer|ark-payer --watch` and their chain backends.
+Blockchain publication and ordinary server requests are still required; “three
+messages” counts peer handoffs, not all network traffic.
+
+### M1: Bob fixes funding and a one-use nonce
+
+Bob chooses the amount, Ark receive policy, claim/refund keys, feerate,
+confirmation depth, and refund window. At request height `h0`, he fixes the
+absolute refund height `R = h0 + refund_delay`.
+
+Bob prepares an unsigned PSBT with a P2TR placeholder for the lock output. Its
+inputs must be confirmed, unspent native-SegWit outputs with empty `scriptSig`
+and no funding witnesses. The public message contains the unsigned transaction,
+input prevouts, and the designated output index—not the private PSBT or wallet
+signing metadata. Bob persists the PSBT and an ordinary MuSig2 secret nonce
+locally before publishing its public nonce in M1.
+
+### M2: Alice fixes both claims before funding
+
+Alice checks the request, BTC prevouts, and Bob's Ark destination. She selects
+fresh eligible Ark inputs, validates their live ancestry and timing, and freezes
+their exact IDs in durable private state together with `t` before contacting the
+server. She locks those inputs locally; retries use those same inputs rather
+than selecting new ones.
+
+Alice replaces only the agreed placeholder output with the final BTC lock.
+Every other funding field remains fixed. Because native-SegWit funding
+signatures only add witnesses, she can compute the final funding txid and the
+exact BTC claim before Bob signs the funding transaction. The claim pays her
+pinned payout script and commits to a fee anchor.
+
+Alice generates a fresh BTC claim nonce adapted to `T` and signs her MuSig2
+partial for the exact claim, Bob's M1 nonce, both keys, and the Taproot tweak.
+Bob's nonce can therefore be published before Alice's key, `T`, or the claim
+sighash is known; only Alice's BTC nonce share needs the adaptor offset.
+
+For the Ark transfer, Alice similarly adapts each user public nonce before
+ordinary server co-signing. The first nonce point is offset by `T`, while the
+corresponding unadapted secret nonce remains local. Combining the server's
+ordinary partial signatures with Alice's shares produces adaptor pre-signatures
+that verify against `T`, not final transaction signatures. The transferable
+package pays Bob's receive policy and includes any Alice change. It contains
+public transaction/signing data, not private keys, secret nonces, or `t`.
+
+Alice persists the complete M2 artifacts and their transcript commitment before
+publishing them. **Server co-signing is already an irreversible Ark-side action,
+even though Bob has not funded.** A crash or an abandoned offer must be handled
+using the frozen recovery inputs; discarding the relay does not undo that action.
+
+### M3: Bob verifies, consumes his nonce, and funds
+
+Before funding, Bob verifies:
+
+- The original request is unchanged, and only the designated funding output was
+  replaced; input prevouts, change, amounts, and fees match the template.
+- The BTC lock, claim transaction, payout, sighash, Taproot tweak, and nonce
+  shares agree with the offered terms.
+- The Ark package's adaptor signatures, server key, exact input set, payment to
+  his receive policy, amount, ancestry, and expiries pass public and live checks.
+- The complete accepted transcript matches any previously pinned commitment.
+
+The commitment includes protocol/version/swap identity, both keys and nonce
+shares, `T`, the partial signature, funding and claim data, and the Ark package.
+It excludes mutable progress status and strips funding witnesses so that M3 can
+add signatures without changing the accepted transaction.
+
+Bob durably pins that transcript before using his secret nonce. He aggregates
+Alice's partial with his own and verifies the resulting BTC adaptor signature
+against the tweaked lock key, exact sighash, and `T` **before funding**. He then
+signs his own persisted PSBT, never a peer-supplied PSBT, and checks that its txid
+matches the claim outpoint. He also signs his independent refund transaction.
+
+The complete result, signed funding and refund, and deletion of the secret
+nonce and private PSBT are persisted together before broadcast or publication.
+A retry uses the persisted result; it cannot sign a changed transcript with the
+same nonce. Fresh chain checks precede the initial funding broadcast. M3 gives
+Alice the aggregate adaptor and the signed funding transaction.
+
+## BTC lock and fee handling
+
+The Taproot lock has a MuSig2 key path controlled by Alice and Bob, and a script
+path allowing Bob's refund key to spend after absolute-height CLTV lock `R`.
+Neither party alone can produce the agreed key-path claim without the other's
+signing contribution. With the verified adaptor signature, Alice can finalize
+that claim using `t`; a verifier holding the same adaptor can recover `t` from
+the valid final signature, including the required nonce-parity handling.
+
+The claim is a version-3 transaction with a 330-sat pay-to-anchor (P2A) output.
+Alice's payout is the locked amount minus the fixed claim fee and anchor value.
+The signed parent is fixed; fee increases use a child-pays-for-parent (CPFP)
+transaction rather than another peer signing round. Alice needs confirmed
+on-chain fee funds. `progress --fee-rate` can override the automatic target.
+
+Bob's refund supports replace-by-fee (RBF). If funding is still unconfirmed,
+recovery can broadcast the pinned funding and refund as a package, paying for
+both. A signed funding transaction must not be forgotten merely because it was
+not seen in the mempool: Alice could publish it later. Repricing or delayed
+funding never moves `R`.
+When funding is already in the mempool, a refund replacement is submitted as
+a single transaction, not unsupported non-TRUC package RBF. Previously signed
+refund IDs remain durable: an older refund can still be mined after replacement.
+Evicted claim children and Ark-reclaim drains can be repriced, and recovery
+tracks older drain candidates as well.
+
+## Fixed-height safety conditions
+
+Let `c` be the required confirmation depth, `m` the safety margin, `h` the current
+validated tip, and `d_i` the emergency-exit delay of Ark input `i`.
+
+- `--refund-delay` is the request-height-to-fixed-refund-height window, default
+  24 blocks; it is not a delay starting when funding confirms.
+- `--confirmations` defaults to 6 and `--safety-margin` defaults to 6. Accepted
+  requests require `c >= 1`, `m >= c`, and enough remaining time:
+  `h + c + m < R`.
+- `R` must be a block height, and height arithmetic must not overflow.
+
+Before Alice co-signs and before Bob releases funding, each selected Ark input
+must have a valid full genesis, a public-key policy, a confirmed live chain
+anchor, and no published exit ancestor—not even in the mempool. Already-on-chain
+inputs, duplicate inputs, conflicting or overlapping ancestry, and duplicate
+output counting are rejected. Legitimate shared ancestry prefixes are allowed.
+The backend must report the anchor output unspent and matching its confirmed
+transaction. The timing conditions are:
 
 ```text
-old exit confirmation height + vtxo_exit_delta
+h + m < R
+R + m < h + d_i                 for every Ark input i
+expiry_i > R + m               for every input and offered output
 ```
 
-## Invariants
+The fresh-ancestry requirement matters: `h + d_i` is not a sound lower bound for
+an old-state spend whose exit clock started earlier. The strict inequalities
+reserve time to settle Bob's refund before a newly started old-state exit can
+mature. They do not prevent new exits from appearing after validation, stop the
+chain from advancing between calls, or guarantee inclusion within the margin.
 
-The protocol relies on these invariants:
+Alice's first disclosure additionally requires the exact BTC funding output to
+be confirmed in the current chain, unspent, and at depth at least `c`, with
+`tip + m < R`. She prepares the signed CPFP child using a dummy parent witness,
+then rechecks the claim window before creating a revealing signature. She
+persists that first signed claim and child immediately before broadcast, without
+further fee-estimation or network preparation between the recheck and signing.
+A final timing race still exists; bounded inclusion and reorg assumptions remain.
 
-- Bob funds only after verifying Alice's public terms.
-- Alice creates `ark_transfer` only after the BTC lock is confirmed, unless
-  using `--allow-unconfirmed` in local tests.
-- Alice reveals `t` only by broadcasting the BTC claim.
-- Bob accepts only one pinned `ark_transfer` commitment hash.
-- Alice's abort uses the original Ark input IDs pinned in local state.
-- Bob completes the Ark receive from chain-visible BTC claim data, not from
-  relay status alone.
-- Bob's BTC refund path remains available even after he has built the BTC claim
-  adaptor package.
+## Disclosure, confirmation, and old-state protection
+
+A valid claim signature can disclose `t` as soon as it leaves Alice's control,
+including through a broadcast attempt that returns an error. Mempool admission,
+confirmation, and durable payment are distinct events. A rejected, evicted, or
+reorged claim does not make an already disclosed secret private again.
+
+Bob observes the exact pinned claim, verifies its final signature against his
+adaptor, and persists the observed transaction. He can recover `t` from an
+unconfirmed claim and immediately finalize/import his Ark VTXOs; waiting for
+BTC confirmation before learning the secret would waste response time.
+
+Alice also finalizes the Ark package and registers its signed transaction chain
+with the server during claim completion. Bob imports his fully signed VTXOs
+before attempting registration; if registration fails, his completion path
+starts local emergency-exit recovery. These are ordinary Ark recovery steps.
+
+**Registration is not atomicity or an on-chain revocation of Alice's old state.**
+It supplies signed transaction data to the server/watchman. Defeating an old-state
+exit still requires the appropriate spend/checkpoint path to be published and
+confirmed in time. Registration, local import, and an `ArkCompleted` status do
+not prove that every conflicting exit or reorg has become impossible. Bob must
+retain his recovery data and maintain ordinary Ark monitoring; fallback exits
+may need continued progression and fees.
+
+The BTC claim key path also remains valid after `R`: the refund lock enables a
+competing spend, not an expiry of Alice's signature. If a claim is disclosed too
+late or inclusion is delayed past the budget, Bob may learn `t` while the refund
+wins the BTC spend. Conversely, late old-state handling can endanger Bob's Ark
+receive. The fixed deadlines and refusal to first disclose late mitigate these
+races under the stated assumptions; they do not make disclosure and both
+settlements simultaneous.
+
+## Recovery and terminal states
+
+- **Bob abandons before M2 co-signing:** no BTC funding has been signed or
+  published. If Alice has not reached the irreversible co-signing step, there
+  is no server-co-signed Ark transfer to recover from.
+- **Bob abandons after M2, even without ever funding:** Alice may already need
+  emergency exits of her frozen Ark inputs. Bob can force delay, fees, and
+  monitoring without first locking BTC. This pre-funding grief is the explicit
+  trade-off that makes the three-message sequence possible.
+- **No secret has escaped:** Alice can use `ark-abort` to start exits of the exact
+  frozen inputs. Her `progress` also chooses this path when the first-disclosure
+  window closes. `Cancelled` is not completed recovery: progress drives the
+  exits, persists and broadcasts a signed drain, and reaches `ArkReclaimed`
+  only after the configured confirmation depth.
+- **No claim is observed by the refund height:** Bob uses `btc-refund` or
+  `progress` to publish/reprice the refund, including a funding/refund package
+  when needed. He stays online until it is sufficiently confirmed and before
+  the relevant Ark old-state deadline.
+- **Ark registration fails after Bob learns the secret:** Bob retains his fully
+  signed receive outputs and enters `ArkRecovering`. Progress drives their
+  unilateral exits and drain to `ArkReclaimed`; it does not refund the BTC leg.
+- **A claim signature may have escaped:** Alice must not abort. The persisted
+  signed-claim marker prevents abort even if the chain backend no longer sees
+  the claim. She continues rebroadcast/CPFP and Ark registration. Bob completes
+  from valid claim evidence, not from a relay cancellation label.
+
+Alice's `BtcClaimed` and Bob's `Refunded` require depth `c`; broadcasting alone
+is not terminal. `ArkCompleted` records Bob's local receive and successful chain
+registration, not BTC confirmation or final resolution of every Ark exit race.
+The manual commands `ark-finalize-btc-claim`, `btc-complete-ark`, `btc-refund`, and
+`ark-abort` remain available; they do not introduce additional peer messages.
+
+## Local durability and privacy boundaries
+
+Private state and relay snapshots use strict version-3 formats; legacy formats
+are rejected. Writes use private mode-0600 files, file synchronization, atomic
+rename, and parent-directory synchronization. Each wallet holds an exclusive
+swap-command lock, including for the lifetime of `--watch`; the watch loop
+reloads durable state on every iteration, including after failed writes. Use
+separate wallets for the two roles rather than running both against one wallet
+under a long-held watch lock.
+
+Do not copy private state to the peer, restore a backup containing a spent
+nonce, or fork a signing session from old state. Durable nonce deletion protects
+retries in the current state history; it does not make stale secret backups
+safe. Preserve local transcripts, refund transactions, and exit data through
+stable settlement or recovery.
+
+The server receives ordinary arkoor requests containing adapted, otherwise
+ordinary public nonces, and later ordinary signed transaction-chain
+registration. The client sends no explicit `T`, `t`, swap ID, BTC transcript, or
+transferable adaptor package to the server. With fresh random nonce material,
+the offset does not itself label the co-signing request as a swap.
+
+This is a protocol-metadata privacy boundary, not operator blindness or network
+anonymity. The server still sees ordinary Ark inputs, outputs, amounts, timing,
+registrations, and emergency exits. Peer relay artifacts expose swap terms and
+BTC linkage to their holders; public chain activity and network observations can
+also permit correlation. The protocol does not protect against a peer sharing
+that information with the operator.

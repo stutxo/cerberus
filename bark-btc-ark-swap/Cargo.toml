@@ -1,6 +1,6 @@
 [package]
 name = "bark-btc-ark-swap"
-version = "0.1.4"
+version = "0.7.1"
 license = "MIT"
 authors = [ "Team Second <hello@second.tech>" ]
 repository = "https://gitlab.com/ark-bitcoin/bark"
@@ -8,13 +8,13 @@ description = "BTC-Ark swap orchestration for bark"
 edition = "2024"
 
 [dependencies]
-ark-lib = { version = "0.1.4", path = "../lib" }
-bark-wallet = { version = "0.1.4", path = "../bark", default-features = false, features = [ "onchain-bdk", "sqlite", "filestore", "socks5-proxy", "rand", "native" ] }
-bark-bitcoin-ext = { version = "0.1.4", path = "../bitcoin-ext", features = ["rpc-socks5-proxy"] }
+ark-lib = { version = "0.7.1", path = "../lib" }
+bark-wallet = { version = "0.7.1", path = "../bark", default-features = false, features = [ "onchain-bdk", "sqlite", "filestore", "socks5-proxy", "rand", "native" ] }
+bark-bitcoin-ext = { version = "0.7.1", path = "../bitcoin-ext", features = ["rpc-socks5-proxy"] }
 
 anyhow.workspace = true
 bitcoin.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "signal", "time"] }

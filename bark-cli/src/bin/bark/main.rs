@@ -846,7 +846,9 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 			round::execute_round_command(cmd, &mut wallet).await?;
 		},
 		Command::Swap(cmd) => {
-			swap::execute_swap_command(cmd, &mut wallet, &mut onchain, &datadir).await?;
+			let onchain = wallet.onchain().context("no onchain wallet configured")?;
+			let mut onchain = onchain.write().await;
+			swap::execute_swap_command(cmd, &mut wallet, &mut *onchain, &datadir).await?;
 		},
 		Command::Watch => {
 			let mut stream = wallet.subscribe_notifications();

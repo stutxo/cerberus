@@ -82,6 +82,7 @@ async-trait.workspace = true
 tokio-postgres.workspace = true
 semver.workspace = true
 parking_lot.workspace = true
+prost.workspace = true
 
 axum = { version = "0.8.4", features = ["macros", "tokio", "query"], default-features = false }
 tower-http = { version = "0.5", features = ["cors", "set-header"] }

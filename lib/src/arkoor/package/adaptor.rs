@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::marker::PhantomData;
 
@@ -43,6 +44,14 @@ pub enum TransferPackageVerificationError {
 	AdaptorPointMismatch,
 	#[error("input VTXO ids mismatch")]
 	InputIdsMismatch,
+	#[error("duplicate transfer input VTXO {0}")]
+	DuplicateInput(VtxoId),
+	#[error("transfer inputs have overlapping or conflicting ancestry")]
+	OverlappingInputs,
+	#[error("duplicate transfer output VTXO {0}")]
+	DuplicateOutput(VtxoId),
+	#[error("transfer amount overflow")]
+	AmountOverflow,
 	#[error("Ark server pubkey mismatch")]
 	ServerPubkeyMismatch,
 	#[error("adaptor signature material count mismatch")]
@@ -198,8 +207,36 @@ impl TransferableAdaptorArkoorPackage {
 		if input_ids != expected_input_ids {
 			return Err(TransferPackageVerificationError::InputIdsMismatch);
 		}
+		let mut unique_inputs = HashSet::with_capacity(input_ids.len());
+		for id in &input_ids {
+			if !unique_inputs.insert(*id) {
+				return Err(TransferPackageVerificationError::DuplicateInput(*id));
+			}
+		}
+
+		// Common ancestry prefixes are legitimate; conflicting spends or spending
+		// another final input would count mutually exclusive coins as payment.
+		let mut ancestry_spends = HashMap::new();
+		for package in &self.packages {
+			package.input().chain_anchor_amount()
+				.ok_or(TransferPackageVerificationError::AmountOverflow)?;
+			for item in package.input().transactions() {
+				let txid = item.tx.compute_txid();
+				for input in &item.tx.input {
+					if unique_inputs.contains(&VtxoId::from(input.previous_output)) {
+						return Err(TransferPackageVerificationError::OverlappingInputs);
+					}
+					if let Some(previous) = ancestry_spends.insert(input.previous_output, txid) {
+						if previous != txid {
+							return Err(TransferPackageVerificationError::OverlappingInputs);
+						}
+					}
+				}
+			}
+		}
 
 		let mut paid_amount = Amount::ZERO;
+		let mut output_ids = HashSet::new();
 		for (package_index, package) in self.packages.iter().enumerate() {
 			if package.adaptor_point() != expected_adaptor_point {
 				return Err(TransferPackageVerificationError::AdaptorPointMismatch);
@@ -246,8 +283,12 @@ impl TransferableAdaptorArkoorPackage {
 			}
 
 			for output in package.build_unsigned_vtxos() {
+				if !output_ids.insert(output.id()) {
+					return Err(TransferPackageVerificationError::DuplicateOutput(output.id()));
+				}
 				if output.policy() == expected_receive_policy {
-					paid_amount += output.amount();
+					paid_amount = paid_amount.checked_add(output.amount())
+						.ok_or(TransferPackageVerificationError::AmountOverflow)?;
 				}
 			}
 		}
@@ -287,8 +328,16 @@ impl ProtocolEncoding for TransferableAdaptorArkoor {
 
 	fn decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, ProtocolDecodingError> {
 		let input = Vtxo::<Full>::decode(r)?;
-		let outputs = decode_vec(r)?;
-		let isolated_outputs = decode_vec(r)?;
+		let outputs: Vec<crate::arkoor::ArkoorDestination> = decode_vec(r)?;
+		let isolated_outputs: Vec<crate::arkoor::ArkoorDestination> = decode_vec(r)?;
+		// The builder's balancing arithmetic assumes representable amounts.
+		// Reject hostile wire values before entering that trusted constructor.
+		input.chain_anchor_amount().ok_or_else(|| {
+			ProtocolDecodingError::invalid("transfer input ancestry amount overflow")
+		})?;
+		outputs.iter().chain(&isolated_outputs)
+			.try_fold(Amount::ZERO, |sum, output| sum.checked_add(output.total_amount))
+			.ok_or_else(|| ProtocolDecodingError::invalid("transfer output amount overflow"))?;
 		let use_checkpoint = match r.read_u8()? {
 			0 => false,
 			1 => true,
@@ -420,12 +469,134 @@ mod test {
 		DummyTestVtxoSpec {
 			amount: amt + P2TR_DUST,
 			fee: P2TR_DUST,
-			expiry_height: 1000,
-			exit_delta: 128,
+			expiry_height: 1000.into(),
+			exit_delta: 128.into(),
 			user_keypair: alice_keypair(),
 			server_keypair: server_keypair(),
 		}
 		.build()
+	}
+
+	fn transfer_for_inputs(
+		inputs: Vec<Vtxo<Full>>,
+		outputs: Vec<ArkoorDestination>,
+		adaptor_point: PublicKey,
+	) -> TransferableAdaptorArkoorPackage {
+		let keys = vec![alice_keypair(); inputs.len()];
+		let builder = ArkoorPackageBuilder::new_with_checkpoints(inputs, outputs).unwrap()
+			.generate_user_adaptor_nonces(&keys, adaptor_point).unwrap();
+		let response = ArkoorPackageBuilder::from_cosign_request(builder.cosign_request()).unwrap()
+			.server_cosign(&server_keypair()).unwrap().cosign_response();
+		builder.user_adaptor_cosign(&keys, response).unwrap().into_transfer_package()
+	}
+
+	#[test]
+	fn repeated_package_cannot_double_received_value() {
+		let amount = Amount::from_sat(100_000);
+		let (_, input) = dummy_vtxo_for_amount(amount);
+		let id = input.id();
+		let policy = VtxoPolicy::new_pubkey(bob_public_key());
+		let point = musig::AdaptorSecret::new(SecretKey::from_slice(&[42; 32]).unwrap()).point();
+		let mut transfer = transfer_for_inputs(vec![input], vec![ArkoorDestination {
+			total_amount: amount, policy: policy.clone(),
+		}], point);
+		let copy = TransferableAdaptorArkoorPackage::deserialize(&transfer.serialize()).unwrap();
+		transfer.packages.extend(copy.packages);
+		assert_eq!(
+			transfer.verify_public_transfer(
+				&[id, id], &policy, amount + amount, server_public_key(), point,
+			),
+			Err(TransferPackageVerificationError::DuplicateInput(id)),
+		);
+	}
+
+	#[test]
+	fn shared_ancestry_is_valid_but_overlapping_or_conflicting_inputs_are_not() {
+		let amount = Amount::from_sat(100_000);
+		let (_, input) = dummy_vtxo_for_amount(amount);
+		let secret = musig::AdaptorSecret::new(SecretKey::from_slice(&[42; 32]).unwrap());
+		let alice_policy = VtxoPolicy::new_pubkey(alice_public_key());
+		let bob_policy = VtxoPolicy::new_pubkey(bob_public_key());
+		let split = |first: u64| transfer_for_inputs(vec![input.clone()], vec![
+			ArkoorDestination {
+				total_amount: Amount::from_sat(first), policy: alice_policy.clone(),
+			},
+			ArkoorDestination {
+				total_amount: amount - Amount::from_sat(first), policy: alice_policy.clone(),
+			},
+		], secret.point()).finalize_with_secret(secret).unwrap().build_signed_vtxos();
+		let siblings = split(40_000);
+		let sibling_ids = siblings.iter().map(|v| v.id()).collect::<Vec<_>>();
+		let mut shared = transfer_for_inputs(siblings.clone(), vec![ArkoorDestination {
+			total_amount: amount, policy: bob_policy.clone(),
+		}], secret.point());
+		shared.verify_public_transfer(
+			&sibling_ids, &bob_policy, amount, server_public_key(), secret.point(),
+		).expect("distinct outputs of shared ancestry are spendable together");
+
+		let parent = transfer_for_inputs(vec![input.clone()], vec![ArkoorDestination {
+			total_amount: amount, policy: bob_policy.clone(),
+		}], secret.point());
+		shared.packages.extend(parent.packages);
+		let ids = shared.input_ids().collect::<Vec<_>>();
+		assert_eq!(
+			shared.verify_public_transfer(
+				&ids, &bob_policy, amount + amount, server_public_key(), secret.point(),
+			),
+			Err(TransferPackageVerificationError::OverlappingInputs),
+		);
+
+		let alternate = split(30_000);
+		let conflicting_amount = siblings[0].amount() + alternate[0].amount();
+		let conflicting = transfer_for_inputs(
+			vec![siblings[0].clone(), alternate[0].clone()],
+			vec![ArkoorDestination {
+				total_amount: conflicting_amount, policy: bob_policy.clone(),
+			}],
+			secret.point(),
+		);
+		let ids = conflicting.input_ids().collect::<Vec<_>>();
+		assert_eq!(
+			conflicting.verify_public_transfer(
+				&ids, &bob_policy, conflicting_amount, server_public_key(), secret.point(),
+			),
+			Err(TransferPackageVerificationError::OverlappingInputs),
+		);
+	}
+
+	#[test]
+	fn received_amount_overflow_is_rejected() {
+		let amount = Amount::from_sat(u64::MAX / 2 + 1);
+		let policy = VtxoPolicy::new_pubkey(bob_public_key());
+		let point = musig::AdaptorSecret::new(SecretKey::from_slice(&[42; 32]).unwrap()).point();
+		let mut combined = TransferableAdaptorArkoorPackage { packages: Vec::new() };
+		for amount in [amount, amount + Amount::ONE_SAT] {
+			let (_, input) = dummy_vtxo_for_amount(amount);
+			let transfer = transfer_for_inputs(vec![input], vec![ArkoorDestination {
+				total_amount: amount, policy: policy.clone(),
+			}], point);
+			combined.packages.extend(transfer.packages);
+		}
+		let ids = combined.input_ids().collect::<Vec<_>>();
+		assert_eq!(
+			combined.verify_public_transfer(&ids, &policy, Amount::ZERO, server_public_key(), point),
+			Err(TransferPackageVerificationError::AmountOverflow),
+		);
+	}
+
+	#[test]
+	fn wire_output_overflow_is_rejected_before_builder_arithmetic() {
+		let (_, input) = dummy_vtxo_for_amount(Amount::from_sat(100_000));
+		let policy = VtxoPolicy::new_pubkey(bob_public_key());
+		let point = musig::AdaptorSecret::new(SecretKey::from_slice(&[42; 32]).unwrap()).point();
+		let mut transfer = transfer_for_inputs(vec![input], vec![ArkoorDestination {
+			total_amount: Amount::from_sat(100_000), policy: policy.clone(),
+		}], point);
+		transfer.packages[0].builder.outputs = vec![
+			ArkoorDestination { total_amount: Amount::MAX, policy: policy.clone() },
+			ArkoorDestination { total_amount: Amount::ONE_SAT, policy },
+		];
+		assert!(TransferableAdaptorArkoorPackage::deserialize(&transfer.serialize()).is_err());
 	}
 
 	#[test]

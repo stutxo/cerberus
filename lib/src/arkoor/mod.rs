@@ -2135,8 +2135,8 @@ mod test {
 		let (funding_tx, alice_vtxo) = DummyTestVtxoSpec {
 			amount: Amount::from_sat(100_330),
 			fee: Amount::from_sat(330),
-			expiry_height: 1000,
-			exit_delta : 128,
+			expiry_height: 1000.into(),
+			exit_delta : 128.into(),
 			user_keypair: alice_keypair.clone(),
 			server_keypair: server_keypair.clone()
 		}.build();

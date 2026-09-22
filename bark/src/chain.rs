@@ -12,7 +12,7 @@ use bdk_core::{BlockId, CheckPoint};
 use bdk_esplora::esplora_client;
 use bitcoin::constants::genesis_block;
 use bitcoin::{
-	Amount, Block, BlockHash, FeeRate, Network, OutPoint, Transaction, Txid, Weight,
+	Amount, Block, BlockHash, FeeRate, Network, OutPoint, Transaction, TxOut, Txid, Weight,
 };
 use log::{debug, info, warn};
 use tokio::sync::RwLock;
@@ -455,6 +455,21 @@ impl ChainSource {
 		}
 	}
 
+	/// Require reliable transaction lookup after confirmation, not just mempool visibility.
+	pub async fn require_transaction_index(&self) -> anyhow::Result<()> {
+		match self.inner() {
+			#[cfg(feature = "bitcoind-rpc")]
+			ChainSourceClient::Bitcoind { rpc, .. } => {
+				let info: serde_json::Value = rpc.call_raw("getindexinfo", &[serde_json::json!("txindex")]).await?;
+				if info.get("txindex").and_then(|index| index.get("synced")).and_then(|synced| synced.as_bool()) != Some(true) {
+					bail!("transaction monitoring requires Bitcoin Core -txindex=1 with its index fully synchronized");
+				}
+			},
+			ChainSourceClient::Esplora(_) => {},
+		}
+		Ok(())
+	}
+
 	/// Retrieves basic CPFP ancestry information of the given transaction. Confirmed transactions
 	/// are ignored as they are not relevant to CPFP.
 	pub async fn mempool_ancestor_info(&self, txid: Txid) -> anyhow::Result<MempoolAncestorInfo> {
@@ -468,11 +483,11 @@ impl ChainSource {
 				let entry: rpc::json::GetMempoolEntryResult = rpc.call_raw(
 					"getmempoolentry", &[serde_json::to_value(txid).expect("serializable")],
 				).await?;
-				let err = || anyhow!("missing weight parameter from getmempoolentry");
+				let err = || anyhow!("invalid ancestor size from getmempoolentry");
 
 				result.total_fee = entry.fees.ancestor;
-				result.total_weight = Weight::from_wu(entry.weight.ok_or_else(err)?) +
-					Weight::from_vb(entry.ancestor_size).ok_or_else(err)?;
+				// ancestorsize already includes the queried transaction.
+				result.total_weight = Weight::from_vb(entry.ancestor_size).ok_or_else(err)?;
 			},
 			ChainSourceClient::Esplora(client) => {
 				// We should first verify the transaction is in the mempool to maintain the same
@@ -698,6 +713,50 @@ impl ChainSource {
 		}
 	}
 
+	/// Returns an output only when the backend knows it is currently unspent.
+	///
+	/// Mempool spends count as spent. Missing or inconsistent backend data must
+	/// never turn an unknown output into a spendable one.
+	pub async fn unspent_txout(&self, outpoint: OutPoint) -> anyhow::Result<Option<TxOut>> {
+		match self.inner() {
+			#[cfg(feature = "bitcoind-rpc")]
+			ChainSourceClient::Bitcoind { rpc, .. } => {
+				let output: Option<rpc::json::GetTxOutResult> = rpc.call_raw(
+					"gettxout",
+					&[
+						serde_json::to_value(outpoint.txid).expect("serializable"),
+						outpoint.vout.into(),
+						true.into(), // include mempool spends, not just the chain UTXO set
+					],
+				).await?;
+				Ok(output.map(|output| TxOut {
+					value: output.value,
+					script_pubkey: bitcoin::ScriptBuf::from_bytes(output.script_pub_key.hex),
+				}))
+			},
+			ChainSourceClient::Esplora(client) => {
+				let Some(tx) = client.get_tx(&outpoint.txid).await? else {
+					return Ok(None);
+				};
+				if tx.compute_txid() != outpoint.txid {
+					bail!("backend returned the wrong transaction for {}", outpoint);
+				}
+				let Some(output) = tx.output.get(outpoint.vout as usize) else {
+					return Ok(None);
+				};
+				let status = client.get_output_status(&outpoint.txid, outpoint.vout.into()).await?
+					.with_context(|| format!("missing spending status for {}", outpoint))?;
+				if status.spent {
+					return Ok(None);
+				}
+				if status.txid.is_some() || status.vin.is_some() || status.status.is_some() {
+					bail!("inconsistent unspent output status for {}", outpoint);
+				}
+				Ok(Some(output.clone()))
+			},
+		}
+	}
+
 	/// Returns the block height the tx is confirmed in, if any.
 	pub async fn tx_confirmed(&self, txid: Txid) -> anyhow::Result<Option<BlockHeight>> {
 		Ok(self.tx_status(txid).await?.confirmed_height())
@@ -710,12 +769,19 @@ impl ChainSource {
 			ChainSourceClient::Bitcoind { rpc, .. } => Ok(bitcoind_tx_status(rpc, txid).await?),
 			ChainSourceClient::Esplora(esplora) => {
 				match esplora.get_tx_info(&txid).await? {
-					Some(info) => match (info.status.block_height, info.status.block_hash) {
-						(Some(block_height), Some(block_hash)) => Ok(TxStatus::Confirmed(BlockRef {
-							height: block_height.into(),
-							hash: block_hash,
-						} )),
-						_ => Ok(TxStatus::Mempool),
+					Some(info) => {
+						if info.status.confirmed {
+							Ok(TxStatus::Confirmed(BlockRef {
+								height: info.status.block_height
+									.context("confirmed transaction missing block height")?.into(),
+								hash: info.status.block_hash
+									.context("confirmed transaction missing block hash")?,
+							}))
+						} else if info.status.block_height.is_some() || info.status.block_hash.is_some() {
+							bail!("unconfirmed transaction has confirmation data");
+						} else {
+							Ok(TxStatus::Mempool)
+						}
 					},
 					None => Ok(TxStatus::NotFound),
 				}
