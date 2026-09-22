@@ -5,8 +5,6 @@
 //! so all that matters is that the code can compile. It doesn't have to run.
 //!
 
-use std::collections::HashMap;
-use std::str::FromStr;
 
 #[cfg(feature = "onchain-bdk")]
 use bdk_wallet::ChangeSet;
@@ -20,22 +18,23 @@ use lightning_invoice::Bolt11Invoice;
 
 use ark::{ProtocolEncoding, Vtxo, VtxoId};
 use ark::vtxo::Full;
-use ark::lightning::{Invoice, PaymentHash, Preimage};
-use bitcoin_ext::{BlockDelta, BlockRef};
+use ark::lightning::{PaymentHash, Preimage};
+use bitcoin_ext::{BlockHeight, BlockRef};
 
 use bark::{WalletProperties, WalletVtxo};
-use bark::exit::{ExitState, ExitClaimableState, ExitTxOrigin};
+use bark::actions::{WalletActionCheckpoint, WalletActionId};
+use bark::exit::{ExitState, ExitStateKind, ExitClaimableState, ExitTxOrigin};
 use bark::movement::{
 	Movement, MovementDestination, MovementId, MovementStatus, MovementSubsystem,
 	MovementTimestamp, PaymentMethod,
 };
+use bark::movement::update::MovementUpdate;
 use bark::persist::BarkPersister;
 use bark::persist::models::{
-	LightningReceive, LightningSend, PendingBoard, StoredExit, StoredRoundState, Unlocked,
-	RoundStateId, SerdeRoundState, PendingOffboard,
+	PaidInvoice, StoredExit, StoredRoundState, Unlocked, RoundStateId, SerdeRoundState,
 };
 use bark::round::RoundState;
-use bark::vtxo::{VtxoState, VtxoStateKind};
+use bark::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind};
 
 
 struct Dummy;
@@ -74,33 +73,13 @@ impl BarkPersister for Dummy {
 		Ok(())
 	}
 
-	async fn store_pending_board(
-		&self,
-		_vtxo: &Vtxo<Full>,
-		_funding_tx: &Transaction,
-		_movement_id: MovementId,
-	) -> anyhow::Result<()> {
-		Ok(())
-	}
-
-	async fn remove_pending_board(&self, _vtxo_id: &VtxoId) -> anyhow::Result<()> {
-		Ok(())
-	}
-
-	async fn get_all_pending_board_ids(&self) -> anyhow::Result<Vec<VtxoId>> {
-		Ok(vec![])
-	}
-
-	async fn get_pending_board_by_vtxo_id(&self, _vtxo_id: VtxoId) -> anyhow::Result<Option<PendingBoard>> {
-		Ok(None)
-	}
-
 	async fn get_wallet_vtxo(&self, _id: VtxoId) -> anyhow::Result<Option<WalletVtxo>> {
 		Ok(Some(WalletVtxo {
 			vtxo: Vtxo::deserialize(&[])?,
 			state: VtxoState::Spendable,
 			exit_depth: 0,
 			exit_tx_weight: bitcoin::Weight::ZERO,
+			registered: false,
 		}))
 	}
 
@@ -110,6 +89,7 @@ impl BarkPersister for Dummy {
 			state: VtxoState::Spendable,
 			exit_depth: 0,
 			exit_tx_weight: bitcoin::Weight::ZERO,
+			registered: false,
 		}]))
 	}
 
@@ -117,11 +97,16 @@ impl BarkPersister for Dummy {
 		Ok(Vec::<WalletVtxo>::from([WalletVtxo {
 			vtxo: Vtxo::deserialize(&[])?,
 			state: VtxoState::Locked {
-				movement_id: Some(MovementId::new(0)),
+				holder: Some(bark::vtxo::VtxoLockHolder::Movement { id: MovementId::new(0) }),
 			},
 			exit_depth: 0,
 			exit_tx_weight: bitcoin::Weight::ZERO,
+			registered: false,
 		}]))
+	}
+
+	async fn get_wallet_vtxos(&self, _ids: &[VtxoId]) -> anyhow::Result<Vec<WalletVtxo>> {
+		Ok(Vec::new())
 	}
 
 	async fn get_full_vtxo(&self, _id: VtxoId) -> anyhow::Result<Option<Vtxo<Full>>> {
@@ -160,83 +145,64 @@ impl BarkPersister for Dummy {
 		Ok(0u64)
 	}
 
-	async fn store_new_pending_lightning_send(
+	async fn upsert_wallet_action_checkpoint(
 		&self,
-		invoice: &Invoice,
-		amount: Amount,
-		fee: Amount,
-		_vtxos: &[VtxoId],
-		movement_id: MovementId
-	) -> anyhow::Result<LightningSend> {
-		Ok(LightningSend {
-			invoice: invoice.clone(),
-			amount,
-			fee,
-			htlc_vtxos: vec![],
-			preimage: None,
-			movement_id,
-			finished_at: None,
-		})
-	}
-
-	async fn get_all_pending_lightning_send(&self) -> anyhow::Result<Vec<LightningSend>> {
-		Ok(vec![])
-	}
-
-	async fn finish_lightning_send(
-		&self,
-		_payment_hash: PaymentHash,
-		_preimage: Option<Preimage>,
+		_id: &WalletActionId,
+		_checkpoint: &WalletActionCheckpoint,
 	) -> anyhow::Result<()> {
 		Ok(())
 	}
 
-	async fn remove_lightning_send(&self, _payment_hash: PaymentHash) -> anyhow::Result<()> {
+	async fn get_wallet_action_checkpoint(
+		&self,
+		_id: &WalletActionId,
+	) -> anyhow::Result<Option<WalletActionCheckpoint>> {
+		Ok(None)
+	}
+
+	async fn get_all_wallet_action_checkpoints(
+		&self,
+	) -> anyhow::Result<Vec<WalletActionCheckpoint>> {
+		Ok(vec![])
+	}
+
+	async fn remove_wallet_action_checkpoint(
+		&self,
+		_id: &WalletActionId,
+	) -> anyhow::Result<()> {
 		Ok(())
 	}
 
-	async fn get_lightning_send(&self, _payment_hash: PaymentHash) -> anyhow::Result<Option<LightningSend>> {
-		Ok(Some(dummy_lightning_send()))
+	async fn record_paid_invoice(
+		&self,
+		_payment_hash: PaymentHash,
+		_preimage: Preimage,
+	) -> anyhow::Result<()> {
+		Ok(())
 	}
 
-	async fn store_lightning_receive(
+	async fn get_paid_invoice(
+		&self,
+		_payment_hash: PaymentHash,
+	) -> anyhow::Result<Option<PaidInvoice>> {
+		Ok(None)
+	}
+
+	async fn record_settled_lightning_receive(
 		&self,
 		_payment_hash: PaymentHash,
 		_preimage: Preimage,
 		_invoice: &Bolt11Invoice,
-		_htlc_recv_cltv_delta: BlockDelta,
+		_amount: bitcoin::Amount,
 	) -> anyhow::Result<()> {
 		Ok(())
 	}
 
-	async fn get_all_pending_lightning_receives(&self) -> anyhow::Result<Vec<LightningReceive>> {
-		Ok(Vec::<LightningReceive>::from([
-			dummy_lightning_receive(),
-		]))
-	}
-
-	async fn set_preimage_revealed(&self, _payment_hash: PaymentHash) -> anyhow::Result<()> {
-		Ok(())
-	}
-
-	async fn update_lightning_receive(
+	async fn get_settled_lightning_receive(
 		&self,
 		_payment_hash: PaymentHash,
-		_vtxo_ids: &[VtxoId],
-		_movement_id: MovementId,
-	) -> anyhow::Result<()> {
-		Ok(())
-	}
-
-	async fn fetch_lightning_receive_by_payment_hash(
-		&self,
-		_payment_hash: PaymentHash,
-	) -> anyhow::Result<Option<LightningReceive>> {
-		Ok(Some(dummy_lightning_receive()))
-	}
-
-	async fn finish_pending_lightning_receive(&self, _payment_hash: PaymentHash) -> anyhow::Result<()> {
-		Ok(())
+	) -> anyhow::Result<Option<bark::persist::models::SettledLightningReceive>> {
+		Ok(None)
 	}
 
 	async fn store_exit_vtxo_entry(&self, _exit: &StoredExit) -> anyhow::Result<()> {
@@ -252,16 +218,30 @@ impl BarkPersister for Dummy {
 			StoredExit {
 				vtxo_id: VtxoId::from_slice(&[])?,
 				state: ExitState::Claimable(ExitClaimableState {
-					tip_height: 0,
+					tip_height: BlockHeight::ZERO,
 					claimable_since: BlockRef {
-						height: 0,
+						height: BlockHeight::ZERO,
 						hash: BlockHash::all_zeros(),
 					},
 					last_scanned_block: None,
 				}),
 				history: Vec::<ExitState>::new(),
+				movement_id: None,
 			}
 		]))
+	}
+
+	async fn get_exit_vtxo_entries_with_states(
+		&self,
+		states: &[ExitStateKind],
+	) -> anyhow::Result<Vec<StoredExit>> {
+		let entries = self.get_exit_vtxo_entries().await?;
+		Ok(entries.into_iter().filter(|e| states.contains(&e.state.kind())).collect())
+	}
+
+	async fn get_exit_vtxo_entry(&self, id: &VtxoId) -> anyhow::Result<Option<StoredExit>> {
+		let entries = self.get_exit_vtxo_entries().await?;
+		Ok(entries.into_iter().find(|e| e.vtxo_id == *id))
 	}
 
 	async fn store_exit_child_tx(
@@ -281,7 +261,7 @@ impl BarkPersister for Dummy {
 			deserialize::<Transaction>(&[])?,
 			ExitTxOrigin::Wallet {
 			confirmed_in: Some(BlockRef {
-				height: 0,
+				height: BlockHeight::ZERO,
 				hash: BlockHash::all_zeros(),
 			}),
 		})))
@@ -298,25 +278,36 @@ impl BarkPersister for Dummy {
 			state: VtxoState::Spent,
 			exit_depth: 0,
 			exit_tx_weight: bitcoin::Weight::ZERO,
+			registered: false,
 		}]).pop().unwrap())
 	}
 
-	async fn store_pending_offboard(
+	async fn update_vtxo_states_checked(
 		&self,
-		_pending: &PendingOffboard,
+		_vtxo_ids: &[VtxoId],
+		_new_state: VtxoState,
+		_allowed_old_states: &[VtxoStateKind],
 	) -> anyhow::Result<()> {
 		Ok(())
 	}
 
-	async fn get_pending_offboards(&self) -> anyhow::Result<Vec<PendingOffboard>> {
-		Ok(vec![])
-	}
-
-	async fn remove_pending_offboard(&self, _movement_id: MovementId) -> anyhow::Result<()> {
+	async fn release_vtxo_lock(
+		&self,
+		_vtxo_id: VtxoId,
+		_holder: Option<&VtxoLockHolder>,
+	) -> anyhow::Result<()> {
 		Ok(())
 	}
 
-	async fn store_round_state_lock_vtxos(&self, _round_state: &RoundState) -> anyhow::Result<RoundStateId> {
+	async fn mark_vtxos_registered(&self, _vtxo_ids: &[VtxoId]) -> anyhow::Result<()> {
+		Ok(())
+	}
+
+	async fn get_unregistered_vtxo_ids(&self) -> anyhow::Result<Vec<VtxoId>> {
+		Ok(vec![])
+	}
+
+	async fn store_round_state(&self, _round_state: &RoundState) -> anyhow::Result<RoundStateId> {
 		Ok(RoundStateId(5))
 	}
 
@@ -342,8 +333,19 @@ impl BarkPersister for Dummy {
 		_status: MovementStatus,
 		_subsystem: &MovementSubsystem,
 		_time: DateTime<Local>,
+		_action_id: Option<&str>,
 	) -> anyhow::Result<MovementId> {
 		Ok(MovementId::new(0))
+	}
+
+	async fn get_or_create_movement_for_action(
+		&self,
+		_subsystem: &MovementSubsystem,
+		_time: DateTime<Local>,
+		_action_id: &str,
+		_update: MovementUpdate,
+	) -> anyhow::Result<(MovementId, bool)> {
+		Ok((MovementId::new(0), true))
 	}
 
 	async fn update_movement(&self, _movement: &Movement) -> anyhow::Result<()> {
@@ -373,31 +375,6 @@ impl BarkPersister for Dummy {
 	}
 }
 
-fn dummy_lightning_send() -> LightningSend {
-	LightningSend {
-		invoice: Invoice::Bolt11(Bolt11Invoice::from_str("bob").unwrap()),
-		amount: Amount::ZERO,
-		fee: Amount::ZERO,
-		htlc_vtxos: vec![],
-		movement_id: MovementId::new(0),
-		preimage: None,
-		finished_at: None,
-	}
-}
-
-fn dummy_lightning_receive() -> LightningReceive {
-	LightningReceive {
-		payment_hash: PaymentHash::from_slice(&[]).unwrap(),
-		payment_preimage: Preimage::from_slice(&[]).unwrap(),
-		invoice: Bolt11Invoice::from_str("bob").unwrap(),
-		preimage_revealed_at: None,
-		htlc_vtxos: vec![],
-		htlc_recv_cltv_delta: 0,
-		movement_id: Some(MovementId::new(0)),
-		finished_at: None,
-	}
-}
-
 fn dummy_movement(status: MovementStatus) -> Movement {
 	Movement {
 		status,
@@ -406,7 +383,7 @@ fn dummy_movement(status: MovementStatus) -> Movement {
 			name: "".to_string(),
 			kind: "".to_string(),
 		},
-		metadata: HashMap::new(),
+		metadata: serde_json::Map::new(),
 		intended_balance: SignedAmount::ZERO,
 		effective_balance: SignedAmount::ZERO,
 		offchain_fee: Amount::ZERO,

@@ -20,7 +20,7 @@ pub const MAX_VEC_SIZE: usize = 4_000_000;
 /// Maximum allowed scriptPubkey size in vbytes
 pub const MAX_SCRIPT_PUBKEY_SIZE: usize = 100;
 
-/// Error occuring during protocol decoding.
+/// Error occurring during protocol decoding.
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolDecodingError {
 	#[error("I/O error: {0}")]
@@ -89,7 +89,12 @@ pub trait ProtocolEncoding: Sized {
 
 	/// Deserialize object from the given byte slice.
 	fn deserialize(mut byte_slice: &[u8]) -> Result<Self, ProtocolDecodingError> {
-		Self::decode(&mut byte_slice)
+		let ret = Self::decode(&mut byte_slice)?;
+		if byte_slice.is_empty() {
+			Ok(ret)
+		} else {
+			Err(ProtocolDecodingError::invalid("trailing bytes"))
+		}
 	}
 
 	/// Serialize the object to a lowercase hex string.
@@ -106,7 +111,12 @@ pub trait ProtocolEncoding: Sized {
 		let mut iter = hex_conservative::HexToBytesIter::new(hex_str).map_err(|e| {
 			ProtocolDecodingError::Io(io::Error::new(io::ErrorKind::InvalidData, e))
 		})?;
-		Self::decode(&mut iter)
+		let ret = Self::decode(&mut iter)?;
+		if iter.next().is_none() {
+			Ok(ret)
+		} else {
+			Err(ProtocolDecodingError::invalid("trailing bytes"))
+		}
 	}
 }
 
@@ -464,9 +474,9 @@ pub struct OversizedVectorError {
 impl OversizedVectorError {
 	/// Check if allocating the requested number of items is allowed
 	pub fn check<T>(requested: usize) -> Result<(), Self> {
-		assert_ne!(mem::size_of::<T>(), 0, "cannot serialize vectors of empty types");
-		let max = MAX_VEC_SIZE.checked_div(mem::size_of::<T>())
-			.expect("size_of always > 0 for instantiable T");
+		// If the division fails we don't allow any items.
+		// This should only happen if `mem::size_of::<T>() == 0
+		let max = MAX_VEC_SIZE.checked_div(mem::size_of::<T>()).unwrap_or(0);
 		if requested > max {
 			Err(Self { requested, max })
 		} else {
@@ -705,8 +715,39 @@ mod test {
 	use bitcoin::hex::DisplayHex;
 	use bitcoin::secp256k1::{self, Keypair};
 
-	use crate::SECP;
+	use crate::{Vtxo, SECP};
+	use crate::test_util::VTXO_VECTORS;
+	use crate::vtxo::Full;
+
 	use super::*;
+
+
+	// Regression: a zero-sized `ProtocolEncoding` used to trip an
+	// `assert_ne!(size_of::<T>(), 0, ...)` inside `OversizedVectorError::check`,
+	// turning any one-byte length-prefixed vector into a panic on decode.
+	#[test]
+	fn length_prefixed_vector_rejects_zero_sized_elements_without_panicking() {
+		#[derive(Clone)]
+		struct EmptyEncoding;
+
+		impl ProtocolEncoding for EmptyEncoding {
+			fn encode<W: io::Write + ?Sized>(&self, _writer: &mut W) -> Result<(), io::Error> {
+				Ok(())
+			}
+
+			fn decode<R: io::Read + ?Sized>(
+				_reader: &mut R,
+			) -> Result<Self, ProtocolDecodingError> {
+				Ok(EmptyEncoding)
+			}
+		}
+
+		let result = EmptyEncoding::deserialize(&[1]);
+		assert!(
+			result.is_err(),
+			"zero-size element encoding was accepted"
+		);
+	}
 
 
 	#[test]
@@ -733,7 +774,6 @@ mod test {
 				&ProtocolEncoding::serialize(&Option::<PublicKey>::None),
 			).unwrap(),
 		);
-
 	}
 
 	#[test]
@@ -753,5 +793,24 @@ mod test {
 		let none = Wrap { pk: None };
 		let json = serde_json::to_string(&none).unwrap();
 		assert_eq!(none, serde_json::from_str(&json).unwrap());
+	}
+
+	#[test]
+	fn reject_trailing_bytes() {
+		let vtxo = &VTXO_VECTORS.board_vtxo;
+
+		let encoded = vtxo.serialize();
+		assert!(<Vtxo<Full> as ProtocolEncoding>::deserialize(&encoded).is_ok());
+
+		let with_trailing = encoded.iter().copied().chain([1u8]).collect::<Vec<_>>();
+		let err = <Vtxo<Full> as ProtocolEncoding>::deserialize(&with_trailing).unwrap_err();
+		assert!(matches!(err, ProtocolDecodingError::Invalid { message, .. } if message == "trailing bytes"));
+
+		let hex = vtxo.serialize_hex();
+		assert!(<Vtxo<Full> as ProtocolEncoding>::deserialize_hex(&hex).is_ok());
+
+		let hex_with_trailing = format!("{}01", hex);
+		let err = <Vtxo<Full> as ProtocolEncoding>::deserialize_hex(&hex_with_trailing).unwrap_err();
+		assert!(matches!(err, ProtocolDecodingError::Invalid { message, .. } if message == "trailing bytes"));
 	}
 }

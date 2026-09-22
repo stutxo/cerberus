@@ -9,10 +9,12 @@ pub mod context;
 pub mod constants;
 pub mod daemon;
 pub mod lightning;
+pub mod ports;
 pub mod util;
 pub mod bark;
 pub mod postgres;
 pub mod exit;
+pub mod control_server;
 
 pub use context::TestContext;
 pub use daemon::{Daemon, DaemonHelper};
@@ -63,6 +65,23 @@ macro_rules! assert_eq {
 	};
 }
 
+/// Check if the bark binary version satisfies the requirement.
+///
+/// Usage:
+/// ```ignore
+/// is_bark_version!(>= "0.1.0-beta.8");
+/// ```
+///
+#[macro_export]
+macro_rules! is_bark_version {
+	($op:tt $version:expr) => {{
+		let actual = $crate::bark::Bark::version().await;
+		let actual = $crate::util::BarkVersion::parse(&actual);
+		let required = $crate::util::BarkVersion::parse($version);
+		actual $op required
+	}};
+}
+
 /// Skip the current test if the bark binary version doesn't satisfy the requirement.
 ///
 /// Usage (as the first line in an async test):
@@ -70,19 +89,39 @@ macro_rules! assert_eq {
 /// require_bark_version!(>= "0.1.0-beta.8");
 /// ```
 ///
-/// DIRTY builds always satisfy `>=` and `>` checks (DIRTY is greater than any release).
+/// Dev builds always satisfy `>=` and `>` checks (dev is greater than any release).
 #[macro_export]
 macro_rules! require_bark_version {
 	($op:tt $version:literal) => {
-		let actual = $crate::bark::Bark::version().await;
-		let actual = $crate::util::BarkVersion::parse(&actual);
-		let required = $crate::util::BarkVersion::parse($version);
-		if !(actual $op required) {
+		if !$crate::is_bark_version!($op $version) {
+			let actual = $crate::bark::Bark::version().await;
 			log::info!(
 				"skipping test: bark {} does not satisfy {} {}",
-				actual, stringify!($op), required,
+				actual, stringify!($op), $version,
 			);
 			return;
+		}
+	};
+}
+
+/// Skip the test unless it is running against the bitcoind chain source.
+///
+/// Some test helpers — notably [`Bark::full_clone`](Bark::full_clone) - only work with the
+/// bitcoind harness, since the esplora/mempool chain source leaves the per-wallet bitcoind
+/// handle unset. Use this at the top of such a test so it is skipped (not failed) under
+/// `CHAIN_SOURCE=esplora`/`mempool`.
+#[macro_export]
+macro_rules! require_bitcoind_chain_source {
+	() => {
+		{
+			let chain_source = $crate::util::get_bark_chain_source_from_env();
+			if !matches!(chain_source, $crate::util::TestContextChainSource::BitcoinCore) {
+				log::info!(
+					"skipping test: requires the bitcoind chain source, but CHAIN_SOURCE is {}",
+					chain_source.as_str(),
+				);
+				return;
+			}
 		}
 	};
 }

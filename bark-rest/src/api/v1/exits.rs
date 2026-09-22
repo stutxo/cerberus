@@ -1,15 +1,17 @@
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{debug_handler, Json, Router};
+use axum::response::Redirect;
 use anyhow::Context;
 use bitcoin::FeeRate;
 use tracing::info;
 use utoipa::OpenApi;
 
-use bark::onchain::ChainSync;
+use bark::exit::ExitError;
 use bark::vtxo::{FilterVtxos, VtxoFilter};
 use bitcoin_ext::FeeRateExt;
 
@@ -20,12 +22,18 @@ use crate::error::{self, HandlerResult, ContextExt, badarg, not_found};
 #[openapi(
 	paths(
 		get_exit_status_by_vtxo_id,
+		get_exit_status_by_vtxo_id_deprecated,
 		get_all_exit_status,
+		get_all_exit_status_deprecated,
+		get_live_exit_status,
+		get_finished_exits,
 		exit_start_vtxos,
 		exit_start_all,
 		exit_progress,
 		exit_claim_vtxos,
 		exit_claim_all,
+		exit_cancel,
+		emergency_exit_fee,
 	),
 	components(schemas(
 		bark_json::web::ExitStatusRequest,
@@ -37,53 +45,43 @@ use crate::error::{self, HandlerResult, ContextExt, badarg, not_found};
 		bark_json::web::ExitClaimAllRequest,
 		bark_json::web::ExitClaimVtxosRequest,
 		bark_json::web::ExitClaimResponse,
+		bark_json::web::ExitCancelResponse,
+		bark_json::web::EmergencyExitFeeEstimateQuery,
+		bark_json::web::EmergencyExitFeeEstimateResponse,
 	)),
 	tags((name = "exits", description = "Move bitcoin back on-chain without server cooperation."))
 )]
 pub struct ExitsApiDoc;
 
-pub fn router() -> Router<ServerState> {
+// The deprecated status routes stay registered until they're removed in a future release.
+#[allow(deprecated)]
+pub fn router() -> Router<Arc<ServerState>> {
 	Router::new()
-		.route("/status/{vtxo_id}", get(get_exit_status_by_vtxo_id))
-		.route("/status", get(get_all_exit_status))
+		.route("/status", get(get_all_exit_status_deprecated))
+		.route("/status/all", get(get_all_exit_status))
+		.route("/status/live", get(get_live_exit_status))
+		.route("/status/finished", get(get_finished_exits))
+		.route("/status/vtxo/{vtxo_id}", get(get_exit_status_by_vtxo_id))
+		.route("/status/{vtxo_id}", get(get_exit_status_by_vtxo_id_deprecated))
 		.route("/start/vtxos", post(exit_start_vtxos))
 		.route("/start/all", post(exit_start_all))
 		.route("/progress", post(exit_progress))
 		.route("/claim/vtxos", post(exit_claim_vtxos))
 		.route("/claim/all", post(exit_claim_all))
+		.route("/cancel/{vtxo_id}", post(exit_cancel))
+		.route("/fee", get(emergency_exit_fee))
 }
 
-#[utoipa::path(
-	get,
-	path = "/status/{vtxo_id}",
-	summary = "Get exit status",
-	params(
-		("vtxo_id" = String, Path, description = "The VTXO to check the exit status of"),
-		("history" = Option<bool>, Query, description = "Whether to include the detailed history of the exit process"),
-		("transactions" = Option<bool>, Query, description = "Whether to include the exit transactions and their CPFP children")
-	),
-	responses(
-		(status = 200, description = "Returns the exit status", body = bark_json::cli::ExitTransactionStatus),
-		(status = 404, description = "VTXO wasn't found", body = error::NotFoundError),
-		(status = 500, description = "Internal server error", body = error::InternalServerError)
-	),
-	description = "Returns the current state of an emergency exit for the specified VTXO, \
-		including which phase the exit is in (start, processing, awaiting-delta, \
-		claimable, claim-in-progress, or claimed). Optionally includes the full state \
-		transition history and the exit transaction packages with their CPFP children.",
-	tag = "exits"
-)]
-#[debug_handler]
-pub async fn get_exit_status_by_vtxo_id(
-	State(state): State<ServerState>,
-	Path(vtxo): Path<String>,
-	Query(query): Query<bark_json::web::ExitStatusRequest>,
+async fn inner_vtxo_exit_status(
+	state: &ServerState,
+	vtxo: String,
+	query: bark_json::web::ExitStatusRequest,
 ) -> HandlerResult<Json<bark_json::cli::ExitTransactionStatus>> {
 	let wallet = state.require_wallet()?;
 
 	let vtxo_id = ark::VtxoId::from_str(&vtxo).badarg("Invalid VTXO ID")?;
 
-	let status = wallet.exit.write().await.get_exit_status(
+	let status = wallet.exit_mgr().get_exit_status(
 		vtxo_id,
 		query.history.unwrap_or(false),
 		query.transactions.unwrap_or(false)
@@ -97,7 +95,61 @@ pub async fn get_exit_status_by_vtxo_id(
 
 #[utoipa::path(
 	get,
-	path = "/status",
+	path = "/status/vtxo/{vtxo_id}",
+	summary = "Get VTXO exit status",
+	params(
+		("vtxo_id" = String, Path, description = "The VTXO to check the exit status of"),
+		("history" = Option<bool>, Query, description = "Whether to include the detailed history of the exit process"),
+		("transactions" = Option<bool>, Query, description = "Whether to include the exit transactions and their CPFP children")
+	),
+	responses(
+		(status = 200, description = "Returns the exit status", body = bark_json::cli::ExitTransactionStatus),
+		(status = 404, description = "VTXO wasn't found", body = error::NotFoundError),
+		(status = 500, description = "Internal server error", body = error::InternalServerError)
+	),
+	description = "Returns the exit status for the given VTXO, live or finished. Optionally \
+		includes the state history and the exit transactions with their CPFP children.",
+	tag = "exits"
+)]
+#[debug_handler]
+pub async fn get_exit_status_by_vtxo_id(
+	State(state): State<Arc<ServerState>>,
+	Path(vtxo): Path<String>,
+	Query(query): Query<bark_json::web::ExitStatusRequest>,
+) -> HandlerResult<Json<bark_json::cli::ExitTransactionStatus>> {
+	inner_vtxo_exit_status(&state, vtxo, query).await
+}
+
+#[utoipa::path(
+	get,
+	path = "/status/{vtxo_id}",
+	summary = "Get exit status (deprecated)",
+	params(
+		("vtxo_id" = String, Path, description = "The VTXO to check the exit status of"),
+		("history" = Option<bool>, Query, description = "Whether to include the detailed history of the exit process"),
+		("transactions" = Option<bool>, Query, description = "Whether to include the exit transactions and their CPFP children")
+	),
+	responses(
+		(status = 200, description = "Returns the exit status", body = bark_json::cli::ExitTransactionStatus),
+		(status = 404, description = "VTXO wasn't found", body = error::NotFoundError),
+		(status = 500, description = "Internal server error", body = error::InternalServerError)
+	),
+	description = "Deprecated: use `GET /exits/status/vtxo/{vtxo_id}` instead.",
+	tag = "exits"
+)]
+#[debug_handler]
+#[deprecated = "use GET /exits/status/vtxo/{vtxo_id} instead"]
+pub async fn get_exit_status_by_vtxo_id_deprecated(
+	State(state): State<Arc<ServerState>>,
+	Path(vtxo): Path<String>,
+	Query(query): Query<bark_json::web::ExitStatusRequest>,
+) -> HandlerResult<Json<bark_json::cli::ExitTransactionStatus>> {
+	inner_vtxo_exit_status(&state, vtxo, query).await
+}
+
+#[utoipa::path(
+	get,
+	path = "/status/all",
 	summary = "List all exit statuses",
 	params(
 		("history" = Option<bool>, Query, description = "Whether to include the detailed history of the exit process"),
@@ -107,33 +159,70 @@ pub async fn get_exit_status_by_vtxo_id(
 		(status = 200, description = "Returns all exit statuses", body = Vec<bark_json::cli::ExitTransactionStatus>),
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
-	description = "Returns the current state of every emergency exit in the wallet. Each \
-		entry includes which phase the exit is in (start, processing, awaiting-delta, \
-		claimable, claim-in-progress, or claimed), and optionally the full state \
-		transition history and the exit transaction packages with their CPFP children.",
+	description = "Returns every exit, live and finished. Optionally includes each exit's \
+		state history and its transactions with their CPFP children.",
 	tag = "exits"
 )]
 #[debug_handler]
 pub async fn get_all_exit_status(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Query(query): Query<bark_json::web::ExitStatusRequest>,
 ) -> HandlerResult<Json<Vec<bark_json::cli::ExitTransactionStatus>>> {
 	let wallet = state.require_wallet()?;
 
-	let exit = wallet.exit.write().await;
-	let mut statuses = Vec::with_capacity(exit.get_exit_vtxos().len());
+	let statuses = wallet.exit_mgr().list_all(
+		query.history.unwrap_or(false),
+		query.transactions.unwrap_or(false),
+	).await.context("Failed to list exits")?;
 
-	for e in exit.get_exit_vtxos() {
-		let status = exit.get_exit_status(
-			e.id(),
-			query.history.unwrap_or(false),
-			query.transactions.unwrap_or(false)
-		).await.badarg("Failed to get exit status")?.unwrap();
+	Ok(axum::Json(statuses.into_iter().map(Into::into).collect()))
+}
 
-		statuses.push(bark_json::cli::ExitTransactionStatus::from(status));
-	}
+#[utoipa::path(
+	get,
+	path = "/status",
+	summary = "List all exit statuses (deprecated)",
+	responses(
+		(status = 308, description = "Permanent redirect to `/exits/status/all`"),
+	),
+	description = "Deprecated: redirects to `GET /exits/status/all`.",
+	tag = "exits"
+)]
+#[debug_handler]
+#[deprecated = "use GET /exits/status/all instead"]
+pub async fn get_all_exit_status_deprecated() -> Redirect {
+	Redirect::permanent("/api/v1/exits/status/all")
+}
 
-	Ok(axum::Json(statuses))
+#[utoipa::path(
+	get,
+	path = "/status/live",
+	summary = "List live exit statuses",
+	params(
+		("history" = Option<bool>, Query, description = "Whether to include the detailed history of the exit process"),
+		("transactions" = Option<bool>, Query, description = "Whether to include the exit transactions and their CPFP children")
+	),
+	responses(
+		(status = 200, description = "Returns the live exit statuses", body = Vec<bark_json::cli::ExitTransactionStatus>),
+		(status = 500, description = "Internal server error", body = error::InternalServerError)
+	),
+	description = "Returns exits that are still progressing. Optionally includes each exit's \
+		state history and its transactions with their CPFP children.",
+	tag = "exits"
+)]
+#[debug_handler]
+pub async fn get_live_exit_status(
+	State(state): State<Arc<ServerState>>,
+	Query(query): Query<bark_json::web::ExitStatusRequest>,
+) -> HandlerResult<Json<Vec<bark_json::cli::ExitTransactionStatus>>> {
+	let wallet = state.require_wallet()?;
+
+	let statuses = wallet.exit_mgr().list_live(
+		query.history.unwrap_or(false),
+		query.transactions.unwrap_or(false),
+	).await.context("Failed to list live exits")?;
+
+	Ok(axum::Json(statuses.into_iter().map(Into::into).collect()))
 }
 
 #[utoipa::path(
@@ -158,7 +247,7 @@ pub async fn get_all_exit_status(
 )]
 #[debug_handler]
 pub async fn exit_start_vtxos(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Json(body): Json<bark_json::web::ExitStartRequest>,
 ) -> HandlerResult<Json<bark_json::web::ExitStartResponse>> {
 	let wallet = state.require_wallet()?;
@@ -188,7 +277,7 @@ pub async fn exit_start_vtxos(
 	let vtxos = spendable.into_iter().chain(inround)
 		.map(|v| v.vtxo).collect::<Vec<_>>();
 
-	wallet.exit.write().await.start_exit_for_vtxos(&vtxos).await
+	wallet.exit_mgr().start_exit_for_vtxos(&vtxos).await
 		.context("Failed to start exit for VTXOs")?;
 
 	Ok(axum::Json(bark_json::web::ExitStartResponse {
@@ -214,11 +303,11 @@ pub async fn exit_start_vtxos(
 )]
 #[debug_handler]
 pub async fn exit_start_all(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 ) -> HandlerResult<Json<bark_json::web::ExitStartResponse>> {
 	let wallet = state.require_wallet()?;
 
-	wallet.exit.write().await.start_exit_for_entire_wallet().await
+	wallet.exit_mgr().start_exit_for_entire_wallet().await
 		.context("Failed to start exit for entire wallet")?;
 
 	Ok(axum::Json(bark_json::web::ExitStartResponse {
@@ -236,72 +325,65 @@ pub async fn exit_start_all(
 		(status = 200, description = "Returns the exit progress", body = bark_json::cli::ExitProgressResponse),
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
-	description = "Triggers all in-progress exits to advance by one step. The daemon already \
-		progresses exits automatically in the background—use this endpoint when you want \
-		immediate progress rather than waiting for the next automatic cycle. On each \
-		call, the endpoint checks whether previously broadcast transactions have \
-		confirmed and, if so, creates and broadcasts the next transaction in the \
-		sequence. The on-chain wallet must have sufficient bitcoin to cover transaction \
-		fees.",
+	description = "Triggers all in-progress exits to advance. The daemon already progresses exits \
+		automatically in the background—use this endpoint when you want immediate progress rather \
+		than waiting for the next automatic cycle. On each call, the endpoint syncs transaction \
+		statuses, advances the exit state machine, and creates or fee-bumps CPFP children for any \
+		exit transactions that need them. The on-chain wallet must have sufficient bitcoin to cover \
+		transaction fees.",
 	tag = "exits"
 )]
 #[debug_handler]
 pub async fn exit_progress(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Json(body): Json<bark_json::web::ExitProgressRequest>,
 ) -> HandlerResult<Json<bark_json::cli::ExitProgressResponse>> {
 	let wallet = state.require_wallet()?;
 
-	let onchain = state.require_onchain()?;
-	let mut onchain_lock = onchain.write().await;
-
 	let fee_rate = body.fee_rate.map(FeeRate::from_sat_per_kvb_ceil);
 
-	onchain_lock.sync(&wallet.chain).await
+	wallet.sync_onchain().await
 		.context("error syncing on-chain wallet")?;
 
-	let mut exit = wallet.exit.write().await;
-	exit.sync_no_progress(&*onchain_lock).await
-		.context("error syncing exit state")?;
-	let result = exit.progress_exits(&wallet, &mut *onchain_lock, fee_rate).await
+	let result = wallet.exit_mgr().progress_exits_with_cpfp(&wallet, fee_rate).await
 		.context("error making progress on exit process")?;
 
-	let done = !exit.has_pending_exits();
-	let claimable_height = exit.all_claimable_at_height().await;
+	let done = !wallet.exit_mgr().has_pending_exits().await;
+	let claimable_height = wallet.exit_mgr().all_claimable_at_height().await;
 	let exits = result.unwrap_or_default();
 
 	Ok(axum::Json(bark_json::cli::ExitProgressResponse {
 		done,
-		claimable_height,
-		exits: exits.into_iter().map(|e| e.into()).collect::<Vec<_>>()
+		claimable_height: claimable_height.map(Into::into),
+		exits: exits.into_iter().map(|e| e.into()).collect::<Vec<_>>(),
+		error: None,
 	}))
 }
 
 async fn inner_claim_vtxos(
 	state: &ServerState,
-	exit: &bark::exit::Exit,
 	address: bitcoin::Address,
-	vtxos: &[&bark::exit::ExitVtxo],
+	vtxos: &[bark::exit::ExitVtxo],
 	fee_rate: Option<FeeRate>,
 ) -> HandlerResult<Json<bark_json::web::ExitClaimResponse>> {
 	let wallet = state.require_wallet()?;
-	let onchain = state.require_onchain()?;
 
 	let address_spk = address.script_pubkey();
-	let psbt = exit.drain_exits(vtxos, &wallet, address, fee_rate).await
+	let psbt = wallet.exit_mgr().drain_exits(vtxos, &wallet, address, fee_rate).await
 		.context("Failed to drain exits")?;
 	let tx = psbt.extract_tx()
 		.context("Failed to extract transaction")?;
-	wallet.chain.broadcast_tx(&tx).await
+	wallet.chain().broadcast_tx(&tx).await
 		.context("Failed to broadcast transaction")?;
 	info!("Drain transaction broadcasted: {}", tx.compute_txid());
 
-	let mut onchain_lock = onchain.write().await;
-
 	// Commit the transaction to the wallet if the claim destination is ours
-	if onchain_lock.is_mine(address_spk) {
-		info!("Adding claim transaction to wallet: {}", tx.compute_txid());
-		onchain_lock.apply_unconfirmed_txs([(tx, ark::time::timestamp_secs())]);
+	if let Some(w) = wallet.onchain() {
+		let mut g = w.write().await;
+		if g.is_mine(&address_spk).await.context("wallet error: is_mine")? {
+			info!("Adding claim transaction to wallet: {}", tx.compute_txid());
+			g.register_tx(&tx).await.context("failed to register claim tx in onchain wallet")?;
+		}
 	}
 
 	Ok(axum::Json(bark_json::web::ExitClaimResponse {
@@ -331,7 +413,7 @@ async fn inner_claim_vtxos(
 )]
 #[debug_handler]
 pub async fn exit_claim_vtxos(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Json(body): Json<bark_json::web::ExitClaimVtxosRequest>,
 ) -> HandlerResult<Json<bark_json::web::ExitClaimResponse>> {
 	let wallet = state.require_wallet()?;
@@ -342,7 +424,7 @@ pub async fn exit_claim_vtxos(
 		.require_network(network)
 		.badarg("Address is not valid for configured network")?;
 
-	let exit = wallet.exit.read().await;
+	let claimable = wallet.exit_mgr().list_claimable().await;
 	let vtxos = {
 		let mut vtxo_ids = HashSet::new();
 		for s in body.vtxos {
@@ -351,7 +433,7 @@ pub async fn exit_claim_vtxos(
 			vtxo_ids.insert(id);
 		}
 
-		let vtxos = exit.list_claimable().into_iter()
+		let vtxos = claimable.into_iter()
 			.filter(|v| vtxo_ids.remove(&v.id()))
 			.collect::<Vec<_>>();
 
@@ -363,7 +445,7 @@ pub async fn exit_claim_vtxos(
 
 	let fee_rate = body.fee_rate.map(FeeRate::from_sat_per_kvb_ceil);
 
-	inner_claim_vtxos(&state, &*exit, address, &vtxos, fee_rate).await
+	inner_claim_vtxos(&state, address, &vtxos, fee_rate).await
 }
 
 #[utoipa::path(
@@ -386,7 +468,7 @@ pub async fn exit_claim_vtxos(
 )]
 #[debug_handler]
 pub async fn exit_claim_all(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Json(body): Json<bark_json::web::ExitClaimAllRequest>,
 ) -> HandlerResult<Json<bark_json::web::ExitClaimResponse>> {
 	let wallet = state.require_wallet()?;
@@ -397,10 +479,178 @@ pub async fn exit_claim_all(
 		.require_network(network)
 		.badarg("Address is not valid for configured network")?;
 
-	let exit = wallet.exit.read().await;
-	let vtxos = exit.list_claimable();
+	let vtxos = wallet.exit_mgr().list_claimable().await;
 
 	let fee_rate = body.fee_rate.map(FeeRate::from_sat_per_kvb_ceil);
 
-	inner_claim_vtxos(&state, &*exit, address, &vtxos, fee_rate).await
+	inner_claim_vtxos(&state, address, &vtxos, fee_rate).await
+}
+
+#[utoipa::path(
+	post,
+	path = "/cancel/{vtxo_id}",
+	summary = "Cancel an exit",
+	params(
+		("vtxo_id" = String, Path, description = "The VTXO whose unilateral exit should be canceled"),
+	),
+	responses(
+		(status = 200, description = "Exit canceled successfully", body = bark_json::web::ExitCancelResponse),
+		(status = 400, description = "The VTXO ID is invalid, or the exit can no longer be \
+			canceled because its final transaction has already been broadcast", body = error::BadRequestError),
+		(status = 404, description = "The VTXO has no exit", body = error::NotFoundError),
+		(status = 500, description = "Internal server error", body = error::InternalServerError)
+	),
+	description = "Aborts an in-progress emergency exit while it is still safe to do so—before \
+		its final transaction has been broadcast. Exit transactions are ordered topologically and \
+		only the final one moves the VTXO on-chain, so an exit can still be canceled even after its \
+		shared ancestor transactions are in the mempool or a block. Canceling leaves the VTXO \
+		spendable, so a fresh exit can be started for it later. Before canceling, the endpoint \
+		verifies directly against the chain that the final transaction hasn't been broadcast; \
+		nothing is rebroadcast in the process. Canceling an already-canceled exit succeeds as a \
+		no-op, so retries are safe. Note the daemon auto-progresses exits at the cadence defined \
+		by `SLOW_INTERVAL`, so cancel promptly once an exit reaches a state you no longer wish \
+		to pursue.",
+	tag = "exits"
+)]
+#[debug_handler]
+pub async fn exit_cancel(
+	State(state): State<Arc<ServerState>>,
+	Path(vtxo): Path<String>,
+) -> HandlerResult<Json<bark_json::web::ExitCancelResponse>> {
+	let wallet = state.require_wallet()?;
+
+	let vtxo_id = ark::VtxoId::from_str(&vtxo).badarg("Invalid VTXO ID")?;
+
+	if let Err(e) = wallet.exit_mgr().cancel_exit(vtxo_id).await {
+		match e {
+			bark::exit::ExitError::NotExiting { .. } => {
+				not_found!([vtxo_id], "No exit found for VTXO");
+			},
+			bark::exit::ExitError::CannotCancelExit { state, .. } => {
+				badarg!("Exit can no longer be canceled (state: {})", state);
+			},
+			bark::exit::ExitError::ExitTxAlreadyBroadcast { txid, .. } => {
+				badarg!("Exit can no longer be canceled (final exit tx {} has already been broadcast)", txid);
+			},
+			other => {
+				return Err(anyhow::Error::from(other)
+					.context("Failed to cancel exit").into());
+			},
+		}
+	}
+
+	Ok(axum::Json(bark_json::web::ExitCancelResponse {
+		message: "Exit canceled successfully".to_string(),
+	}))
+}
+
+#[utoipa::path(
+	get,
+	path = "/status/finished",
+	summary = "List finished exits",
+	params(
+		("history" = Option<bool>, Query, description = "Whether to include the detailed state history of each finished exit"),
+		("transactions" = Option<bool>, Query, description = "Whether to include the exit transactions and their CPFP children"),
+	),
+	responses(
+		(status = 200, description = "Returns the finished exits", body = Vec<bark_json::cli::ExitTransactionStatus>),
+		(status = 500, description = "Internal server error", body = error::InternalServerError)
+	),
+	description = "Returns exits that reached a terminal state: claimed, aborted because the \
+		VTXO was already spent, or canceled. Finished exits are dropped from active tracking—\
+		they are never progressed—but they're retained for auditing and surfaced here.",
+	tag = "exits"
+)]
+#[debug_handler]
+pub async fn get_finished_exits(
+	State(state): State<Arc<ServerState>>,
+	Query(query): Query<bark_json::web::ExitStatusRequest>,
+) -> HandlerResult<Json<Vec<bark_json::cli::ExitTransactionStatus>>> {
+	let wallet = state.require_wallet()?;
+
+	let statuses = wallet.exit_mgr().list_finished(
+		query.history.unwrap_or(false),
+		query.transactions.unwrap_or(false),
+	).await.context("Failed to list finished exits")?;
+
+	Ok(axum::Json(statuses.into_iter().map(Into::into).collect()))
+}
+
+#[utoipa::path(
+	get,
+	path = "/fee",
+	summary = "Estimate emergency exit fee",
+	params(
+		("vtxo_ids" = Option<String>, Query, description = "Comma-separated VTXO ids to exit; omit to exit the entire wallet"),
+		("fee_rate_sat_per_vb" = Option<u64>, Query, description = "Fee rate in sat/vB applied to both legs; omit to price the broadcast leg at the current fast rate and the claim leg at the regular rate"),
+		("destination" = Option<String>, Query, description = "Claim destination address; omit to use a placeholder for weighing"),
+	),
+	responses(
+		(status = 200, description = "Returns the emergency exit fee breakdown", body = bark_json::web::EmergencyExitFeeEstimateResponse),
+		(status = 400, description = "A VTXO is unknown, dust, already exited, or already spent, or a parameter is invalid", body = error::BadRequestError),
+		(status = 500, description = "Internal server error", body = error::InternalServerError)
+	),
+	description = "Estimates the on-chain cost of unilaterally (emergency) exiting a set of VTXOs \
+		without server cooperation. The breakdown separates the broadcast cost—CPFP-bumping every \
+		not-yet-confirmed transaction in each VTXO's exit tree, paid now from confirmed on-chain \
+		funds—from the claim cost of the single batched transaction that later drains the matured \
+		outputs. The estimate reflects current chain state, so exit transactions already confirmed \
+		cost nothing. `fundable` is false when the wallet's confirmed on-chain balance can't cover \
+		the full broadcast walk, which would stall the exit midway.",
+	tag = "exits"
+)]
+#[debug_handler]
+pub async fn emergency_exit_fee(
+	State(state): State<Arc<ServerState>>,
+	Query(query): Query<bark_json::web::EmergencyExitFeeEstimateQuery>,
+) -> HandlerResult<Json<bark_json::web::EmergencyExitFeeEstimateResponse>> {
+	let wallet = state.require_wallet()?;
+
+	// The query param is a comma-separated string (axum's Query extractor can't deserialize
+	// repeated keys into a Vec). Trim each entry and ignore empties so a trailing comma or a stray
+	// `a,,b` doesn't surface as an opaque parse error.
+	let vtxo_ids = match query.vtxo_ids {
+		Some(ref s) => s.split(',')
+			.map(str::trim)
+			.filter(|id| !id.is_empty())
+			.map(ark::VtxoId::from_str)
+			.collect::<Result<Vec<_>, _>>()
+			.badarg("Invalid VTXO ID")?,
+		None => wallet.spendable_vtxos().await
+			.context("Failed to list spendable VTXOs")?
+			.into_iter().map(|v| v.vtxo.id()).collect(),
+	};
+
+	let fee_rate = match query.fee_rate_sat_per_vb {
+		Some(v) => Some(FeeRate::from_sat_per_vb(v).badarg("Fee rate too large")?),
+		None => None,
+	};
+
+	let destination = match query.destination {
+		Some(ref s) => {
+			let network = wallet.network().await?;
+			let address = bitcoin::Address::from_str(s)
+				.badarg("Invalid destination address")?
+				.require_network(network)
+				.badarg("Address is not valid for configured network")?;
+			Some(address)
+		},
+		None => None,
+	};
+
+	// Sync the on-chain wallet so the `fundable` check sees current confirmed funds.
+	wallet.sync_onchain().await.context("error syncing on-chain wallet")?;
+	let result = wallet
+		.estimate_emergency_exit_fee(&vtxo_ids, fee_rate, destination)
+		.await;
+
+	let estimate = match &result {
+		Err(ExitError::DustLimit { vtxo, .. }) => badarg!("Provided VTXO {} is dust", vtxo),
+		Err(ExitError::UnknownVtxo { vtxo }) => badarg!("Provided VTXO {} is unknown", vtxo),
+		Err(ExitError::VtxoAlreadyExited { vtxo }) => badarg!("Provided VTXO {} has already exited", vtxo),
+		Err(ExitError::VtxoAlreadySpent { vtxo }) => badarg!("Provided VTXO {} has already been spent", vtxo),
+		_ => result.context("Failed to estimate emergency exit fee")?,
+	};
+
+	Ok(axum::Json(estimate.into()))
 }

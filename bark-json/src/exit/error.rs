@@ -1,4 +1,4 @@
-use bitcoin::{Amount, FeeRate, Txid};
+use bitcoin::{Amount, Txid};
 use thiserror::Error;
 
 use ark::VtxoId;
@@ -6,6 +6,7 @@ use bitcoin_ext::BlockHeight;
 #[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
 
+use crate::exit::ExitStateKind;
 use crate::exit::states::ExitTxStatus;
 
 #[derive(Clone, Debug, Error, PartialEq, Eq, Deserialize, Serialize)]
@@ -20,7 +21,18 @@ pub enum ExitError {
 	},
 
 	#[error("Block Retrieval Failure: Unable to retrieve a block at height {height}: {error}")]
-	BlockRetrievalFailure { height: BlockHeight, error: String },
+	BlockRetrievalFailure {
+		#[cfg_attr(feature = "utoipa", schema(value_type = u32))]
+		height: BlockHeight,
+		error: String
+	},
+
+	#[error("Cannot Cancel Exit: The exit for VTXO {vtxo} can no longer be canceled (state: {state})")]
+	CannotCancelExit {
+		#[cfg_attr(feature = "utoipa", schema(value_type = String))]
+		vtxo: VtxoId,
+		state: ExitStateKind,
+	},
 
 	#[error("Claim Missing Inputs: No inputs given to claim")]
 	ClaimMissingInputs,
@@ -58,10 +70,15 @@ pub enum ExitError {
 	#[error("Database Retrieval Failure: Unable to get child tx: {error}")]
 	DatabaseChildRetrievalFailure { error: String },
 
-	#[error("Dust Limit Error: The dust limit for a VTXO is {dust} but the balance is only {vtxo}")]
+	#[error("Database Store Failure: Unable to store child tx: {error}")]
+	DatabaseChildStoreFailure { error: String },
+
+	#[error("Dust Limit Error: The dust limit for a VTXO is {dust} but vtxo {vtxo} is only {amount}")]
 	DustLimit {
+		#[cfg_attr(feature = "utoipa", schema(value_type = String))]
+		vtxo: VtxoId,
 		#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
-		vtxo: Amount,
+		amount: Amount,
 		#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
 		dust: Amount
 	},
@@ -83,26 +100,20 @@ pub enum ExitError {
 		error: String
 	},
 
+	#[error("Exit Tx Already Broadcast: Cannot cancel the exit for VTXO {vtxo}, its final exit tx {txid} has already been broadcast")]
+	ExitTxAlreadyBroadcast {
+		#[cfg_attr(feature = "utoipa", schema(value_type = String))]
+		vtxo: VtxoId,
+		#[cfg_attr(feature = "utoipa", schema(value_type = String))]
+		txid: Txid,
+	},
+
 	#[error("Insufficient Confirmed Funds: {needed} is needed but only {available} is available")]
 	InsufficientConfirmedFunds {
 		#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
 		needed: Amount,
 		#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
 		available: Amount
-	},
-
-	#[error("Insufficient Fee Error: Your balance is {balance} but an estimated {total_fee} (fee rate of {fee_rate}) is required to exit the VTXO")]
-	InsufficientFeeToStart {
-		#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
-		balance: Amount,
-		#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
-		total_fee: Amount,
-		#[serde(rename = "fee_rate_sat_per_kvb", with = "crate::serde_utils::fee_rate_sat_per_kvb")]
-		#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
-		fee_rate: FeeRate,
-		#[deprecated(note = "use fee_rate_sat_per_kvb instead")]
-		#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
-		fee_rate_kwu: u64,
 	},
 
 	#[error("Internal Error: An unexpected problem occurred, {error}")]
@@ -117,7 +128,11 @@ pub enum ExitError {
 	},
 
 	#[error("Invalid LockTime ({tip}): {error}")]
-	InvalidLocktime { tip: BlockHeight, error: String },
+	InvalidLocktime {
+		#[cfg_attr(feature = "utoipa", schema(value_type = u32))]
+		tip: BlockHeight,
+		error: String
+	},
 
 	#[error("Invalid Wallet State: {error}")]
 	InvalidWalletState { error: String },
@@ -128,8 +143,18 @@ pub enum ExitError {
 	#[error("Missing VTXO Transaction: Couldn't find exit tx {txid}")]
 	MissingExitTransaction { #[cfg_attr(feature = "utoipa", schema(value_type = String))] txid: Txid },
 
+	#[error("Non-Standard VTXO {vtxo}: exit chain is not relayable: {error}")]
+	NonStandardVtxo {
+		#[cfg_attr(feature = "utoipa", schema(value_type = String))]
+		vtxo: VtxoId,
+		error: String,
+	},
+
 	#[error("Movement Registration Failure: {error}")]
 	MovementRegistrationFailure { error: String },
+
+	#[error("Not Exiting: VTXO {vtxo} has no unilateral exit")]
+	NotExiting { #[cfg_attr(feature = "utoipa", schema(value_type = String))] vtxo: VtxoId },
 
 	#[error("Tip Retrieval Failure: Unable to retrieve the blockchain tip height: {error}")]
 	TipRetrievalFailure { error: String },
@@ -139,6 +164,15 @@ pub enum ExitError {
 
 	#[error("VTXO Not Spendable Error: Attempted to claim a VTXO which is not in a spendable state: {vtxo}")]
 	VtxoNotClaimable { #[cfg_attr(feature = "utoipa", schema(value_type = String))] vtxo: VtxoId },
+
+	#[error("Unknown VTXO: {vtxo} is not known to this wallet")]
+	UnknownVtxo { #[cfg_attr(feature = "utoipa", schema(value_type = String))] vtxo: VtxoId },
+
+	#[error("VTXO Already Exited: {vtxo} has already completed its unilateral exit")]
+	VtxoAlreadyExited { #[cfg_attr(feature = "utoipa", schema(value_type = String))] vtxo: VtxoId },
+
+	#[error("VTXO Already Spent: {vtxo} has already been spent and can no longer be exited")]
+	VtxoAlreadySpent { #[cfg_attr(feature = "utoipa", schema(value_type = String))] vtxo: VtxoId },
 
 	#[error("VTXO ScriptPubKey Invalid: {error}")]
 	VtxoScriptPubKeyInvalid { error: String },
@@ -174,11 +208,14 @@ impl From<bark::exit::ExitError> for ExitError {
 			bark::exit::ExitError::DatabaseChildRetrievalFailure { error } => {
 				ExitError::DatabaseChildRetrievalFailure { error }
 			},
-			bark::exit::ExitError::DustLimit { vtxo, dust } => {
-				ExitError::DustLimit { vtxo, dust }
+			bark::exit::ExitError::DatabaseChildStoreFailure { error } => {
+				ExitError::DatabaseChildStoreFailure { error }
+			},
+			bark::exit::ExitError::DustLimit { vtxo, amount, dust } => {
+				ExitError::DustLimit { vtxo, amount, dust }
 			},
 			bark::exit::ExitError::ExitPackageBroadcastFailure { txid, error } => {
-				ExitError::ExitPackageBroadcastFailure { txid, error }
+				ExitError::ExitPackageBroadcastFailure { txid, error: error.to_string() }
 			},
 			bark::exit::ExitError::ExitPackageFinalizeFailure { error } => {
 				ExitError::ExitPackageFinalizeFailure { error }
@@ -186,12 +223,11 @@ impl From<bark::exit::ExitError> for ExitError {
 			bark::exit::ExitError::ExitPackageStoreFailure { txid, error } => {
 				ExitError::ExitPackageStoreFailure { txid, error }
 			},
+			bark::exit::ExitError::ExitTxAlreadyBroadcast { vtxo, txid } => {
+				ExitError::ExitTxAlreadyBroadcast { vtxo, txid }
+			},
 			bark::exit::ExitError::InsufficientConfirmedFunds { needed, available } => {
 				ExitError::InsufficientConfirmedFunds { needed, available }
-			},
-			bark::exit::ExitError::InsufficientFeeToStart { balance, total_fee, fee_rate } => {
-				let fee_rate_kwu = fee_rate.to_sat_per_kwu();
-				ExitError::InsufficientFeeToStart { balance, total_fee, fee_rate, fee_rate_kwu }
 			},
 			bark::exit::ExitError::InternalError { error } => {
 				ExitError::InternalError { error }
@@ -211,8 +247,17 @@ impl From<bark::exit::ExitError> for ExitError {
 			bark::exit::ExitError::MissingExitTransaction { txid } => {
 				ExitError::MissingExitTransaction { txid }
 			},
+			bark::exit::ExitError::NonStandardVtxo { vtxo, error } => {
+				ExitError::NonStandardVtxo { vtxo, error: error.to_string() }
+			},
 			bark::exit::ExitError::MovementRegistrationFailure { error } => {
 				ExitError::MovementRegistrationFailure { error }
+			},
+			bark::exit::ExitError::CannotCancelExit { vtxo, state } => {
+				ExitError::CannotCancelExit { vtxo, state: state.into() }
+			},
+			bark::exit::ExitError::NotExiting { vtxo } => {
+				ExitError::NotExiting { vtxo }
 			},
 			bark::exit::ExitError::TipRetrievalFailure { error } => {
 				ExitError::TipRetrievalFailure { error }
@@ -222,6 +267,15 @@ impl From<bark::exit::ExitError> for ExitError {
 			},
 			bark::exit::ExitError::VtxoNotClaimable { vtxo } => {
 				ExitError::VtxoNotClaimable { vtxo }
+			},
+			bark::exit::ExitError::UnknownVtxo { vtxo } => {
+				ExitError::UnknownVtxo { vtxo }
+			},
+			bark::exit::ExitError::VtxoAlreadyExited { vtxo } => {
+				ExitError::VtxoAlreadyExited { vtxo }
+			},
+			bark::exit::ExitError::VtxoAlreadySpent { vtxo } => {
+				ExitError::VtxoAlreadySpent { vtxo }
 			},
 			bark::exit::ExitError::VtxoScriptPubKeyInvalid { error } => {
 				ExitError::VtxoScriptPubKeyInvalid { error }

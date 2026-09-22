@@ -1,6 +1,7 @@
 
 debug/
 target/
+/build/
 .direnv/
 rustdocs/
 /test/
@@ -24,3 +25,9 @@ contrib/agents/ci-debugging/
 
 # macOS
 .DS_Store
+
+# LLMs
+.investigations/
+
+# CI devShell env payloads, generated per-pipeline by contrib/generate-ci-env.sh
+/contrib/ci-env/*.env

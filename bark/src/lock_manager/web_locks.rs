@@ -36,6 +36,7 @@
 //!   [`super::LockManager`] implementation available there.
 
 use anyhow::{anyhow, bail, Context};
+use bitcoin::bip32::Fingerprint;
 use futures::channel::oneshot;
 use js_sys::{Function, Object, Reflect};
 use wasm_bindgen::closure::Closure;
@@ -44,11 +45,21 @@ use wasm_bindgen_futures::future_to_promise;
 
 use super::{LockGuard, LockManager, key::validate_key};
 
-pub struct WebLockManager;
+pub struct WebLockManager {
+	wallet_fingerprint: Option<Fingerprint>,
+}
 
 impl WebLockManager {
 	pub fn new() -> Self {
-		Self
+		Self {
+			wallet_fingerprint: None,
+		}
+	}
+
+	pub fn new_with_fingerprint(wallet_fingerprint: Fingerprint) -> Self {
+		Self {
+			wallet_fingerprint: Some(wallet_fingerprint),
+		}
 	}
 }
 
@@ -62,14 +73,20 @@ impl std::fmt::Debug for WebLockManager {
 	}
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl LockManager for WebLockManager {
 	async fn try_lock(&self, key: &str) -> Option<Box<dyn LockGuard>> {
 		if let Err(e) = validate_key(key) {
 			log::warn!("rejecting lock key {:?}: {:#}", key, e);
 			return None;
 		}
-		match request(key).await {
+		let key = if let Some(fp) = self.wallet_fingerprint {
+			format!("bark.{}.{}", fp, key)
+		} else {
+			format!("bark.{}", key)
+		};
+		match request(&key).await {
 			Ok(Some(g)) => Some(Box::new(g)),
 			// Lock is held by another caller — `ifAvailable` returned null.
 			Ok(None) => None,

@@ -1,3 +1,11 @@
+//! gRPC server implementations for the public ark, mailbox, admin and intman
+//! services.
+//!
+//! Rate limiting, per-IP throttling and per-method concurrency caps are
+//! **not** implemented here. All of that is owned by the reverse proxy in
+//! front of captaind. Don't add a server-side equivalent; that path was
+//! removed on purpose and would duplicate configuration that ops already
+//! owns.
 
 pub mod admin;
 pub mod ark;
@@ -7,26 +15,44 @@ mod middleware;
 mod convert;
 mod macros;
 
-use std::fmt;
+use std::fmt::{self, Write};
 use std::sync::atomic::{self, AtomicBool};
 
 use tokio::sync::oneshot;
-use tracing::trace;
+use tracing::{trace, warn};
 
-use server_rpc::RequestExt;
+use server_rpc::{pver, RequestExt};
 
-use crate::error::{BadArgument, NotFound};
+use crate::error::{BadArgument, NotFound, UnusableInputs};
 
 
 /// The minimum protocol version supported by the server.
 ///
-/// For info on protocol versions, see [server_rpc] module documentation.
-pub const MIN_PROTOCOL_VERSION: u64 = 1;
+/// For info on protocol versions, see [server_rpc::pver] module documentation.
+pub const MIN_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_PPM_FEE_TOTAL;
 
 /// The maximum protocol version supported by the server.
 ///
-/// For info on protocol versions, see [server_rpc] module documentation.
-pub const MAX_PROTOCOL_VERSION: u64 = 1;
+/// For info on protocol versions, see [server_rpc::pver] module documentation.
+pub const MAX_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES;
+
+/// Default maximum number of remotely-reset HTTP/2 streams that may sit in a
+/// connection's accept queue before h2 closes the connection.
+///
+/// h2's default of 20 is a "rapid reset" (CVE-2023-44487) mitigation, but
+/// legitimate traffic hits it too: a proxy or load balancer in front of us
+/// multiplexes many clients onto a single HTTP/2 connection, so a burst of
+/// client-side cancellations (request timeouts, dropped subscription streams)
+/// arriving while we are slow to accept trips the limit and h2 tears down the
+/// whole shared connection with a GOAWAY (ENHANCE_YOUR_CALM "too_many_resets").
+/// This shows up in our logs as h2's "recv_reset; remotely-reset
+/// pending-accept streams reached limit" warning.
+///
+/// We raise the limit well above the per-connection concurrent stream limit
+/// (hyper's default is 200) so that even a peer canceling everything it has
+/// in flight at once doesn't kill the connection. Memory impact is small:
+/// only bookkeeping for the already-dead streams is kept until accepted.
+pub(crate) const DEFAULT_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 1000;
 
 /// Whether to provide rich internal errors to RPC users.
 ///
@@ -50,12 +76,37 @@ impl ToStatus for anyhow::Error {
 		trace!("RPC ERROR: {:?}", self);
 		if let Some(nf) = self.downcast_ref::<NotFound>() {
 			let mut metadata = tonic::metadata::MetadataMap::new();
-			let ids = nf.identifiers().join(",").parse().expect("non-ascii identifier");
-			metadata.insert("identifiers", ids);
+			// Identifiers can originate from arbitrary user input (e.g. a
+			// Lightning-receive anti-DoS token) so they are not guaranteed to be
+			// ASCII. Metadata headers must be ASCII, so drop the metadata rather
+			// than panic if the joined identifiers do not parse.
+			if let Ok(ids) = nf.identifiers().join(",").parse() {
+				metadata.insert("identifiers", ids);
+			}
 			tonic::Status::with_metadata(tonic::Code::NotFound, format!("{:#}", self), metadata)
+		} else if let Some(ui) = self.downcast_ref::<UnusableInputs>() {
+			// Like a bad argument, but we attach the offending VTXO ids so the
+			// client can drop exactly those inputs and retry without them.
+			let ids = {
+				let ids = ui.identifiers();
+				let mut buf = String::with_capacity(ids.len() * 65);
+				for (i, id) in ids.iter().enumerate() {
+					if i > 0 {
+						buf.push_str(",");
+					}
+					write!(&mut buf, "{}", id).unwrap();
+				}
+				buf.parse().expect("non-ascii identifier")
+			};
+			let mut metadata = tonic::metadata::MetadataMap::new();
+			metadata.insert("identifiers", ids);
+			tonic::Status::with_metadata(tonic::Code::InvalidArgument, format!("{:#}", self), metadata)
 		} else if let Some(_) = self.downcast_ref::<BadArgument>() {
 			tonic::Status::invalid_argument(format!("{:#}", self))
 		} else {
+			// Without rich errors the client only sees "internal error",
+			// so this is the only place that records the cause.
+			warn!("RPC internal error: {:#}", self);
 			if RPC_RICH_ERRORS.load(atomic::Ordering::Relaxed) {
 				tonic::Status::internal(format!("{:#}", self))
 			} else {

@@ -2,16 +2,18 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use bitcoin::{Network, Transaction, Txid};
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, warn};
 use tokio::sync::RwLock;
 
 use ark::vtxo::Full;
 use ark::Vtxo;
 use bitcoin_ext::{BlockHeight, TransactionExt, TxStatus, DEEPLY_CONFIRMED};
 
-use crate::chain::ChainSource;
-use crate::exit::models::{ChildTransactionInfo, ExitChildStatus, ExitError, ExitTransactionPackage, ExitTxOrigin, TransactionInfo};
-use crate::onchain::ExitUnilaterally;
+use crate::chain::{BroadcastError, ChainSource};
+use crate::exit::models::{
+	ChildTransactionInfo, ExitChildStatus, ExitError, ExitTransactionPackage, ExitTxOrigin, FeeInfo,
+	TransactionInfo,
+};
 use crate::persist::BarkPersister;
 
 pub struct ExitTransactionManager {
@@ -20,6 +22,9 @@ pub struct ExitTransactionManager {
 	packages: Vec<Arc<RwLock<ExitTransactionPackage>>>,
 	index: HashMap<Txid, Weak<RwLock<ExitTransactionPackage>>>,
 	status: HashMap<Txid, TxStatus>,
+	/// How many tracked exits reference each exit (parent) transaction. Sibling VTXOs share
+	/// ancestor transactions in the exit tree, so a tx may be needed by several exits at once.
+	refcount: HashMap<Txid, usize>,
 }
 
 impl ExitTransactionManager {
@@ -33,6 +38,7 @@ impl ExitTransactionManager {
 			packages: Vec::new(),
 			index: HashMap::new(),
 			status: HashMap::new(),
+			refcount: HashMap::new(),
 		})
 	}
 
@@ -43,12 +49,11 @@ impl ExitTransactionManager {
 	pub async fn track_vtxo_exits(
 		&mut self,
 		vtxo: &Vtxo<Full>,
-		onchain: &dyn ExitUnilaterally,
 	) -> anyhow::Result<Vec<Txid>, ExitError> {
 		let exit_txs = vtxo.transactions();
 		let mut txids = Vec::with_capacity(exit_txs.len());
 		for tx in exit_txs {
-			txids.push(self.track_exit_tx(tx.tx, onchain).await?);
+			txids.push(self.track_exit_tx(tx.tx).await?);
 		}
 		Ok(txids)
 	}
@@ -56,19 +61,18 @@ impl ExitTransactionManager {
 	pub async fn track_exit_tx(
 		&mut self,
 		tx: Transaction,
-		onchain: &dyn ExitUnilaterally,
 	) -> anyhow::Result<Txid, ExitError> {
 		let txid = tx.compute_txid();
 		if self.index.contains_key(&txid) {
+			*self.refcount.entry(txid).or_insert(0) += 1;
 			return Ok(txid);
 		}
 
 		trace!("Tracking exit tx {}", txid);
 
-		// We should check the wallet/database to see if we have a child transaction stored locally
 		let package = {
 			let info = TransactionInfo { txid, tx };
-			let child = self.find_child_locally(&info, onchain).await?;
+			let child = self.find_child_in_database(&info).await?;
 			trace!("Found local child for exit tx {}: {}", txid, child.is_some());
 			ExitTransactionPackage {
 				child,
@@ -93,13 +97,74 @@ impl ExitTransactionManager {
 		}
 		self.status.insert(txid, status);
 		self.packages.push(package);
+		*self.refcount.entry(txid).or_insert(0) += 1;
 		Ok(txid)
+	}
+
+	/// Drops references to the given exit (parent) transactions, removing each from memory once
+	/// no tracked exit references it any more. Used when an exit is canceled so we stop syncing
+	/// its transactions; ancestor transactions still needed by sibling exits are retained.
+	///
+	/// `exit_txids` should be the txids returned by [Self::track_vtxo_exits] for the canceled exit.
+	pub async fn untrack_vtxo_exits(&mut self, exit_txids: &[Txid]) {
+		for txid in exit_txids {
+			let remaining = match self.refcount.get_mut(txid) {
+				Some(count) => {
+					*count = count.saturating_sub(1);
+					*count
+				},
+				None => {
+					warn!("Attempt to untrack exit tx {} that isn't tracked", txid);
+					continue;
+				},
+			};
+			if remaining > 0 {
+				trace!("Exit tx {} still referenced by {} exit(s), keeping it", txid, remaining);
+				continue;
+			}
+
+			trace!("Dropping exit tx {} from the transaction manager", txid);
+			self.refcount.remove(txid);
+
+			// Grab the package (and its child txid) before we drop it so we can purge every
+			// index entry that points at it.
+			let package = self.index.get(txid).and_then(|w| w.upgrade());
+			let child_txid = match &package {
+				Some(p) => p.read().await.child.as_ref().map(|c| c.info.txid),
+				None => None,
+			};
+
+			self.index.remove(txid);
+			if let Some(child_txid) = child_txid {
+				self.index.remove(&child_txid);
+			}
+			self.status.remove(txid);
+			if let Some(package) = package {
+				match self.packages.iter().position(|p| Arc::ptr_eq(p, &package)) {
+					Some(pos) => {
+						self.packages.swap_remove(pos);
+					},
+					None => warn!("package with txid {} should be in the list", txid),
+				}
+			}
+		}
 	}
 
 	pub async fn sync(&mut self) -> anyhow::Result<(), ExitError> {
 		trace!("Syncing exit transaction manager");
-		let tip = self.tip().await?;
+		self.update_tx_statuses().await
+	}
 
+	/// Refreshes the chain status of a single exit transaction and returns it.
+	pub async fn sync_exit_tx(&mut self, txid: Txid) -> anyhow::Result<TxStatus, ExitError> {
+		trace!("Refreshing status of exit tx {} without rebroadcasting", txid);
+		let tip = self.tip().await?;
+		self.update_one_tx_status(txid, tip, false).await?;
+		self.tx_status(txid).await
+	}
+
+	async fn update_tx_statuses(&mut self) -> anyhow::Result<(), ExitError> {
+		let tip = self.tip().await?;
 		let keys = self.status.keys().cloned().collect::<Vec<_>>();
 		for txid in keys {
 			// We should query the status of every transaction unless they're already deeply
@@ -107,50 +172,70 @@ impl ExitTransactionManager {
 			let status = self.status.get(&txid).unwrap();
 			if let TxStatus::Confirmed(block) = status {
 				trace!("Skipping deeply confirmed exit tx {}", txid);
-				if block.height <= (tip - DEEPLY_CONFIRMED) {
+				if block.height <= tip.saturating_sub(DEEPLY_CONFIRMED) {
 					continue;
 				}
 			}
-			match self.index.get(&txid) {
-				// If the transaction is not an exit package, we can just update its status
-				None => {
-					trace!("Updating status for non-exit tx {}", txid);
-					self.status.insert(txid, self.get_tx_status(txid).await?);
-				},
-				// If the transaction is a package, we must query the status of both transactions
-				Some(weak_ptr) => {
-					trace!("Update status for exit tx {}", txid);
-					let package = weak_ptr.upgrade().expect("index contains a stale package");
-					let status = self.get_tx_status(txid).await?;
-					trace!("Exit tx {} old status {:?}, new status {:?}", txid, self.status.get(&txid), Some(status));
+			// Failures for one tx should not abort the whole sync. The most common cause is
+			// a race between our status check and the chain source's view (e.g. esplora
+			// reports a tx as mempool while bitcoind's mempool has already evicted or
+			// confirmed it). Log and move on — the next sync tick will retry. Each exit's
+			// own `progress()` call surfaces fatal problems via its per-VTXO error field.
+			if let Err(e) = self.update_one_tx_status(txid, tip, true).await {
+				warn!("Failed to update status for exit tx {}: {:#}", txid, e);
+			}
+		}
+		Ok(())
+	}
 
-					match status {
-						TxStatus::NotFound => {
-							// Broadcast the current package if we have one
-							match self.broadcast_package(&*package.read().await).await {
-								Ok(_) => continue,
-								Err(ExitError::ExitPackageBroadcastFailure { error, .. }) => {
-									// We can just swallow these errors instead of stopping the
-									// entire syncing process
-									error!("{}", error);
-								},
-								Err(e) => {
-									return Err(e);
-								},
-							}
-						},
-						_ => {
-							// We should update/redownload from the network as a newer child
-							// transaction may exist in the mempool or in a confirmed block.
-							// We will skip this step once a transaction is deeply confirmed.
-							trace!("Attempting to update child status from network for exit tx {}", txid);
-							let status = self.update_child_from_network(
-								&package,
-								status.confirmed_height().unwrap_or(tip),
-							).await?;
-							self.status.insert(txid, status);
-						},
-					}
+	async fn update_one_tx_status(
+		&mut self,
+		txid: Txid,
+		tip: BlockHeight,
+		broadcast_local: bool,
+	) -> anyhow::Result<(), ExitError> {
+		match self.index.get(&txid) {
+			// If the transaction is not an exit package, we can just update its status
+			None => {
+				trace!("Updating status for non-exit tx {}", txid);
+				self.status.insert(txid, self.get_tx_status(txid).await?);
+			},
+			// If the transaction is a package, we must query the status of both transactions
+			Some(weak_ptr) => {
+				trace!("Update status for exit tx {}", txid);
+				let package = weak_ptr.upgrade().ok_or_else(|| ExitError::InternalError {
+					error: "index contains a stale package".into(),
+				})?;
+				let status = self.get_tx_status(txid).await?;
+				trace!("Exit tx {} old status {:?}, new status {:?}", txid, self.status.get(&txid), Some(status));
+
+				match status {
+					TxStatus::NotFound if broadcast_local => {
+						// Broadcast the current package if we have one
+						match self.broadcast_package(&*package.read().await).await {
+							Ok(_) => {},
+							Err(ExitError::ExitPackageBroadcastFailure { error, .. }) => {
+								// We can just swallow these errors instead of stopping the
+								// entire syncing process
+								error!("{}", error);
+							},
+							Err(e) => {
+								return Err(e);
+							},
+						}
+					},
+					_ => {
+						// We should update/redownload from the network as a newer child
+						// transaction may exist in the mempool or in a confirmed block.
+						// We will skip this step once a transaction is deeply confirmed.
+						trace!("Attempting to update child status from network for exit tx {}", txid);
+						let status = self.update_package_from_network(
+							&package,
+							status.confirmed_height().unwrap_or(tip),
+							broadcast_local,
+						).await?;
+						self.status.insert(txid, status);
+					},
 				}
 			}
 		}
@@ -166,7 +251,10 @@ impl ExitTransactionManager {
 		if let Some(child) = &guard.child {
 			Ok(Some(ExitChildStatus {
 				txid: child.info.txid,
-				status: self.status.get(&exit_txid).cloned().expect("status should be set"),
+				status: self.status.get(&exit_txid).cloned().ok_or_else(|| ExitError::InternalError {
+					error: "status should be set".into(),
+				})?,
+				fee_info: child.fee_info,
 				origin: child.origin,
 			}))
 		} else {
@@ -185,6 +273,11 @@ impl ExitTransactionManager {
 		} else {
 			Ok(None)
 		}
+	}
+
+	/// Returns the package for an exit tx if the manager is tracking it.
+	pub fn try_get_package(&self, exit_txid: Txid) -> Option<Arc<RwLock<ExitTransactionPackage>>> {
+		self.index.get(&exit_txid)?.upgrade()
 	}
 
 	pub fn get_package(
@@ -221,12 +314,18 @@ impl ExitTransactionManager {
 		package.write().await.child = Some(ChildTransactionInfo {
 			info: TransactionInfo {
 				txid: child_txid,
-				tx: child_tx,
+				tx: child_tx.clone(),
 			},
 			origin,
+			// Populated by the next sync via [calculate_fee_params] once the child is in the
+			// mempool. Not provided here because the API doesn't immediately require it and having
+			// devs provide it could lead to incorrect data
+			fee_info: None,
 		});
 		self.index.insert(child_txid, Arc::downgrade(&package));
-		self.status.insert(exit_txid, TxStatus::NotFound);
+		self.status.insert(exit_txid, TxStatus::Mempool);
+		self.persister.store_exit_child_tx(exit_txid, &child_tx, origin).await
+			.map_err(|e| ExitError::DatabaseChildStoreFailure { error: e.to_string() })?;
 		Ok(child_txid)
 	}
 
@@ -249,7 +348,7 @@ impl ExitTransactionManager {
 					]).await
 					.map_err(|e| ExitError::ExitPackageBroadcastFailure {
 						txid: package.exit.txid,
-						error: e.to_string(),
+						error: e,
 					})?;
 
 				info!("Successfully broadcast exit package: {}", package.exit.txid);
@@ -260,6 +359,49 @@ impl ExitTransactionManager {
 		Ok(status)
 	}
 
+	/// Broadcast a freshly-built CPFP `child_tx` for `exit_txid` and commit it to the
+	/// exit package **only if it was accepted**.
+	///
+	/// Returns whether the child was committed.
+	pub async fn broadcast_and_set_child(
+		&mut self,
+		exit_txid: Txid,
+		child_tx: Transaction,
+		origin: ExitTxOrigin,
+	) -> Result<bool, ExitError> {
+		let parent_tx = self.get_package(exit_txid)?.read().await.exit.tx.clone();
+		match self.chain_source.broadcast_package(&[&parent_tx, &child_tx]).await {
+			Ok(()) => {
+				info!("Successfully broadcast exit package: {}", exit_txid);
+				self.set_wallet_child_tx(exit_txid, child_tx, origin).await?;
+				Ok(true)
+			},
+			// An input is already spent by a confirmed tx, so this CPFP can never confirm —
+			// for a freshly-built CPFP that's our own fee input, consumed by a sibling exit
+			// tx's CPFP that reused the same wallet UTXO. Don't commit it: the exit stays in
+			// AwaitingCpfpBroadcast and a fresh CPFP is built next tick. (A competing CPFP
+			// contesting the *shared anchor* instead surfaces as a mempool conflict and is
+			// resolved by `update_package_from_network`, which RBFs or adopts it — so it
+			// doesn't reach here, and not committing is safe either way.)
+			Err(BroadcastError::MissingOrSpentInputs) => {
+				warn!("Discarding exit CPFP for {}: an input is already spent — will rebuild \
+					from spendable UTXOs", exit_txid,
+				);
+				Ok(false)
+			},
+			// An equivalent CPFP is already in the mempool, or RBF rejected our bump: commit
+			// ours anyway, the in-mempool package will confirm the exit.
+			Err(ref e) if e.is_mempool_conflict() => {
+				warn!("CPFP broadcast conflict for {}: {} — another CPFP may already be in \
+					mempool", exit_txid, e,
+				);
+				self.set_wallet_child_tx(exit_txid, child_tx, origin).await?;
+				Ok(true)
+			},
+			Err(e) => Err(ExitError::ExitPackageBroadcastFailure { txid: exit_txid, error: e }),
+		}
+	}
+
 	async fn tip(&self) -> anyhow::Result<BlockHeight, ExitError> {
 		self.chain_source.tip().await
 			.map_err(|e| ExitError::TipRetrievalFailure { error: e.to_string() })
@@ -268,50 +410,6 @@ impl ExitTransactionManager {
 	async fn get_tx_status(&self, txid: Txid) -> anyhow::Result<TxStatus, ExitError> {
 		self.chain_source.tx_status(txid).await
 			.map_err(|e| ExitError::TransactionRetrievalFailure { txid, error: e.to_string() })
-	}
-
-	async fn find_child_locally(
-		&self,
-		exit_info: &TransactionInfo,
-		onchain: &dyn ExitUnilaterally,
-	) -> anyhow::Result<Option<ChildTransactionInfo>, ExitError> {
-		let wallet = self.find_child_in_wallet(exit_info, onchain).await?;
-		if wallet.is_some() {
-			Ok(wallet)
-		} else {
-			self.find_child_in_database(exit_info).await
-		}
-	}
-
-	async fn find_child_in_wallet(
-		&self,
-		exit_info: &TransactionInfo,
-		onchain: &dyn ExitUnilaterally,
-	) -> anyhow::Result<Option<ChildTransactionInfo>, ExitError> {
-		trace!("Looking for child in wallet for exit tx {}", exit_info.txid);
-
-		// Check if we have a CPFP tx in our wallet
-		let (outpoint, _) = exit_info.tx.fee_anchor()
-			.ok_or_else(|| ExitError::InternalError { error: format!("Exit tx {} has no P2A output", exit_info.txid) })?;
-
-		trace!("Checking wallet for spending tx of {}:{}", outpoint.txid, outpoint.vout);
-
-		if let Some(child_tx) = onchain.get_spending_tx(outpoint) {
-			// Check the wallet to see if it's confirmed
-			let child_txid = child_tx.compute_txid();
-			let block = onchain.get_wallet_tx_confirmed_block(child_txid)
-				.map_err(|e| ExitError::InvalidWalletState { error: e.to_string() })?;
-
-			Ok(Some(ChildTransactionInfo {
-				info: TransactionInfo {
-					txid: child_txid,
-					tx: (*child_tx).clone(),
-				},
-				origin: ExitTxOrigin::Wallet { confirmed_in: block},
-			}))
-		} else {
-			Ok(None)
-		}
 	}
 
 	async fn find_child_in_database(
@@ -330,16 +428,20 @@ impl ExitTransactionManager {
 					tx,
 				},
 				origin,
+				// We don't persist fee info; it will be repopulated from the network on the
+				// next sync if the child is still unconfirmed.
+				fee_info: None,
 			}))
 		} else {
 			Ok(None)
 		}
 	}
 
-	async fn update_child_from_network(
+	async fn update_package_from_network(
 		&self,
 		package: &RwLock<ExitTransactionPackage>,
 		block_scan_start: BlockHeight,
+		broadcast_local: bool,
 	) -> anyhow::Result<TxStatus, ExitError> {
 		// Scan the mempool and chain to see if the anchor output is spent
 		let outpoint = {
@@ -356,86 +458,165 @@ impl ExitTransactionManager {
 			})?;
 		debug!("txs_spending_inputs for {}: {:?}", outpoint, spend_results);
 
-		// Check if we need to download a new child or update the status of the current child
-		if let Some((txid, status)) = spend_results.get(&outpoint) {
-			let mut guard = package.write().await;
+		let Some((new_txid, status)) = spend_results.get(&outpoint) else {
+			return Ok(TxStatus::NotFound);
+		};
+		let mut guard = package.write().await;
 
-			// We only need to update the confirmation block for wallet transactions which haven't
-			// been replaced
-			let current_txid = if let Some(child) = guard.child.as_mut() {
-				if matches!(child.origin, ExitTxOrigin::Wallet { .. }) && child.info.txid == *txid {
-					trace!("Updating block confirmation for wallet child tx {}: {:?}",
-						child.info.txid, status.confirmed_in(),
-					);
-					child.origin = ExitTxOrigin::Wallet { confirmed_in: status.confirmed_in() };
-					return Ok(status.clone());
+		// If the chain still reports our existing child, just refresh its origin (and
+		// populate fee info if we don't have it yet — true for both wallet- and
+		// network-sourced children).
+		if let Some(c) = guard.child.as_mut() {
+			if c.info.txid == *new_txid {
+				let updated_origin = c.origin.with_confirmed_in(status.confirmed_in());
+				trace!("Refreshing child {} for exit {}: origin {:?} -> {:?}",
+					new_txid, outpoint.txid, c.origin, updated_origin,
+				);
+				// Persist transitions so a wallet reload reports the correct
+				// confirmation state before its first successful chain sync.
+				if updated_origin != c.origin {
+					let store_result = self.persister
+						.store_exit_child_tx(outpoint.txid, &c.info.tx, updated_origin).await;
+					if let Err(e) = store_result {
+						// Not fatal: the in-memory origin is correct and the row will be
+						// refreshed by a later transition or child adoption.
+						error!("Failed to store updated exit child transaction: {:#}", e);
+					}
 				}
-				Some(child.info.txid)
-			} else {
-				None
-			};
+				c.origin = updated_origin;
+				if status.confirmed_in().is_none() && c.fee_info.is_none() {
+					c.fee_info = self.try_calculate_fee_params(*new_txid).await;
+				}
+				return Ok(status.clone());
+			}
+		}
 
-			// We should download a newer transaction if necessary
-			let tx = if current_txid.is_none() || current_txid.is_some_and(|t| t != *txid) {
-				info!("Downloading child tx {} for exit {}", txid, outpoint.txid);
-				let tx = self.chain_source.get_tx(txid)
-					.await
-					.map_err(|e| ExitError::TransactionRetrievalFailure {
-						txid: *txid, error: e.to_string(),
-					})?.expect("Spending transaction should exist");
-				info!("Successfully downloaded child tx {} for exit {}", txid, outpoint.txid);
-				tx
-			} else {
-				debug!("Skipping download of child txid {} for exit {}", txid, outpoint.txid);
-				guard.child.as_ref().unwrap().info.tx.clone()
-			};
-
-			// Update the transaction we store in the database
-			let origin = if status.confirmed_in().is_some() {
-				ExitTxOrigin::Block { confirmed_in: status.confirmed_in().unwrap() }
-			} else {
-				debug!("Getting mempool ancestor information for exit {}", txid);
-				match self.chain_source.mempool_ancestor_info(*txid).await {
-					Ok(info) => {
-						let fee_rate = info.effective_fee_rate()
-							.ok_or_else(|| ExitError::AncestorRetrievalFailure {
-								txid: *txid,
-								error: format!("unable to calculate fee rate for {}", txid),
-							})?;
-						ExitTxOrigin::Mempool {
-							fee_rate, total_fee: info.total_fee,
-						}
+		// The chain reports a different spending tx than our local child. If our local child
+		// is wallet-built and the chain's tx is unconfirmed, try to (re-)broadcast our package
+		// first. The chain may simply be lagging behind our broadcast (esplora-electrs in
+		// particular indexes mempool txs out-of-band), or we may have been RBF'd — letting
+		// Bitcoin Core's mempool policy decide which child wins avoids us second-guessing
+		// our local fee rate. If the broadcast is rejected, accept the chain's tx.
+		let local_is_wallet = guard.child.as_ref()
+			.is_some_and(|c| matches!(c.origin, ExitTxOrigin::Wallet { .. }));
+		if local_is_wallet && status.confirmed_in().is_none() {
+			let local = guard.child.as_ref().unwrap();
+			let kept = if !broadcast_local { false } else {
+				let broadcast_res = self.chain_source.broadcast_package(&[
+					&guard.exit.tx, &local.info.tx,
+				]).await;
+				match broadcast_res {
+					Ok(()) => {
+						info!("Re-broadcast wallet child {} for exit {} succeeded — \
+							keeping it over chain-reported tx {}",
+							local.info.txid, outpoint.txid, new_txid,
+						);
+						true
+					},
+					Err(BroadcastError::AlreadyKnown) => {
+						trace!("Wallet child {} already in mempool for exit {} — keeping it",
+							local.info.txid, outpoint.txid,
+						);
+						true
 					},
 					Err(e) => {
-						// The tx may have been confirmed between when we checked its
-						// status and now. Re-check before treating this as a real error.
-						let new_status = self.get_tx_status(*txid).await?;
-						if let Some(block) = new_status.confirmed_in() {
-							debug!("Child tx {} was confirmed while querying mempool info", txid);
-							ExitTxOrigin::Block { confirmed_in: block }
-						} else {
-							return Err(ExitError::AncestorRetrievalFailure {
-								txid: *txid, error: e.to_string(),
-							});
-						}
+						info!("Accepting chain's tx {}, wallet child {} for exit {} rejected {:#}",
+							new_txid, local.info.txid, outpoint.txid, e,
+						);
+						false
 					},
 				}
 			};
-
-			debug!("Storing child tx {} with origin {} in database", txid, origin);
-			let r = self.persister.store_exit_child_tx(outpoint.txid, &tx, origin).await;
-			if let Err(e) = r {
-				error!("Failed to store confirmed exit child transaction: {}", e);
+			if kept {
+				// Best-effort fee info population: the chain source may not have indexed the
+				// just-broadcast tx yet, in which case ancestor info comes back NotFound. The
+				// next sync will retry.
+				if guard.child.as_ref().unwrap().fee_info.is_none() {
+					let local_txid = guard.child.as_ref().unwrap().info.txid;
+					if let Some(fi) = self.try_calculate_fee_params(local_txid).await {
+						guard.child.as_mut().unwrap().fee_info = Some(fi);
+					}
+				}
+				return Ok(status.clone());
 			}
+		}
 
-			// Finally, update the child transaction
-			guard.child = Some(ChildTransactionInfo {
-				info: TransactionInfo { txid: *txid, tx },
-				origin,
-			});
-			Ok(status.clone())
+		// At this point we must adopt the chain's tx as the new child.
+		info!("Downloading child tx {} for exit {}", new_txid, outpoint.txid);
+		let tx = match self.chain_source.get_tx(new_txid).await {
+			Ok(Some(tx)) => Ok(tx),
+			Ok(None) => Err(ExitError::TransactionRetrievalFailure {
+				txid: *new_txid, error: "Spending transaction was unexpectedly missing".into(),
+			}),
+			Err(e) => Err(ExitError::TransactionRetrievalFailure {
+				txid: *new_txid, error: e.to_string(),
+			}),
+		}?;
+		info!("Successfully downloaded child tx {} for exit {}", new_txid, outpoint.txid);
+
+		let (origin, fee_info) = if let Some(block) = status.confirmed_in() {
+			(ExitTxOrigin::Block { confirmed_in: block }, None)
 		} else {
-			Ok(TxStatus::NotFound)
+			match self.calculate_fee_params(*new_txid).await {
+				Ok(info) => (ExitTxOrigin::Mempool, Some(info)),
+				Err(ExitError::AncestorRetrievalFailure { error, .. }) => {
+					// The tx may have been confirmed between when we checked its status
+					// and now. Re-check before treating this as a real error.
+					let new_status = self.get_tx_status(*new_txid).await?;
+					if let Some(block) = new_status.confirmed_in() {
+						debug!("Child tx {} was confirmed while querying mempool info", new_txid);
+						(ExitTxOrigin::Block { confirmed_in: block }, None)
+					} else {
+						return Err(ExitError::AncestorRetrievalFailure {
+							txid: *new_txid, error,
+						});
+					}
+				},
+				Err(e) => return Err(e),
+			}
+		};
+
+		debug!("Storing child tx {} with origin {} in database", new_txid, origin);
+		if let Err(e) = self.persister.store_exit_child_tx(outpoint.txid, &tx, origin).await {
+			// Not fatal: the same tx can be re-downloaded later if it hasn't been replaced.
+			error!("Failed to store confirmed exit child transaction: {:#}", e);
+		}
+
+		guard.child = Some(ChildTransactionInfo {
+			info: TransactionInfo { txid: *new_txid, tx },
+			origin,
+			fee_info,
+		});
+		Ok(status.clone())
+	}
+
+	/// Query the chain source for a tx's effective fee rate and total package fee.
+	async fn calculate_fee_params(&self, txid: Txid) -> Result<FeeInfo, ExitError> {
+		debug!("Getting mempool ancestor information for {}", txid);
+		let info = self.chain_source
+			.mempool_ancestor_info(txid)
+			.await
+			.map_err(|e| ExitError::AncestorRetrievalFailure {
+				txid, error: e.to_string(),
+			})?;
+		let fee_rate = info.effective_fee_rate()
+			.ok_or_else(|| ExitError::AncestorRetrievalFailure {
+				txid,
+				error: format!("unable to calculate fee rate for {}", txid),
+			})?;
+		Ok(FeeInfo { fee_rate, total_fee: info.total_fee })
+	}
+
+	/// Best-effort variant of [`calculate_fee_params`]: returns `None` (and logs) when the
+	/// chain source can't yet produce ancestor info — typically because we just broadcast
+	/// the tx and the indexer hasn't caught up. The next sync will retry.
+	async fn try_calculate_fee_params(&self, txid: Txid) -> Option<FeeInfo> {
+		match self.calculate_fee_params(txid).await {
+			Ok(info) => Some(info),
+			Err(e) => {
+				debug!("Skipping fee info for {} this round: {:#}", txid, e);
+				None
+			},
 		}
 	}
 }

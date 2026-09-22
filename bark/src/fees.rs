@@ -7,6 +7,7 @@ use ark::{Vtxo, VtxoId};
 use ark::fees::VtxoFeeInfo;
 
 use crate::Wallet;
+use crate::vtxo::selection::InputSelection;
 
 /// Result of a fee estimation containing the total cost, fee amount, and VTXOs used. It's very
 /// important to consider that fees can change over time, so you should expect to renew this
@@ -71,7 +72,7 @@ impl Wallet {
 	/// does not charge any fees for arkoor payments.
 	pub async fn estimate_arkoor_payment_fee(&self, amount: Amount) -> anyhow::Result<FeeEstimate> {
 		let zero_fee = Amount::ZERO;
-		let inputs = match self.select_vtxos_to_cover(amount).await {
+		let inputs = match self.select_any_vtxos_to_cover(amount).await {
 			Ok(inputs) => inputs,
 			Err(_) => {
 				// We choose to ignore every error, even those which are not due to insufficient
@@ -115,8 +116,9 @@ impl Wallet {
 	pub async fn estimate_lightning_send_fee(&self, amount: Amount) -> anyhow::Result<FeeEstimate> {
 		let (_, ark_info) = self.require_server().await?;
 
-		let (inputs, fee) = match self.select_vtxos_to_cover_with_fee(
-			amount, |a, v| ark_info.fees.lightning_send.calculate(a, v).context("fee overflowed"),
+		let (inputs, fee) = match self.select_any_vtxos_to_cover_with_fee(
+			amount,
+			|a, v| ark_info.fees.lightning_send.calculate(a, v).context("fee overflowed"),
 		).await {
 			Ok((inputs, fee)) => (inputs, fee),
 			Err(_) => {
@@ -144,7 +146,7 @@ impl Wallet {
 		let (srv, ark_info) = self.require_server().await?;
 		let offboard_feerate = srv.offboard_feerate().await?;
 		let script_buf = address.script_pubkey();
-		let current_height = self.chain.tip().await?;
+		let current_height = self.inner.chain.tip().await?;
 
 		let vtxos = vtxos.into_iter();
 		let capacity = vtxos.size_hint().1.unwrap_or(vtxos.size_hint().0);
@@ -186,7 +188,7 @@ impl Wallet {
 		vtxos: impl IntoIterator<Item = impl AsRef<Vtxo<G>>>,
 	) -> anyhow::Result<FeeEstimate> {
 		let (_, ark_info) = self.require_server().await?;
-		let current_height = self.chain.tip().await?;
+		let current_height = self.inner.chain.tip().await?;
 
 		let vtxos = vtxos.into_iter();
 		let capacity = vtxos.size_hint().1.unwrap_or(vtxos.size_hint().0);
@@ -229,11 +231,13 @@ impl Wallet {
 		let offboard_feerate = srv.offboard_feerate().await?;
 		let script_buf = address.script_pubkey();
 
-		let (inputs, fee) = match self.select_vtxos_to_cover_with_fee(
-			amount, |a, v|
+		let selection = InputSelection::new()
+			.max_inputs(srv.ark_info().await.max_offboard_inputs)
+			.fee_scheme(self.inner.chain.tip().await?, |a, v|
 				ark_info.fees.offboard.calculate(&script_buf, a, offboard_feerate, v)
-					.ok_or_else(|| anyhow!("Error whilst calculating fee"))
-		).await {
+					.ok_or_else(|| anyhow!("Error whilst calculating fee")),
+			);
+		let (inputs, fee) = match selection.select(self.spendable_vtxos().await?, amount) {
 			Ok((inputs, fee)) => (inputs, fee),
 			Err(_) => {
 				// We choose to ignore every error, even those which are not due to insufficient
@@ -250,5 +254,21 @@ impl Wallet {
 		let vtxo_ids = inputs.into_iter().map(|v| v.id()).collect();
 
 		Ok(FeeEstimate::new(total_cost, fee, amount, vtxo_ids))
+	}
+
+	/// Estimate the onchain fees to unilaterally (emergency) exit the given VTXOs.
+	///
+	/// This is a thin wrapper over [crate::exit::Exit::estimate_emergency_exit_fee]; see it for the
+	/// meaning of the returned breakdown and the parameters. The `onchain` wallet is needed to price
+	/// the CPFP fee bumps against real confirmed funds.
+	pub async fn estimate_emergency_exit_fee(
+		&self,
+		vtxos: &[VtxoId],
+		fee_rate: Option<bitcoin::FeeRate>,
+		destination: Option<bitcoin::Address>,
+	) -> anyhow::Result<crate::exit::ExitFeeEstimate, crate::exit::ExitError> {
+		self.exit_mgr()
+			.estimate_emergency_exit_fee(vtxos, self, fee_rate, destination)
+			.await
 	}
 }

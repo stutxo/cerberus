@@ -6,7 +6,7 @@ use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
 use tracing::{error, info};
 use server_rpc::protos;
 
-use crate::rpcserver::ToStatusResult;
+use crate::rpcserver::{StatusContext, ToStatusResult, DEFAULT_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS};
 use crate::Server;
 
 #[async_trait]
@@ -16,6 +16,11 @@ impl server_rpc::server::IntegrationService for Server {
 		&self,
 		req: tonic::Request<protos::intman::TokensRequest>,
 	) -> Result<tonic::Response<protos::intman::Tokens>, tonic::Status> {
+		// The extension prefers `X-Forwarded-For`, which is client-
+		// controlled. Trustworthy here because the integration listener
+		// is reachable only via the traefik->envoy chain (traefik strips
+		// client XFF, envoy resolves via `xff_num_trusted_hops: 1`) and
+		// UFW closes the raw port. See `RemoteAddrService` docs.
 		let client_address =
 			if let Some(remote_addr) = req.extensions().get::<SocketAddr>().cloned() {
 				Some(remote_addr)
@@ -25,7 +30,7 @@ impl server_rpc::server::IntegrationService for Server {
 				None
 			};
 		let req = req.into_inner();
-		let api_key = uuid::Uuid::try_from(req.api_key.clone()).expect("Invalid API key");
+		let api_key = uuid::Uuid::try_from(req.api_key.clone()).badarg("invalid API key")?;
 
 		let tokens = self.get_integration_tokens(
 			client_address, api_key, req.r#type().into(), req.count,
@@ -55,6 +60,11 @@ impl server_rpc::server::IntegrationService for Server {
 		&self,
 		req: tonic::Request<protos::intman::TokenInfoRequest>,
 	) -> Result<tonic::Response<protos::intman::TokenInfo>, tonic::Status> {
+		// The extension prefers `X-Forwarded-For`, which is client-
+		// controlled. Trustworthy here because the integration listener
+		// is reachable only via the traefik->envoy chain (traefik strips
+		// client XFF, envoy resolves via `xff_num_trusted_hops: 1`) and
+		// UFW closes the raw port. See `RemoteAddrService` docs.
 		let client_address =
 			if let Some(remote_addr) = req.extensions().get::<SocketAddr>().cloned() {
 				Some(remote_addr)
@@ -64,7 +74,7 @@ impl server_rpc::server::IntegrationService for Server {
 				None
 			};
 		let req = req.into_inner();
-		let api_key = uuid::Uuid::try_from(req.api_key).unwrap();
+		let api_key = uuid::Uuid::try_from(req.api_key).badarg("invalid API key")?;
 
 		let (_, _, token) = self.get_integration_token(client_address, api_key, req.token.as_str())
 			.await.to_status()?;
@@ -93,6 +103,11 @@ impl server_rpc::server::IntegrationService for Server {
 		&self,
 		req: tonic::Request<protos::intman::UpdateTokenRequest>,
 	) -> Result<tonic::Response<protos::intman::TokenInfo>, tonic::Status> {
+		// The extension prefers `X-Forwarded-For`, which is client-
+		// controlled. Trustworthy here because the integration listener
+		// is reachable only via the traefik->envoy chain (traefik strips
+		// client XFF, envoy resolves via `xff_num_trusted_hops: 1`) and
+		// UFW closes the raw port. See `RemoteAddrService` docs.
 		let client_address =
 			if let Some(remote_addr) = req.extensions().get::<SocketAddr>().cloned() {
 				Some(remote_addr)
@@ -102,7 +117,7 @@ impl server_rpc::server::IntegrationService for Server {
 				None
 			};
 		let req = req.into_inner();
-		let api_key = uuid::Uuid::try_from(req.api_key.clone()).unwrap();
+		let api_key = uuid::Uuid::try_from(req.api_key.clone()).badarg("invalid API key")?;
 
 		let token = self.update_integration_token(
 			client_address,
@@ -133,7 +148,14 @@ impl server_rpc::server::IntegrationService for Server {
 }
 
 
-/// Run the public gRPC endpoint.
+/// Run the integration gRPC endpoint.
+///
+/// `config.rpc.integration_address` must be reachable only through the
+/// trusted proxy chain (traefik -> envoy -> captaind). `RemoteAddrLayer`
+/// honours `X-Forwarded-For` unconditionally, so the per-key IP
+/// filters downstream are meaningful only while traefik normalises XFF
+/// (`trustedIPs: []`), envoy resolves it (`xff_num_trusted_hops: 1`),
+/// and UFW blocks direct access to the port.
 pub async fn run_rpc_server(server: Arc<Server>) -> anyhow::Result<()> {
 	crate::rpcserver::RPC_RICH_ERRORS.store(server.config.rpc_rich_errors, atomic::Ordering::Relaxed);
 
@@ -144,6 +166,10 @@ pub async fn run_rpc_server(server: Arc<Server>) -> anyhow::Result<()> {
 	let integration_server = server_rpc::server::IntegrationServiceServer::from_arc(server.clone());
 
 	tonic::transport::Server::builder()
+		.http2_max_pending_accept_reset_streams(Some(
+			server.config.rpc.max_pending_accept_reset_streams
+				.unwrap_or(DEFAULT_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS)
+		))
 		.layer(OtelGrpcLayer::default())
 		.layer(crate::rpcserver::middleware::TelemetryMetricsLayer)
 		.layer(crate::rpcserver::middleware::RemoteAddrLayer)

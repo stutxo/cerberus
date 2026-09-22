@@ -20,7 +20,7 @@ pub mod mailbox;
 pub mod musig;
 pub mod offboard;
 pub mod rounds;
-pub mod time;
+pub mod message;
 pub mod tree;
 pub mod vtxo;
 pub mod integration;
@@ -63,8 +63,8 @@ pub struct ArkInfo {
 	pub nb_round_nonces: usize,
 	/// Delta between exit confirmation and coins becoming spendable
 	pub vtxo_exit_delta: BlockDelta,
-	/// Expiration delta of the VTXO
-	pub vtxo_expiry_delta: BlockDelta,
+	/// The number of blocks a VTXO lives before it expires
+	pub vtxo_lifetime: BlockDelta,
 	/// The number of blocks after which an HTLC-send VTXO expires once granted.
 	pub htlc_send_expiry_delta: BlockDelta,
 	/// The number of blocks to keep between Lightning and Ark HTLCs expiries
@@ -75,19 +75,30 @@ pub struct ArkInfo {
 	pub required_board_confirmations: usize,
 	/// Maximum CLTV delta server will allow clients to request an
 	/// invoice generation with.
-	pub max_user_invoice_cltv_delta: u16,
+	pub max_user_invoice_cltv_delta: BlockDelta,
 	/// Minimum amount for a board the server will cosign
 	pub min_board_amount: Amount,
+
+	/// The number of blocks a VTXO lives before it expires.
+	///
+	/// Deprecated in favour of [ArkInfo::vtxo_lifetime]. This field is still
+	/// populated with the same value for backwards compatibility with older
+	/// clients.
+	#[deprecated(note = "renamed to vtxo_lifetime")]
+	pub vtxo_expiry_delta: BlockDelta,
 
 	/// The feerate for offboard transactions.
 	///
 	/// Deprecated in favour of the dedicated `GetOffboardFeeRate` RPC.
 	/// This field is still populated for backwards compatibility with
 	/// older clients but may be stale; prefer
-	/// [`ServerConnection::offboard_feerate`] which calls the dedicated
+	/// `ServerConnection::offboard_feerate` which calls the dedicated
 	/// endpoint.
 	#[deprecated(since = "0.1.5", note = "use ServerConnection::offboard_feerate instead")]
 	pub offboard_feerate: FeeRate,
+
+	/// The maximum number of inputs for an offboard
+	pub max_offboard_inputs: usize,
 
 	/// Indicates whether the Ark server requires clients to either
 	/// provide a VTXO ownership proof, or a lightning receive token
@@ -102,6 +113,9 @@ pub struct ArkInfo {
 	/// cosign further OOR transactions spending it. Clients should refresh
 	/// their VTXOs into a round before this limit is reached.
 	pub max_vtxo_exit_depth: u16,
+
+	/// Link to the server's terms of service, if any.
+	pub tos_link: Option<String>,
 }
 
 /// Request for the creation of an vtxo.
@@ -147,7 +161,7 @@ pub mod scripts {
 
 	/// Create a tapscript that is a checksig and a relative timelock.
 	pub fn delayed_sign(delay_blocks: BlockDelta, pubkey: XOnlyPublicKey) -> ScriptBuf {
-		let csv = bitcoin::Sequence::from_height(delay_blocks);
+		let csv = bitcoin::Sequence::from(delay_blocks);
 		bitcoin::Script::builder()
 			.push_int(csv.to_consensus_u32() as i64)
 			.push_opcode(opcodes::all::OP_CSV)
@@ -159,7 +173,7 @@ pub mod scripts {
 
 	/// Create a tapscript that is a checksig and an absolute timelock.
 	pub fn timelock_sign(timelock_height: BlockHeight, pubkey: XOnlyPublicKey) -> ScriptBuf {
-		let lt = bitcoin::absolute::LockTime::from_height(timelock_height).unwrap();
+		let lt = timelock_height.to_locktime().unwrap();
 		bitcoin::Script::builder()
 			.push_int(lt.to_consensus_u32() as i64)
 			.push_opcode(opcodes::all::OP_CLTV)
@@ -175,8 +189,8 @@ pub mod scripts {
 		timelock_height: BlockHeight,
 		pubkey: XOnlyPublicKey,
 	) -> ScriptBuf {
-		let csv = bitcoin::Sequence::from_height(delay_blocks);
-		let lt = bitcoin::absolute::LockTime::from_height(timelock_height).unwrap();
+		let csv = bitcoin::Sequence::from(delay_blocks);
+		let lt = timelock_height.to_locktime().unwrap();
 		bitcoin::Script::builder()
 			.push_int(lt.to_consensus_u32().try_into().unwrap())
 			.push_opcode(opcodes::all::OP_CLTV)
@@ -198,6 +212,26 @@ pub mod scripts {
 		let hash_160 = ripemd160::Hash::hash(&hash[..]);
 
 		bitcoin::Script::builder()
+			.push_opcode(opcodes::all::OP_SIZE)
+			.push_int(32)
+			.push_opcode(opcodes::all::OP_EQUALVERIFY)
+			.push_opcode(opcodes::all::OP_HASH160)
+			.push_slice(hash_160.as_byte_array())
+			.push_opcode(opcodes::all::OP_EQUALVERIFY)
+			.push_x_only_key(&pubkey)
+			.push_opcode(opcodes::all::OP_CHECKSIG)
+			.into_script()
+	}
+
+	/// Contract that requires revealing the preimage to the given hash
+	/// and a signature using the given (aggregate) pubkey
+	///
+	/// The expected spending script witness is the preimage followed by
+	/// the signature.
+	pub fn hash_and_sign_v0(hash: sha256::Hash, pubkey: XOnlyPublicKey) -> ScriptBuf {
+		let hash_160 = ripemd160::Hash::hash(&hash[..]);
+
+		bitcoin::Script::builder()
 			.push_opcode(opcodes::all::OP_HASH160)
 			.push_slice(hash_160.as_byte_array())
 			.push_opcode(opcodes::all::OP_EQUALVERIFY)
@@ -212,7 +246,30 @@ pub mod scripts {
 		pubkey: XOnlyPublicKey,
 	) -> ScriptBuf {
 		let hash_160 = ripemd160::Hash::hash(&hash[..]);
-		let csv = bitcoin::Sequence::from_height(delay_blocks);
+		let csv = bitcoin::Sequence::from(delay_blocks);
+
+		bitcoin::Script::builder()
+			.push_int(csv.to_consensus_u32().try_into().unwrap())
+			.push_opcode(opcodes::all::OP_CSV)
+			.push_opcode(opcodes::all::OP_DROP)
+			.push_opcode(opcodes::all::OP_SIZE)
+			.push_int(32)
+			.push_opcode(opcodes::all::OP_EQUALVERIFY)
+			.push_opcode(opcodes::all::OP_HASH160)
+			.push_slice(hash_160.as_byte_array())
+			.push_opcode(opcodes::all::OP_EQUALVERIFY)
+			.push_x_only_key(&pubkey)
+			.push_opcode(opcodes::all::OP_CHECKSIG)
+			.into_script()
+	}
+
+	pub fn hash_delay_sign_v0(
+		hash: sha256::Hash,
+		delay_blocks: BlockDelta,
+		pubkey: XOnlyPublicKey,
+	) -> ScriptBuf {
+		let hash_160 = ripemd160::Hash::hash(&hash[..]);
+		let csv = bitcoin::Sequence::from(delay_blocks);
 
 		bitcoin::Script::builder()
 			.push_int(csv.to_consensus_u32().try_into().unwrap())
@@ -235,7 +292,7 @@ pub mod scripts {
 		for (input, sig) in tx.input.iter_mut().zip(sigs.iter()) {
 			assert!(input.witness.is_empty());
 			input.witness.push(&sig[..]);
-			debug_assert_eq!(TAPROOT_KEYSPEND_WEIGHT, input.witness.size());
+			debug_assert_eq!(TAPROOT_KEYSPEND_WEIGHT.to_wu(), input.witness.size() as u64);
 		}
 	}
 

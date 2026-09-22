@@ -12,7 +12,7 @@ use bitcoin::params::Params;
 use tokio::join;
 use bitcoin_ext::TaprootSpendInfoExt;
 
-use ark_testing::{btc, sat, signed_sat, TestContext};
+use ark_testing::{btc, is_bark_version, require_bark_version, sat, signed_sat, TestContext};
 use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
 use ark_testing::util::FutureExt;
 
@@ -135,7 +135,10 @@ async fn exit_start() {
 	assert_eq!(exits.first().unwrap().vtxo_id, vtxos.first().unwrap().vtxo.id);
 
 	let movement = bark.history().await.last().cloned().unwrap();
-	assert_eq!(movement.status, MovementStatus::Successful);
+	// Exit movements are created in Pending and only finalize once progress reaches
+	// Claimed (Successful) or VtxoAlreadySpent (Canceled). The exit here hasn't been
+	// progressed past Start yet.
+	assert_eq!(movement.status, MovementStatus::Pending);
 	assert_eq!(movement.subsystem.name, "bark.exit");
 	assert_eq!(movement.subsystem.kind, "start");
 	assert_eq!(movement.intended_balance, signed_sat(-100_000));
@@ -157,12 +160,14 @@ async fn exit_start() {
 	assert_eq!(*movement.input_vtxos.first().unwrap(), vtxos.first().unwrap().id);
 	assert_eq!(movement.output_vtxos.len(), 0);
 	assert_eq!(movement.exited_vtxos.len(), 0);
-	assert_eq!(movement.time.completed_at.is_some(), true);
+	assert!(movement.time.completed_at.is_none(), "pending exit movement should not have completed_at");
 	assert_eq!(movement.metadata.is_none(), true);
 }
 
 #[tokio::test]
 async fn lightning_send_invoice_receive() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("movement/lightning_send_invoice_receive").await;
 	let ln = ctx.new_lightning_setup("ln").await;
 	let srv = ctx.captaind("server").lightningd(&ln.internal).funded(btc(10)).create().await;
@@ -202,7 +207,8 @@ async fn lightning_send_invoice_receive() {
 	assert_eq!(send_movement.received_on.len(), 0);
 	assert_eq!(send_movement.input_vtxos.len(), 1);
 	assert_eq!(send_movement.input_vtxos, bark1_vtxos);
-	assert_eq!(send_movement.output_vtxos.len(), 1); // HTLC VTXOs aren't included here
+	let nb_change = if is_bark_version!(> "0.6.1") { 2 } else { 1 }; // HTLC VTXOs aren't included here
+	assert_eq!(send_movement.output_vtxos.len(), nb_change);
 	assert_ne!(send_movement.output_vtxos, bark1_vtxos);
 	assert_eq!(send_movement.exited_vtxos.len(), 0);
 	assert_eq!(send_movement.time.completed_at.is_some(), true);
@@ -246,6 +252,8 @@ async fn lightning_send_invoice_receive() {
 
 #[tokio::test]
 async fn lightning_send_invoice_revoke() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("movement/lightning_send_invoice_revoke").await;
 	let ln = ctx.new_lightning_setup_no_channel("ln").await;
 	let srv = ctx.captaind("server").lightningd(&ln.internal).funded(btc(10)).create().await;
@@ -279,7 +287,8 @@ async fn lightning_send_invoice_revoke() {
 	assert_eq!(send_movement.received_on.len(), 0);
 	assert_eq!(send_movement.input_vtxos.len(), 1);
 	assert_eq!(send_movement.input_vtxos, vtxos_pre_pay);
-	assert_eq!(send_movement.output_vtxos.len(), 2); // Change + revocation VTXO
+	let nb_change = if is_bark_version!(> "0.6.1") { 2 } else { 1 }; // Change + revocation VTXO
+	assert_eq!(send_movement.output_vtxos.len(), nb_change + 1);
 	assert_vec_unsorted_equal(send_movement.output_vtxos, vtxos_post_pay);
 	assert_eq!(send_movement.exited_vtxos.len(), 0);
 	assert_eq!(send_movement.time.completed_at.is_some(), true);
@@ -293,6 +302,8 @@ async fn lightning_send_invoice_revoke() {
 
 #[tokio::test]
 async fn lightning_send_offer() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("movement/lightning_send_offer").await;
 	let ln = ctx.new_lightning_setup("ln").await;
 	let srv = ctx.captaind("server").lightningd(&ln.internal).funded(btc(10)).create().await;
@@ -310,7 +321,8 @@ async fn lightning_send_offer() {
 	srv.wait_for_vtxopool(&ctx).await;
 	for i in 1..5 {
 		let amount = sat(i * 10_000);
-		let vtxos_pre_pay = bark.vtxo_ids().await;
+		let pre_pay = bark.vtxos().await;
+		let vtxos_pre_pay = pre_pay.iter().map(|v| v.id).collect::<Vec<_>>();
 		bark.pay_lightning_wait(&offer, Some(amount)).await;
 
 		let movement = bark.history().await.last().cloned().unwrap();
@@ -326,9 +338,21 @@ async fn lightning_send_offer() {
 			amount,
 		});
 		assert_eq!(movement.received_on.len(), 0);
+		// Once change is split, the wallet holds several VTXOs and the
+		// payment only spends one of them.
 		assert_eq!(movement.input_vtxos.len(), 1);
-		assert_eq!(movement.input_vtxos, vtxos_pre_pay);
-		assert_eq!(movement.output_vtxos.len(), 1);
+		assert!(movement.input_vtxos.iter().all(|id| vtxos_pre_pay.contains(id)),
+			"inputs should come from the pre-payment VTXO set");
+		let input_amount = pre_pay.iter()
+			.filter(|v| movement.input_vtxos.contains(&v.id))
+			.map(|v| v.amount)
+			.sum::<Amount>();
+		let nb_change = if is_bark_version!(> "0.6.1") && input_amount - amount > amount {
+			2
+		} else {
+			1
+		};
+		assert_eq!(movement.output_vtxos.len(), nb_change);
 		assert_ne!(movement.output_vtxos, vtxos_pre_pay);
 		assert_eq!(movement.exited_vtxos.len(), 0);
 		assert_eq!(movement.time.completed_at.is_some(), true);
@@ -348,7 +372,7 @@ async fn lightning_send_offer() {
 #[tokio::test]
 async fn movement_offboard() {
 	let ctx = TestContext::new("movement/movement_offboard").await;
-	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+	let srv = ctx.captaind("server").no_vtxo_pool().funded(btc(10)).create().await;
 	let bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
 
 	bark.board(sat(100_000)).await;
@@ -400,6 +424,8 @@ async fn movement_offboard() {
 
 #[tokio::test]
 async fn round_refresh() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("movement/round_refresh").await;
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;
 	let bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
@@ -439,8 +465,10 @@ async fn round_refresh() {
 
 #[tokio::test]
 async fn movement_send_onchain() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("movement/movement_send_onchain").await;
-	let srv = ctx.captaind("server").cfg(|cfg| {
+	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| {
 		cfg.round_interval = Duration::from_secs(3600);
 	}).create().await;
 	ctx.fund_captaind(&srv, btc(10)).await;
@@ -498,6 +526,8 @@ async fn movement_send_onchain() {
 
 #[tokio::test]
 async fn list_movements() {
+	require_bark_version!(> "0.5.0");
+
 	// Initialize the test
 	let ctx = TestContext::new("bark/list_movements").await;
 

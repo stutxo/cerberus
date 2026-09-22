@@ -2,9 +2,9 @@
 }:
 let
 	bitcoinVersion = "31.0";
-	lightningVersion = "26.04.1";
+	lightningVersion = "26.06.6";
 	holdPluginVersion = "0.3.3";
-	esploraElectrsRevision = "5852c0cf49380bed575d69d364d3cc0a47f00375";
+	esploraElectrsRevision = "ef4417921511610fe8c9663020ce7b835cb1f14a";
 	mempoolElectrsRevision = "v3.3.0";
 
 	isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
@@ -31,11 +31,18 @@ let
 			urls = [ "https://bitcoincore.org/bin/bitcoin-core-${bitcoinVersion}/bitcoin-${bitcoinVersion}.tar.gz" ];
 			sha256 = "sha256-C6DvXuo679lswXdL4nTD1ZSBLPrAmIgJ1wZzi7Bns+M=";
 		};
+		# nixpkgs' bitcoind gpg-verifies the release SHA256SUMS in preUnpack,
+		# but its checksum files are pinned to the nixpkgs version, which our
+		# version pin above rewires to URLs that don't match those hashes. The
+		# source is already pinned by sha256 here, so skip the verification.
+		preUnpack = "";
 		cmakeFlags = (old.cmakeFlags or []) ++ [
 			"-DENABLE_IPC=OFF"
 		];
 		doCheck = false;
 	});
+
+	swaggerUi = import ./swagger-ui.nix { inherit pkgs; };
 
 	hal = rustPlatform.buildRustPackage rec {
 		pname = "hal";
@@ -54,7 +61,7 @@ let
 			owner = "Blockstream";
 			repo = "electrs";
 			rev = esploraElectrsRevision;
-			hash = "sha256-SW8+qK6fGwUkaZFaxktdnTIlQXqB+AOA9Ww5Z3nUjgY=";
+			hash = "sha256-EO5LXZANwIME0Y4XknQSSmx3X7dQ/ny9fp1ldkloPvk=";
 		};
 
 		nativeBuildInputs = [ rustPlatform.bindgenHook ];
@@ -91,9 +98,13 @@ let
 		version = lightningVersion;
 		src = pkgs.fetchurl {
 			url = "https://github.com/ElementsProject/lightning/releases/download/v${lightningVersion}/clightning-v${lightningVersion}.zip";
-			hash = "sha256-MEsZ5GPCY6q/SNO+xcktfGiCZUVgl4p7pdMOiqIqFJM=";
+			hash = "sha256-cZEfzDXkqyRuvH1FMcrPK8OBYGnZZ5jcj3pztAMgfO0=";
 		};
 		makeFlags = [ "VERSION=v${lightningVersion}" ];
+		postPatch = (old.postPatch or "") + ''
+			chmod +x devtools/blockreplace.py
+			patchShebangs devtools/blockreplace.py
+		'';
 		preInstall = ''
 			mkdir -p $out/libexec/c-lightning/plugins/
 			touch $out/libexec/c-lightning/plugins/clnrest
@@ -107,7 +118,7 @@ let
 			owner = "ElementsProject";
 			repo = "lightning";
 			rev = "v${lightningVersion}";
-			hash = "sha256-NS9+9szZuYSYefRmitQK1e07pHu9GvWf1cM2pApXyPg=";
+			hash = "sha256-bra45wREkyt4byY7/oemRQsmqSiVX/8vVuwYcYjcQHQ=";
 		};
 		buildAndTestSubdir = "plugins/grpc-plugin";
 		nativeBuildInputs = [ rustBuildToolchain pkgs.protobuf ];
@@ -146,6 +157,7 @@ let
 	};
 
 	env = buildShell.env // {
+		SWAGGER_UI_DOWNLOAD_URL = "file://${swaggerUi}";
 		POSTGRES_BINS = "${postgresql}/bin";
 		BITCOIND_EXEC = "${bitcoin}/bin/bitcoind";
 		ESPLORA_ELECTRS_EXEC = "${esploraElectrs}/bin/electrs";
@@ -177,20 +189,17 @@ in {
 				rustToolchain.rust-analyzer
 				rustTargetWasm
 			])
-			# compiler cache
-			pkgs.sccache
 
 			slog-tools
 
-			# for bark
-			pkgs.sqlite
-
 			# for development
 			hal
-			pkgs.jq
 
 			# for all tests
 			pkgs.cargo-nextest
+
+			# for CI advisory scans against Cargo.lock (RustSec db)
+			pkgs.cargo-audit
 
 			# for inspecting tokio runtime tasks (paired with the
 			# `tokio-console` cargo feature on bark-server)
@@ -221,6 +230,9 @@ in {
 			pkgs.wabt
 			pkgs.firefox
 			pkgs.geckodriver
+			# pinned to the wasm-bindgen version in Cargo.lock (the test
+			# runner errors out on version mismatch).
+			pkgs.wasm-bindgen-cli_0_2_114
 
 		] ++ (
 			if isDarwin then [

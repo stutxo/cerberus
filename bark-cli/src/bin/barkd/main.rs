@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -8,22 +9,28 @@ use bitcoin::secp256k1::rand::{self, RngCore};
 use clap::{Parser, Subcommand};
 use clap::builder::BoolishValueParser;
 use log::{info, warn};
-use tokio::sync::RwLock;
 
 use bark_json::web::{BarkNetwork, BitcoindAuth, ChainSourceConfig, CreateWalletRequest};
-use bark_rest::{Config, OnWalletCreate, OnWalletDelete, RestServer, ServerWallet};
+use bark_rest::{Config, OnGetMnemonic, OnWalletCreate, OnWalletDelete, RestServer, ServerState};
 use bark_rest::http::HeaderValue;
 use bark_rest::error::ContextExt;
 use bark_rest::auth::AuthToken;
 
-use bark_cli::VERSION_DIRTY;
+use bark::fs_perms;
+
+use bark_cli::VERSION_DEV_MARKER;
+use bark_cli::connection;
 use bark_cli::log::init_logging;
-use bark_cli::wallet::{ConfigOpts, CreateOpts, create_wallet, open_wallet, AUTH_TOKEN_FILE};
+use bark_cli::wallet::{ConfigOpts, CreateOpts, create_wallet, open_wallet, read_mnemonic, AUTH_TOKEN_FILE};
+use tokio_util::sync::CancellationToken;
 
 
 /// The full version string we show in our binary.
 /// (BARK_VERSION and GIT_HASH are set in build.rs)
 const FULL_VERSION: &str = concat!(env!("BARK_VERSION"), " (", env!("GIT_HASH"), ")");
+
+/// Wire-level client identity sent in `x-user-agent` on every RPC.
+const USER_AGENT: &str = concat!("barkd/", env!("BARK_VERSION"));
 
 
 fn default_datadir() -> String {
@@ -32,6 +39,18 @@ fn default_datadir() -> String {
 	}).unwrap_or_else(|| {
 		"./".into()
 	}).join(".bark").display().to_string()
+}
+
+fn ui_default_chain_source() -> String {
+	let mut config = ConfigOpts::default();
+	config.fill_network_defaults(bark::BarkNetwork::Mainnet);
+	config.esplora.expect("no esplora in mainnet default")
+}
+
+fn ui_default_ark_server() -> String {
+	let mut config = ConfigOpts::default();
+	config.fill_network_defaults(bark::BarkNetwork::Mainnet);
+	config.ark.expect("no ark server in mainnet default")
 }
 
 #[derive(Parser)]
@@ -56,6 +75,20 @@ struct Cli {
 	)]
 	quiet: bool,
 
+	/// Write the debug log to this file instead of the default
+	/// `<datadir>/debug.log`
+	#[arg(long, env = "BARK_LOGFILE", global = true, conflicts_with = "no_logfile")]
+	logfile: Option<PathBuf>,
+	/// Disable the debug log file entirely
+	#[arg(
+		long,
+		env = "BARK_NO_LOGFILE",
+		global = true,
+		conflicts_with = "logfile",
+		value_parser = BoolishValueParser::new(),
+	)]
+	no_logfile: bool,
+
 	/// The datadir of the bark wallet
 	#[arg(long, env = "BARKD_DATADIR", global = true, default_value_t = default_datadir())]
 	datadir: String,
@@ -66,14 +99,70 @@ struct Cli {
 	/// The port to listen on
 	#[arg(long, env = "BARKD_BIND_PORT")]
 	port: Option<u16>,
-	/// The host to listen on
+	/// The host to listen on. Defaults to loopback; any other value may expose
+	/// the API to other machines on your network or the public internet.
 	#[arg(long, env = "BARKD_BIND_HOST")]
 	host: Option<String>,
 
 	/// Comma-separated list of allowed CORS origins (e.g. "http://localhost:3001,https://myapp.example.com").
-	/// If not set, all cross-origin requests are denied.
+	/// Defaults to denying all cross-origin requests; any value may expose the
+	/// API to browser clients on other origins.
 	#[arg(long, env = "BARKD_ALLOWED_ORIGINS", value_delimiter = ',')]
 	allowed_origins: Vec<String>,
+
+	/// Expose `GET /api/v1/wallet/mnemonic`, which returns the wallet's BIP-39
+	/// mnemonic phrase. Disabled by default; while disabled the endpoint
+	/// responds with 404. Pass `--expose-mnemonic` (or set
+	/// `BARKD_EXPOSE_MNEMONIC=true`) to enable it.
+	#[arg(
+		long,
+		env = "BARKD_EXPOSE_MNEMONIC",
+		default_value_t = false,
+		value_parser = BoolishValueParser::new(),
+	)]
+	expose_mnemonic: bool,
+
+	/// Disables all authentication.
+	///
+	/// Anyone who can access the HTTP port can create invoices, spend all coins
+	/// and might retrieve the mnemonic.
+	///
+	/// This option is mainly useful for testing and development.
+	///
+	/// Deliberately has no environment variable. We don't want auth to be
+	/// disabled by an inherited environment.
+	#[arg(long)]
+	no_auth: bool,
+
+	/// Disables all authentication and permits a non-loopback bind.
+	///
+	/// Implies --no-auth, so it is passed on its own. Anything that can route
+	/// to the bind address gets full wallet access, so only use this when
+	/// something else restricts who can reach the port.
+	#[arg(long)]
+	dangerously_allow_remote_no_auth: bool,
+
+	/// Don't serve the embedded bark-web wallet UI.
+	#[cfg(feature = "barkd-web-ui")]
+	#[arg(long, env = "BARKD_NO_UI", value_parser = BoolishValueParser::new())]
+	no_ui: bool,
+
+	/// Ark server URL the UI's create-wallet flow uses while no wallet is
+	/// loaded
+	#[cfg(feature = "barkd-web-ui")]
+	#[arg(long, env = "BARKD_UI_DEFAULT_ARK_SERVER", default_value_t = ui_default_ark_server())]
+	ui_default_ark_server: String,
+
+	/// Chain source (esplora) URL the UI's create-wallet flow uses while no
+	/// wallet is loaded
+	#[cfg(feature = "barkd-web-ui")]
+	#[arg(long, env = "BARKD_UI_DEFAULT_CHAIN_SOURCE", default_value_t = ui_default_chain_source())]
+	ui_default_chain_source: String,
+
+	/// Network the UI's create-wallet flow uses while no wallet is loaded
+	#[cfg(feature = "barkd-web-ui")]
+	#[arg(long, env = "BARKD_UI_DEFAULT_NETWORK", default_value = "mainnet")]
+	ui_default_network: String,
 }
 
 #[derive(Subcommand)]
@@ -107,6 +196,10 @@ impl Cli {
 	fn to_config(&self) -> anyhow::Result<Config> {
 		let mut cfg = Config::default();
 		if let Some(port) = &self.port {
+			if *port == 0 {
+				bail!("--port 0 is not supported; barkd listens on a fixed \
+					port (default {})", cfg.port);
+			}
 			cfg.port = *port;
 		}
 		if let Some(host) = &self.host {
@@ -130,11 +223,32 @@ impl Cli {
 		cfg.allowed_origins = self.allowed_origins.clone();
 		Ok(cfg)
 	}
+
+	/// Either flag disables auth; only the dangerous one also permits a
+	/// non-loopback bind.
+	fn auth_disabled(&self) -> bool {
+		self.no_auth || self.dangerously_allow_remote_no_auth
+	}
+}
+
+/// Refuse to run without auth on a bind address other hosts can reach, unless
+/// the operator asked for exactly that with the dangerous flag.
+fn check_remote_no_auth(host: IpAddr, allow_remote: bool) -> anyhow::Result<()> {
+	if host.is_loopback() || allow_remote {
+		return Ok(());
+	}
+
+	bail!(
+		"refusing to start: --no-auth with bind host {host} would give full wallet access \
+		to every client that can reach the port. Bind a loopback address, or use \
+		--dangerously-allow-remote-no-auth instead if reachability is restricted by other \
+		means (and terminate TLS in front of barkd)",
+	);
 }
 
 /// Runs a thread that will watch for SIGTERM and ctrl-c signals and
 /// returns when a signal is received
-async fn run_shutdown_signal_listener() {
+async fn run_shutdown_signal_listener(shutdown: CancellationToken) {
 	async fn signal_recv() {
 		#[cfg(unix)]
 		{
@@ -171,6 +285,8 @@ async fn run_shutdown_signal_listener() {
 			Err(e) => panic!("failed to listen to ctrl-c signal: {e}"),
 		},
 	}
+
+	shutdown.cancel();
 }
 
 /// Load the auth token from the datadir. Returns `None` if the file
@@ -189,18 +305,8 @@ fn load_auth_token(datadir: &PathBuf) -> anyhow::Result<Option<AuthToken>> {
 /// Write the auth token to the datadir.
 fn store_auth_token(datadir: &PathBuf, token: &AuthToken) -> anyhow::Result<()> {
 	let path = datadir.join(AUTH_TOKEN_FILE);
-	std::fs::write(&path, token.encode())
-		.with_context(|| format!("failed to write {}", path.display()))?;
-
-	#[cfg(unix)]
-	{
-		use std::os::unix::fs::PermissionsExt;
-		let perms = std::fs::Permissions::from_mode(0o600);
-		std::fs::set_permissions(&path, perms)
-			.with_context(|| format!("failed to set permissions on {}", path.display()))?;
-	}
-
-	Ok(())
+	// This also handles `secret refresh`, which overwrites an existing token.
+	fs_perms::write_atomic_owner_only(&path, token.encode().as_bytes())
 }
 
 /// Generate a random auth token and persist it to the datadir.
@@ -219,6 +325,7 @@ fn wallet_create_request_to_create_opts(req: CreateWalletRequest) -> anyhow::Res
 		None
 	};
 
+	#[allow(deprecated)]
 	let mut config = ConfigOpts {
 		ark: req.ark_server,
 		access_token: req.ark_server_access_token,
@@ -228,6 +335,7 @@ fn wallet_create_request_to_create_opts(req: CreateWalletRequest) -> anyhow::Res
 		bitcoind_user: None,
 		bitcoind_pass: None,
 		socks5_proxy: None,
+		gap_limit: req.gap_limit,
 	};
 
 	if let Some(chain_source) = req.chain_source {
@@ -251,14 +359,14 @@ fn wallet_create_request_to_create_opts(req: CreateWalletRequest) -> anyhow::Res
 	}
 
 	Ok(CreateOpts {
-		force: false,
+		force: req.force,
 		use_filestore: false,
 		mainnet: req.network == BarkNetwork::Mainnet,
 		regtest: req.network == BarkNetwork::Regtest,
 		signet: req.network == BarkNetwork::Signet,
 		mutinynet: req.network == BarkNetwork::Mutinynet,
 		mnemonic: mnemonic,
-		birthday_height: req.birthday_height,
+		birthday_height: req.birthday_height.map(Into::into),
 		config: config,
 	})
 }
@@ -269,7 +377,18 @@ async fn main() -> anyhow::Result<()>{
 
 	let datadir = PathBuf::from_str(&cli.datadir).unwrap();
 
-	init_logging(cli.verbose, cli.quiet, &datadir);
+	let datadir_existed = datadir.exists();
+	std::fs::create_dir_all(&datadir)
+		.with_context(|| format!("failed to create datadir {}", datadir.display()))?;
+	if !datadir_existed {
+		fs_perms::harden(&datadir, 0o700)?;
+	}
+
+	init_logging(cli.verbose, cli.quiet, &datadir, cli.logfile.clone(), cli.no_logfile);
+
+	if datadir_existed {
+		fs_perms::warn_if_loose(&datadir, 0o700);
+	}
 
 	// Handle subcommands that don't start the daemon.
 	if let Some(command) = &cli.command {
@@ -292,44 +411,55 @@ async fn main() -> anyhow::Result<()>{
 				} else {
 					generate_store_auth_token(&datadir)?
 				};
-				eprintln!("Restart barkd for the new token to take effect.");
+				info!("Restart barkd for the new token to take effect.");
 				println!("{}", token.encode());
 				return Ok(());
 			},
 		}
 	}
 
+	let config = cli.to_config()?;
+
+	let shutdown = CancellationToken::new();
+
 	info!("Starting barkd version {} with datadir {}", FULL_VERSION, datadir.display());
 
-	if env!("BARK_VERSION") == VERSION_DIRTY {
+	if env!("BARK_VERSION").contains(VERSION_DEV_MARKER) {
 		warn!("You're running a custom build of barkd, which might cause unexpected issues. \
 			Consider building at one of the tagged versions or using the release builds.");
 	}
 
-	let auth_token = match load_auth_token(&datadir)? {
-		Some(token) => token,
-		None => {
-			let token = generate_store_auth_token(&datadir)?;
-			eprintln!("No auth token found — generated a new one. Use `barkd secret show` to view it.");
-			token
-		},
+	let _barkd_lock = connection::acquire_barkd_lock(&datadir)?;
+
+	let auth_token = if cli.auth_disabled() {
+		check_remote_no_auth(config.host, cli.dangerously_allow_remote_no_auth)?;
+		if cli.allowed_origins.is_empty() {
+			warn!("Auth is disabled and no CORS origins are configured — \
+				any client that can reach this port has full API access.");
+		}
+		None
+	} else {
+		let token = match load_auth_token(&datadir)? {
+			Some(token) => token,
+			None => {
+				let token = generate_store_auth_token(&datadir)?;
+				info!("No auth token found — generated a new one. Use `barkd secret show` to view it.");
+				token
+			},
+		};
+		Some(token)
 	};
 
-	let wallet_opt = if let Some((wallet, onchain)) = open_wallet(&datadir).await? {
-		let wallet = Arc::new(wallet);
-		let onchain = Arc::new(RwLock::new(onchain));
-
-		wallet.start_daemon(Some(onchain.clone()))?;
+	let wallet_opt = if let Some(wallet) = open_wallet(&datadir, USER_AGENT).await? {
+		wallet.start_daemon()?;
 		info!("Wallet loaded and daemon started");
-		let server_wallet = bark_rest::ServerWallet::new(wallet, onchain);
-
-		Some(server_wallet)
+		Some(wallet)
 	} else {
 		warn!("No wallet found. Starting rest server without daemon");
 		None
 	};
 
-	let on_wallet_create: Arc<OnWalletCreate> = Arc::new({
+	let on_wallet_create: Box<OnWalletCreate> = Box::new({
 		let datadir = datadir.clone();
 
 		move |req: CreateWalletRequest| {
@@ -337,12 +467,9 @@ async fn main() -> anyhow::Result<()>{
 
 			Box::pin(async move {
 				let create_opts = wallet_create_request_to_create_opts(req)?;
-				create_wallet(&datadir, create_opts).await?;
-				let (wallet, onchain) = open_wallet(&datadir).await?
+				create_wallet(&datadir, USER_AGENT, create_opts).await?;
+				let wallet = open_wallet(&datadir, USER_AGENT).await?
 					.expect("Wallet should exist");
-
-				let wallet = Arc::new(wallet);
-				let onchain = Arc::new(RwLock::new(onchain));
 
 				// Warm up `wallet.server` before spawning the daemon so
 				// that subsequent REST requests don't race with the daemon's
@@ -351,15 +478,13 @@ async fn main() -> anyhow::Result<()>{
 					warn!("Ark server handshake failed on wallet creation: {:#}", e);
 				}
 
-				wallet.start_daemon(Some(onchain.clone()))?;
-
-				let handle = ServerWallet::new(wallet, onchain);
-				Ok::<_, anyhow::Error>(handle)
+				wallet.start_daemon()?;
+				Ok::<_, anyhow::Error>(wallet)
 			})
 		}
 	});
 
-	let on_wallet_delete: Arc<OnWalletDelete> = Arc::new({
+	let on_wallet_delete: Box<OnWalletDelete> = Box::new({
 		let datadir = datadir.clone();
 		move || {
 			let datadir = datadir.clone();
@@ -367,20 +492,48 @@ async fn main() -> anyhow::Result<()>{
 			// NB: No need to stop the daemon here, it will be stopped when the wallet is removed from the server state
 
 			Box::pin(async move {
-				// Wipe datadir
-				let _ = tokio::fs::remove_dir_all(&datadir).await.ok();
-				tokio::fs::create_dir_all(&datadir).await?;
+				connection::wipe_datadir_except_barkd_files(&datadir)?;
 				Ok(())
 			})
 		}
 	});
 
-	let inner_wallet = wallet_opt.as_ref().map(|w| w.wallet.clone());
-	let server = RestServer::start(
-		&cli.to_config()?, Some(auth_token), wallet_opt, Some(on_wallet_create), Some(on_wallet_delete),
-	).await?;
+	let on_get_mnemonic: Option<Box<OnGetMnemonic>> = if cli.expose_mnemonic {
+		let datadir = datadir.clone();
+		Some(Box::new(move || {
+			let datadir = datadir.clone();
+			Box::pin(async move { read_mnemonic(&datadir).await })
+		}))
+	} else {
+		None
+	};
 
-	run_shutdown_signal_listener().await;
+	let inner_wallet = wallet_opt.as_ref().map(|w| w.clone());
+	let builder = ServerState::builder()
+		.wallet(wallet_opt)
+		.auth_token(auth_token)
+		.on_wallet_create(on_wallet_create)
+		.on_wallet_delete(on_wallet_delete)
+		.on_get_mnemonic(on_get_mnemonic);
+
+	// Serve the embedded bark-web SPA from the same origin as the REST API.
+	#[cfg(feature = "barkd-web-ui")]
+	let builder = builder.web(if cli.no_ui {
+		None
+	} else {
+		Some(bark_rest::web::WebConfig {
+			ark_server: cli.ui_default_ark_server.clone(),
+			chain_source: cli.ui_default_chain_source.clone(),
+			network: cli.ui_default_network.clone(),
+			wallet_data_path: cli.datadir.clone(),
+			datadir: datadir.clone(),
+		})
+	});
+
+	let state = builder.build(shutdown.clone());
+	let server = RestServer::start(&config, Arc::new(state), shutdown.clone()).await?;
+
+	run_shutdown_signal_listener(shutdown.clone()).await;
 
 	if let Some(wallet) = inner_wallet {
 		wallet.stop_daemon();
@@ -391,4 +544,86 @@ async fn main() -> anyhow::Result<()>{
 	}
 
 	Ok(())
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	#[test]
+	fn defaults_dont_panic() {
+		// assert that mainnet_default_chain_source does not panic
+		let _ = ui_default_chain_source();
+		// assert that mainnet_default_ark_server does not panic
+		let _ = ui_default_ark_server();
+	}
+
+	/// `--expose-mnemonic` is a bare presence flag: absent means the mnemonic
+	/// endpoint is disabled, present means enabled. This guards both the
+	/// disabled-by-default behavior and the flag form; the env-var value form
+	/// (`BARKD_EXPOSE_MNEMONIC=true`) is covered by the barkd integration tests.
+	#[test]
+	fn expose_mnemonic_flag_parsing() {
+		let cli = Cli::try_parse_from(["barkd"])
+			.expect("bare invocation should parse");
+		assert!(!cli.expose_mnemonic, "mnemonic exposure must be off by default");
+
+		let cli = Cli::try_parse_from(["barkd", "--expose-mnemonic"])
+			.expect("--expose-mnemonic should parse");
+		assert!(cli.expose_mnemonic, "--expose-mnemonic must enable exposure");
+	}
+
+	/// Nothing reports the actually bound address, so an OS-assigned port
+	/// would leave the daemon unreachable by convention.
+	#[test]
+	fn to_config_rejects_port_zero() {
+		let cli = Cli::try_parse_from(["barkd", "--port", "0"])
+			.expect("--port 0 should parse");
+		let err = cli.to_config().unwrap_err();
+		assert!(
+			err.to_string().contains("--port 0 is not supported"),
+			"unexpected error: {}", err,
+		);
+
+		let cli = Cli::try_parse_from(["barkd", "--port", "3001"])
+			.expect("--port 3001 should parse");
+		assert_eq!(cli.to_config().unwrap().port, 3001);
+	}
+
+	/// Both flags are bare presence flags with no env-var form; that auth can't
+	/// be disabled through the environment is covered by the barkd integration
+	/// tests.
+	#[test]
+	fn no_auth_flag_parsing() {
+		let cli = Cli::try_parse_from(["barkd"])
+			.expect("bare invocation should parse");
+		assert!(!cli.auth_disabled(), "auth must be required by default");
+		assert!(!cli.dangerously_allow_remote_no_auth, "remote must be off by default");
+
+		let cli = Cli::try_parse_from(["barkd", "--no-auth"])
+			.expect("--no-auth should parse");
+		assert!(cli.auth_disabled(), "--no-auth must disable auth");
+		assert!(!cli.dangerously_allow_remote_no_auth, "--no-auth must not permit remote binds");
+
+		// The dangerous flag stands on its own: it disables auth too.
+		let cli = Cli::try_parse_from(["barkd", "--dangerously-allow-remote-no-auth"])
+			.expect("--dangerously-allow-remote-no-auth should parse");
+		assert!(cli.auth_disabled(), "the dangerous flag must disable auth on its own");
+		assert!(cli.dangerously_allow_remote_no_auth, "the dangerous flag must permit remote binds");
+	}
+
+	#[test]
+	fn remote_no_auth_needs_dangerous_flag() {
+		let addr = |s: &str| s.parse::<IpAddr>().unwrap();
+
+		check_remote_no_auth(addr("127.0.0.1"), false).expect("IPv4 loopback");
+		check_remote_no_auth(addr("::1"), false).expect("IPv6 loopback");
+
+		for host in ["0.0.0.0", "192.168.1.10", "::"] {
+			check_remote_no_auth(addr(host), false)
+				.expect_err(&format!("{host} is reachable from other hosts"));
+			check_remote_no_auth(addr(host), true)
+				.unwrap_or_else(|e| panic!("{host} should be allowed by the flag: {e:#}"));
+		}
+	}
 }

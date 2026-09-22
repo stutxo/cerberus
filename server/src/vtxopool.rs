@@ -6,10 +6,11 @@ use std::sync::atomic::{self, AtomicBool};
 use std::time::Duration;
 
 use anyhow::Context;
+use bdk_wallet::coin_selection::SingleRandomDraw;
 use bitcoin::secp256k1::{rand, Keypair};
 use bitcoin::{Amount, OutPoint, Transaction};
 use futures::{stream, StreamExt, TryStreamExt};
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use ark::{ServerVtxo, Vtxo, VtxoId, VtxoPolicy, VtxoRequest};
 use ark::arkoor::ArkoorDestination;
@@ -17,12 +18,15 @@ use ark::vtxo::Full;
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::tree::signed::{LeafVtxoCosignContext, UnlockPreimage};
 use ark::tree::signed::builder::SignedTreeBuilder;
-use bitcoin_ext::{BlockDelta, BlockHeight};
+use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef, P2TR_DUST};
+use bitcoin_ext::bdk::WithGuaranteedChange;
 
 use crate::database::vtxopool::PoolVtxo;
+use crate::database::htlc_vtxo::{self, HtlcDirection};
 use crate::database::tree::VtxoTreeUpdate;
 use crate::wallet::BdkWalletExt;
 use crate::{database, telemetry, Server, SECP};
+use crate::nursery::NurseryTxKind;
 
 
 /// Type used to express a vtxo issuance target for the [VtxoPool]
@@ -69,10 +73,7 @@ pub struct Config {
 	pub vtxo_pre_expiry: BlockDelta,
 	/// maximum arkoor depth to keep change until
 	#[serde(alias = "vtxo_max_arkoor_depth")]
-	pub max_vtxo_arkoor_depth: ArkoorDepth,
-
-	#[serde(with = "crate::utils::serde::duration")]
-	pub issue_interval: Duration,
+	pub max_vtxo_exit_depth: u16,
 }
 
 impl Default for Config {
@@ -80,10 +81,12 @@ impl Default for Config {
 		Self {
 			vtxo_targets: Vec::new(),
 			vtxo_target_issue_threshold: 80,
-			vtxo_lifetime: 144 * 3,
-			vtxo_pre_expiry: 144,
-			max_vtxo_arkoor_depth: 3,
-			issue_interval: Duration::from_secs(60),
+			vtxo_lifetime: BlockDelta::new(144 * 3),
+			vtxo_pre_expiry: BlockDelta::new(144),
+			// The server refuses to cosign arkoors past `max_vtxo_exit_depth`
+			// in the top-level config, which is higher. This field here is
+			// only for the pool of VTXO.
+			max_vtxo_exit_depth: 50,
 		}
 	}
 }
@@ -94,20 +97,14 @@ impl Config {
 	/// We take double the created VTXO lifetime.
 	fn vtxo_key_lifetime(&self) -> Duration {
 		// take double as a buffer
-		Duration::from_secs(60 * 10 * self.vtxo_lifetime as u64 * 2)
+		Duration::from_secs(60 * 10 * u64::from(self.vtxo_lifetime) * 2)
 	}
 }
-
-
-/// To make it clear what we are storing
-type ArkoorDepth = u16;
 
 struct Data {
 	/// A quick manual index into the vtxo pool.
 	/// We first order by expiry height and then by amount.
 	pool: BTreeMap<BlockHeight, BTreeMap<Amount, Vec<VtxoId>>>,
-	/// Sorted target amounts, used for amount-bucket telemetry.
-	bucket_amounts: Vec<Amount>,
 }
 
 impl Data {
@@ -123,16 +120,25 @@ impl Data {
 		}
 	}
 
-	pub async fn load_from_db(db: &database::Db, bucket_amounts: Vec<Amount>) -> anyhow::Result<Self> {
+	pub async fn load_from_db(
+		db: &database::Db,
+		max_exit_depth: u16,
+	) -> anyhow::Result<Self> {
 		let stream = db.load_vtxopool().await?;
 		tokio::pin!(stream);
 
-		let mut ret = Data { pool: BTreeMap::new(), bucket_amounts };
+		let mut ret = Data { pool: BTreeMap::new() };
 		while let Some(v) = stream.try_next().await? {
+			if v.exit_depth() > max_exit_depth {
+				debug!("Not serving vtxo pool vtxo {}: exit depth {} exceeds \
+					the maximum of {}", v.id(), v.exit_depth(), max_exit_depth,
+				);
+				continue;
+			}
 			ret.insert(v.id(), v.expiry_height(), v.amount());
 		}
 
-		telemetry::set_vtxo_pool_metrics(&ret.pool, &ret.bucket_amounts);
+		telemetry::set_vtxo_pool_metrics(&ret.pool);
 
 		Ok(ret)
 	}
@@ -240,7 +246,29 @@ impl Data {
 
 fn update_all_bucket_metrics(data: &parking_lot::Mutex<Data>) {
 	let data = data.lock();
-	telemetry::set_vtxo_pool_metrics(&data.pool, &data.bucket_amounts);
+	telemetry::set_vtxo_pool_metrics(&data.pool);
+}
+
+/// Checks that change outputs contains at most one non-dust and one dust output
+///
+/// Returns change outputs with non-dust first and dust last
+fn check_change_outputs(change: Vec<Vtxo<Full>>) -> anyhow::Result<Vec<Vtxo<Full>>> {
+	let (change, dust_change) = change.into_iter()
+		.partition::<Vec<_>, _>(|v| v.amount() >= P2TR_DUST);
+	if change.len() > 1 {
+		error!("The vtxo pool returned more than one non-dust change output");
+		bail!("More than one non-dust change output");
+	};
+	if dust_change.len() > 1 {
+		error!("The vtxo pool returned more than one dust change output");
+		bail!("More than one dust change output");
+	};
+	if !change.is_empty() && !dust_change.is_empty() {
+		debug!("The vtxo pool produced both non-dust and dust \
+			change outputs, dust one will be dropped from the pool");
+	}
+
+	Ok(change.into_iter().chain(dust_change.into_iter()).collect())
 }
 
 pub struct VtxoPool {
@@ -263,13 +291,17 @@ impl VtxoPool {
 		inputs: &[(VtxoId, BlockHeight, Amount)],
 	) -> anyhow::Result<Vec<Vtxo<Full>>> {
 		let input_ids = inputs.iter().map(|v| v.0).collect::<Vec<_>>();
-		let input_vtxos = srv.db.read(async |t| t.get_pool_vtxos_by_ids(&input_ids).await).await?;
+		let mut input_vtxos = srv.db.read(async |t| t.get_pool_vtxos_by_ids(&input_ids).await).await?;
+
+		// We sort the vtxos in order of increasing amounts
+		// This ensures we spend the smallest vtxos first and
+		// we don't have any vtxo that serves as change
+		input_vtxos.sort_by(|v1, v2| v1.amount().cmp(&v2.amount()));
 
 		// Validate that the inputs are still usable and unlocked
 		let _vtxo_guard = srv.vtxos_in_flux.try_lock(&input_ids).map_err(|e| {
 			anyhow::anyhow!("some VTXO is already locked by another process: {}", e.id)
 		})?;
-		srv.check_vtxos_not_exited(&input_ids).await?;
 
 		let keys = {
 			let mut ret = Vec::with_capacity(input_vtxos.len());
@@ -284,16 +316,30 @@ impl VtxoPool {
 			ret
 		};
 
-		let change_key = srv.generate_ephemeral_cosign_key(self.config.vtxo_key_lifetime()).await?;
-		let change_policy = VtxoPolicy::new_pubkey(change_key.public_key());
 		let input_sum = input_vtxos.iter().map(|v| v.amount()).sum::<Amount>();
-		let change_dest = ArkoorDestination {
-			policy: change_policy,
-			total_amount: input_sum - dest.total_amount,
+		let change_amount = input_sum - dest.total_amount;
+		// Omit the change output when the inputs exactly cover the destination.
+		// A zero-value change output would produce a valueless VTXO, which
+		// arkoor construction rejects.
+		let outputs = if change_amount == Amount::ZERO {
+			vec![dest.clone()]
+		} else {
+			let change_key = srv.generate_ephemeral_cosign_key(self.config.vtxo_key_lifetime()).await?;
+			let change_policy = VtxoPolicy::new_pubkey(change_key.public_key());
+			vec![
+				dest.clone(),
+				ArkoorDestination {
+					policy: change_policy,
+					total_amount: change_amount,
+				},
+			]
 		};
-		let builder = ArkoorPackageBuilder::new_without_checkpoints(
+		// The checkpoint caps the watchman's on-chain traversal when an exit
+		// anchors an allocation chain: checkpoints are swept at expiry instead
+		// of progressed further.
+		let builder = ArkoorPackageBuilder::new_with_checkpoints(
 			input_vtxos.into_iter().map(|v| v.into_inner()),
-			vec![dest.clone(), change_dest],
+			outputs,
 		).context("arkoor builder error")?;
 		let builder = builder.cosign_both(&keys, srv.server_key.leak_ref())
 			.context("error cosigning arkoor")?;
@@ -303,23 +349,43 @@ impl VtxoPool {
 		let input_spend_info = builder.input_spend_info().collect::<Vec<_>>();
 		let output_vtxos = builder.build_signed_vtxos();
 
+		let (sent, change) = output_vtxos.into_iter()
+			.partition::<Vec<_>, _>(|v| *v.policy() == dest.policy);
+
+		let change = check_change_outputs(change)?;
+
 		let update = VtxoTreeUpdate::new()
 			.upsert_signed_tx(signed_vtxs)
 			.insert_oor_spent_vtxos(internal_vtxos)
 			.insert_unspent_vtxos(
-				output_vtxos.iter().cloned().map(ServerVtxo::from),
+				sent.iter().cloned().map(ServerVtxo::from),
 				database::SpendState::HtlcRecvUnclaimed,
 			)
+			.insert_unspent_vtxos(
+				change.iter().cloned().map(ServerVtxo::from),
+				database::SpendState::Pool,
+			)
 			.mark_vtxos_oor_spent(input_spend_info);
+
+		// An htlc-recv vtxo exists as soon as we hand out our signatures,
+		// so its htlc_vtxo row is written together with the vtxo itself.
+		let htlc_recvs = sent.iter()
+			.filter_map(|v| match v.policy() {
+				VtxoPolicy::ServerHtlcRecv(p) =>
+					Some((v.id(), p.payment_hash, p.htlc_expiry)),
+				VtxoPolicy::ServerHtlcRecv_v0(p) =>
+					Some((v.id(), p.payment_hash, p.htlc_expiry)),
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+
 		srv.db.write(async |t| {
 			t.execute_vtxo_tree_update(update).await?;
+			htlc_vtxo::create_htlc_vtxos(&t, &htlc_recvs, HtlcDirection::Outgoing).await?;
 			t.mark_vtxopool_vtxos_spent(inputs.iter().map(|v| v.0)).await
 				.context("failed to mark vtxopool vtxos as spent")?;
 			Ok(())
 		}).await?;
-
-		let (sent, change) = output_vtxos.into_iter()
-			.partition::<Vec<_>, _>(|v| *v.policy() == dest.policy);
 
 		for input in inputs {
 			slog!(SpentPoolVtxo, vtxo: input.0, amount: input.2, destination: dest.clone());
@@ -333,14 +399,25 @@ impl VtxoPool {
 			}
 		}
 
-		for change in change {
-			let new = PoolVtxo::new(change);
-			if let Err(e) = srv.db.write(async |t| t.store_vtxopool_vtxo(&new).await).await {
-				// don't abort for this
-				warn!("Failed to store change from a vtxopool spend: {:#}", e);
+		// We stored all change output VTXOs, but in the pool we only keep the
+		// first one (nondust) to avoid later serving one whose ephemeral key was deleted.
+		// Change past the arkoor depth cap is not kept either; like dust
+		// change, it is swept after expiry.
+		if let Some(change) = change.first() {
+			if change.exit_depth() > self.config.max_vtxo_exit_depth {
+				info!("Dropping vtxo pool change {} from the pool: exit depth {} \
+					exceeds the maximum of {}",
+					change.id(), change.exit_depth(), self.config.max_vtxo_exit_depth,
+				);
 			} else {
-				self.data.lock().insert_vtxos(&[new.clone()]);
-				slog!(ChangePoolVtxo, vtxo: new.id(), amount: new.amount());
+				let new = PoolVtxo::new(change.clone());
+				if let Err(e) = srv.db.write(async |t| t.store_vtxopool_vtxo(&new).await).await {
+					// don't abort for this
+					warn!("Failed to store change from a vtxopool spend: {:#}", e);
+				} else {
+					self.data.lock().insert_vtxos(&[new.clone()]);
+					slog!(ChangePoolVtxo, vtxo: new.id(), amount: new.amount());
+				}
 			}
 		}
 
@@ -375,13 +452,7 @@ impl VtxoPool {
 	}
 
 	pub async fn new(config: Config, db: &database::Db) -> anyhow::Result<VtxoPool> {
-		// Compute sorted bucket amounts once
-		let mut bucket_amounts = config.vtxo_targets.iter()
-			.map(|t| t.amount)
-			.collect::<Vec<_>>();
-		bucket_amounts.sort();
-
-		let data = Data::load_from_db(db, bucket_amounts).await?;
+		let data = Data::load_from_db(db, config.max_vtxo_exit_depth).await?;
 
 		Ok(VtxoPool {
 			config,
@@ -390,7 +461,11 @@ impl VtxoPool {
 		})
 	}
 
-	pub fn start(&self, srv: Arc<Server>) {
+	pub fn start(
+		&self,
+		srv: Arc<Server>,
+		sync_height_rx: tokio::sync::watch::Receiver<BlockRef>,
+	) {
 		if self.started.swap(true, atomic::Ordering::Relaxed) {
 			return;
 		}
@@ -399,6 +474,7 @@ impl VtxoPool {
 			srv: srv.clone(),
 			config: self.config.clone(),
 			data: self.data.clone(),
+			sync_height_rx,
 		};
 		tokio::spawn(proc.run());
 	}
@@ -409,6 +485,9 @@ struct Process {
 	config: Config,
 
 	data: Arc<parking_lot::Mutex<Data>>,
+
+	/// Issuance occurs after a sync has completed
+	sync_height_rx: tokio::sync::watch::Receiver<BlockRef>,
 }
 
 impl Process {
@@ -417,6 +496,15 @@ impl Process {
 		let nb_vtxos = issuance.iter().map(|i| i.1).sum();
 		if nb_vtxos < 2 {
 			warn!("Ignoring vtxopool issuance request for 1 VTXO");
+			return Ok(());
+		}
+
+		// Gate the tx-committing path on shutdown: we don't want to broadcast
+		// an issuance funding tx on the way out. Past this point the critical
+		// worker guard keeps shutdown waiting for the wallet commit and
+		// broadcast to finish, so this is the last chance to bail out cleanly.
+		if self.srv.rtmgr.shutdown_requested() {
+			info!("Shutdown pending; skipping VTXO pool issuance");
 			return Ok(());
 		}
 
@@ -444,7 +532,7 @@ impl Process {
 			(requests, leaf_keys)
 		};
 
-		let expiry = self.srv.chain_tip().height + self.config.vtxo_lifetime as BlockHeight;
+		let expiry = self.srv.chain_tip().height + self.config.vtxo_lifetime;
 
 		let cosign_key = Keypair::new(&*SECP, &mut rand::thread_rng());
 		let server_cosign_key = self.srv.generate_ephemeral_cosign_key(
@@ -466,15 +554,16 @@ impl Process {
 
 		let funding_txout = builder.funding_txout();
 
-		let mut wallet = self.srv.rounds_wallet.lock().await;
-		let funding_psbt = {
-			let unavailable = wallet.unavailable_outputs(self.srv.config.min_trusted_confs);
-			let mut b = wallet.build_tx();
-			b.unspendable(unavailable);
-			b.add_recipient(funding_txout.script_pubkey.clone(), funding_txout.value);
-			b.fee_rate(fee_rate);
-			b.finish().context("failed to build signed tree funding tx")?
-		};
+		let txout = funding_txout.clone();
+		let (mut wallet, funding_psbt) = self.srv.rounds_wallet.build_blocking(
+			move |wallet| {
+				let selection = WithGuaranteedChange(SingleRandomDraw);
+				wallet.build_tx_at_chunk_feerate(selection, fee_rate, |b| {
+					b.add_recipient(txout.script_pubkey.clone(), txout.value);
+					Ok(())
+				}).context("failed to build signed tree funding tx")
+			},
+		).await?;
 
 		let funding_txid = funding_psbt.unsigned_tx.compute_txid();
 		let total_amount = builder.total_required_value();
@@ -506,8 +595,9 @@ impl Process {
 		// we rely here on the order of the vtxos being identical to the order of the requests
 		let mut vtxos = tree.output_vtxos().collect::<Vec<_>>();
 		for (vtxo, leaf_key) in vtxos.iter_mut().zip(leaf_keys.iter()) {
-			let (ctx, req) = LeafVtxoCosignContext::new(vtxo, &funding_psbt.unsigned_tx, &leaf_key);
-			let resp = self.srv.cosign_hashlocked_leaf(&req, vtxo, &funding_psbt.unsigned_tx);
+			let (ctx, req) = LeafVtxoCosignContext::new(vtxo, &funding_psbt.unsigned_tx, &leaf_key)
+				.context("pool vtxo is not a hArk leaf")?;
+			let resp = self.srv.cosign_hashlocked_leaf(&req, vtxo, &funding_psbt.unsigned_tx)?;
 			ensure!(ctx.finalize(vtxo, resp), "failed to finalize leaf vtxo");
 			ensure!(vtxo.provide_unlock_preimage(unlock_preimage), "invalid unlock preimage");
 		}
@@ -516,7 +606,11 @@ impl Process {
 		let tx = wallet.finish_tx(funding_psbt).context("error finishing tree funding tx")?;
 
 		// Create the vtxos and virtual transactions in the database
-		// before committing the funding tx to the wallet.
+		// before committing the funding tx to the wallet. The funding tx
+		// is handed to the nursery in the same db tx, so that once the
+		// wallet considers its inputs spent, broadcast follow-up is
+		// guaranteed even if a later step fails.
+		let confirm_target = self.srv.nursery_confirm_target();
 		let update = VtxoTreeUpdate::new()
 			.upsert_funding_tx(&tx)
 			.upsert_signed_tx(tree.internal_node_txs().iter().cloned())
@@ -526,7 +620,10 @@ impl Process {
 				tree.output_vtxos().map(ServerVtxo::from),
 				database::SpendState::Pool,
 			);
-		self.srv.db.write(async |t| t.execute_vtxo_tree_update(update).await).await?;
+		self.srv.db.write(async |t| {
+			t.execute_vtxo_tree_update(update).await?;
+			t.upsert_nursery_tx(&tx, NurseryTxKind::VtxoPool, confirm_target).await
+		}).await?;
 
 		// Here we commit the transaction to the wallet
 		wallet.commit_tx(&tx);
@@ -540,8 +637,6 @@ impl Process {
 		self.srv.db.write(async |t| {
 			t.add_funding_vtxos_to_frontier(txid, None).await
 				.context("failed to add vtxopool vtxos to frontier")?;
-			t.upsert_bitcoin_transaction(txid, &tx).await
-				.context("error storing unbroadcasted vtxo issuance funding tx")?;
 			t.store_vtxopool_vtxos(&pool_vtxos).await.context("storing pool vtxos")?;
 			Ok(())
 		}).await?;
@@ -550,10 +645,8 @@ impl Process {
 
 		slog!(FinishedPoolIssuance, txid: funding_txid, total_count: requests.len(), total_amount);
 
-		self.srv.tx_nursery.broadcast_tx(tx).await
+		self.srv.tx_nursery.broadcast_tx(tx, NurseryTxKind::VtxoPool, confirm_target).await
 			.with_context(|| format!("error broadcasting vtxopool issuance tx {}", txid))?;
-
-		//TODO(stevenroose) should ensure tx gets confirmed
 
 		Ok(())
 	}
@@ -591,7 +684,7 @@ impl Process {
 	)]
 	async fn check_maybe_issue_vtxos(&self) -> anyhow::Result<()> {
 		let tip = self.srv.chain_tip().height;
-		let threshold = tip + self.config.vtxo_pre_expiry as BlockHeight;
+		let threshold = tip + self.config.vtxo_pre_expiry;
 
 		// NB this needs to be a different method because otherwise borrowck complains
 		// about the mutex not being send even if we add a manual `drop()`
@@ -605,25 +698,33 @@ impl Process {
 		Ok(())
 	}
 
-	async fn run(self) {
+	async fn run(mut self) {
 		let _worker = self.srv.rtmgr.spawn_critical("VtxoPool");
 
-		let mut timer = tokio::time::interval(self.config.issue_interval);
 		loop {
+			// Don't issue until we are fully caught up: the wallet only holds
+			// every confirmed utxo once we reach the tip. Comparing the whole
+			// block ref also holds off on an equal-height reorg, where the tip
+			// has moved to another block of the same height.
+			let synced = *self.sync_height_rx.borrow() == self.srv.chain_tip();
+			if synced {
+				if let Err(e) = self.check_maybe_issue_vtxos().await {
+					error!("Error from VTXO pool: {:#}", e);
+				}
+			}
+
 			tokio::select! {
-				// Periodic interval for issuing new vtxos
-				_ = timer.tick() => {},
+				res = self.sync_height_rx.changed() => {
+					if res.is_err() {
+						info!("Sync height watcher closed. Exiting VtxoPool...");
+						return;
+					}
+				},
 				_ = self.srv.rtmgr.shutdown_signal() => {
 					info!("Shutdown signal received. Exiting VtxoPool...");
 					return;
 				},
 			}
-
-			if let Err(e) = self.check_maybe_issue_vtxos().await {
-				warn!("Error from VTXO pool: {:#}", e);
-			}
-
-			timer.reset();
 		}
 	}
 }
@@ -641,6 +742,10 @@ mod test {
 
 	fn sat(v: u64) -> Amount {
 		Amount::from_sat(v)
+	}
+
+	fn h(v: u32) -> BlockHeight {
+		BlockHeight::new(v)
 	}
 
 	/// assert a given selection
@@ -667,43 +772,45 @@ mod test {
 	#[test]
 	fn test_vtxo_selection() {
 		let vtxos = [
-			(id(1), 100, sat(1000)),
-			(id(2), 100, sat(1000)),
-			(id(3), 100, sat(2000)),
-			(id(4), 100, sat(2000)),
-			(id(5), 100, sat(3000)),
-			(id(6), 100, sat(3000)),
-			(id(11), 110, sat(1000)),
-			(id(12), 110, sat(1000)),
-			(id(13), 110, sat(2000)),
-			(id(14), 110, sat(2000)),
-			(id(15), 110, sat(3000)),
-			(id(16), 110, sat(3000)),
+			(id(1), h(100), sat(1000)),
+			(id(2), h(100), sat(1000)),
+			(id(3), h(100), sat(2000)),
+			(id(4), h(100), sat(2000)),
+			(id(5), h(100), sat(3000)),
+			(id(6), h(100), sat(3000)),
+			(id(11), h(110), sat(1000)),
+			(id(12), h(110), sat(1000)),
+			(id(13), h(110), sat(2000)),
+			(id(14), h(110), sat(2000)),
+			(id(15), h(110), sat(3000)),
+			(id(16), h(110), sat(3000)),
+			(id(17), h(120), sat(1000)),
+			(id(18), h(120), sat(1000)),
 		];
 		let len = vtxos.len();
 
-		let mut data = Data { pool: BTreeMap::new(), bucket_amounts: vec![] };
+		let mut data = Data { pool: BTreeMap::new() };
 		for (v, h, a) in vtxos {
 			data.insert(v, h, a);
 		}
 		assert_eq!(data.len(), len);
 
 		let sel = data.take_inputs(sat(500));
-		assert_sel(&sel, &[(100, sat(1000))]);
+		assert_sel(&sel, &[(h(100), sat(1000))]);
 
 		let sel = data.take_inputs(sat(2500));
-		assert_sel(&sel, &[(100, sat(3000))]);
+		assert_sel(&sel, &[(h(100), sat(3000))]);
 
 		let sel = data.take_inputs(sat(1000));
-		assert_sel(&sel, &[(100, sat(1000))]);
+		assert_sel(&sel, &[(h(100), sat(1000))]);
 
 		// the 2x 1000 at height 100 are already used
 		let sel = data.take_inputs(sat(900));
-		assert_sel(&sel, &[(100, sat(2000))]);
+		assert_sel(&sel, &[(h(100), sat(2000))]);
 
 		// left at 100: 3000, 2000
 		let sel = data.take_inputs(sat(5500));
-		assert_sel(&sel, &[(100, sat(2000)), (100, sat(3000)), (110, sat(1000))]);
+		assert_sel(&sel, &[(h(100), sat(2000)), (h(100), sat(3000)), (h(110), sat(1000))]);
 
 		let len = data.len();
 		let sel = data.take_inputs(Amount::MAX_MONEY);

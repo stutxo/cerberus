@@ -22,8 +22,8 @@ message PostArkoorMessageRequest {
 }
 
 message MailboxRequest {
-	// The unblinded mailbox ID to obtain data from
-	bytes unblinded_id = 1;
+	// The mailbox ID to obtain data from
+	bytes mailbox_id = 1;
 	// A signed proof that you are allowed to read from this mailbox
 	optional bytes authorization = 2;
 	// The last checkpoint you have seen/processed
@@ -56,6 +56,7 @@ message RoundParticipationCompleted {
 
 message IncomingLightningPaymentMessage {
 	bytes payment_hash = 1;
+	uint64 amount_msat = 2;
 }
 
 message RecoveryVtxoIdsMessage {
@@ -76,7 +77,11 @@ message MailboxMessages {
 }
 
 message PostRecoveryVtxoIdsRequest {
-	// The unblinded recovery mailbox ID
-	bytes unblinded_id = 1;
+	// The recovery mailbox ID
+	bytes mailbox_id = 1;
+	// The recovery IDs.
+	// Maximum number of IDs is set in the `MAX_NB_MAILBOX_RECOVERY_IDS` constant
 	repeated bytes vtxo_ids = 2;
+	// Signed proof of mailbox ownership. Optional for now for backward compat.
+	optional bytes authorization = 3;
 }

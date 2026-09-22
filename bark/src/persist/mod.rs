@@ -25,6 +25,11 @@ pub mod sqlite;
 pub(crate) mod test_suite;
 
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::Context;
+use bitcoin::bip32::Fingerprint;
 use bitcoin::{Amount, Transaction, Txid};
 use bitcoin::secp256k1::PublicKey;
 use chrono::DateTime;
@@ -33,19 +38,19 @@ use lightning_invoice::Bolt11Invoice;
 use bdk_wallet::ChangeSet;
 
 use ark::{Vtxo, VtxoId};
-use ark::lightning::{Invoice, PaymentHash, Preimage};
+use ark::lightning::{PaymentHash, Preimage};
 use ark::vtxo::Full;
-use bitcoin_ext::BlockDelta;
 
 use crate::WalletProperties;
-use crate::exit::ExitTxOrigin;
+use crate::actions::{WalletActionCheckpoint, WalletActionId};
+use crate::exit::{ExitTxOrigin, ExitStateKind};
 use crate::persist::models::{
-	LightningReceive, LightningSend, PendingBoard, RoundStateId, StoredExit, StoredRoundState,
-	Unlocked, PendingOffboard,
+	PaidInvoice, RoundStateId, SettledLightningReceive, StoredExit, StoredRoundState, Unlocked,
 };
 use crate::movement::{Movement, MovementId, MovementStatus, MovementSubsystem, PaymentMethod};
+use crate::movement::update::MovementUpdate;
 use crate::round::RoundState;
-use crate::vtxo::{VtxoState, VtxoStateKind, WalletVtxo};
+use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
 
 /// Storage interface for Bark wallets.
 ///
@@ -180,7 +185,27 @@ pub trait BarkPersister: Send + Sync + 'static {
 		status: MovementStatus,
 		subsystem: &MovementSubsystem,
 		time: DateTime<chrono::Local>,
+		action_id: Option<&str>,
 	) -> anyhow::Result<MovementId>;
+
+	/// Atomically look up the movement owned by `action_id`, or create it and
+	/// apply `update` as its initial state, in a single transaction.
+	///
+	/// A movement created this way is indexed by `action_id`, so a re-driven
+	/// action step (crash recovery, an early wake, the reentrancy double-drive)
+	/// reuses its existing, already-initialized movement. Doing the lookup,
+	/// insert and initial update atomically means a re-drive never observes a
+	/// half-written movement and never inserts a duplicate.
+	///
+	/// Returns the movement id and whether it was newly created, so the caller
+	/// can dispatch the `created` notification exactly once.
+	async fn get_or_create_movement_for_action(
+		&self,
+		subsystem: &MovementSubsystem,
+		time: DateTime<chrono::Local>,
+		action_id: &str,
+		update: MovementUpdate,
+	) -> anyhow::Result<(MovementId, bool)>;
 
 	/// Persists the given movement state.
 	///
@@ -228,51 +253,9 @@ pub trait BarkPersister: Send + Sync + 'static {
 		payment_method: &PaymentMethod,
 	) -> anyhow::Result<Vec<Movement>>;
 
-	/// Store a pending board.
+	/// Store a new ongoing round state
 	///
-	/// Parameters:
-	/// - vtxo: The [Vtxo] to store.
-	/// - funding_txid: The funding [Txid].
-	/// - movement_id: The [MovementId] associated with this board.
-	///
-	/// Errors:
-	/// - Returns an error if the board cannot be stored.
-	async fn store_pending_board(
-		&self,
-		vtxo: &Vtxo<Full>,
-		funding_tx: &Transaction,
-		movement_id: MovementId,
-	) -> anyhow::Result<()>;
-
-	/// Remove a pending board.
-	///
-	/// Parameters:
-	/// - vtxo_id: The [VtxoId] to remove.
-	///
-	/// Errors:
-	/// - Returns an error if the board cannot be removed.
-	async fn remove_pending_board(&self, vtxo_id: &VtxoId) -> anyhow::Result<()>;
-
-	/// Get the [VtxoId] for each pending board.
-	///
-	/// Returns:
-	/// - `Ok(Vec<VtxoId>)` possibly empty.
-	///
-	/// Errors:
-	/// - Returns an error if the query fails.
-	async fn get_all_pending_board_ids(&self) -> anyhow::Result<Vec<VtxoId>>;
-
-	/// Get the [PendingBoard] associated with the given [VtxoId].
-	///
-	/// Returns:
-	/// - `Ok(Some(PendingBoard))` if a matching board exists
-	/// - `Ok(None)` if no matching board exists
-	///
-	/// Errors:
-	/// - Returns an error if the query fails.
-	async fn get_pending_board_by_vtxo_id(&self, vtxo_id: VtxoId) -> anyhow::Result<Option<PendingBoard>>;
-
-	/// Store a new ongoing round state and lock the VTXOs in round
+	/// The holder should ensure the input VTXOs are available and locked.
 	///
 	/// Parameters:
 	/// - `round_state`: the state to store
@@ -281,9 +264,8 @@ pub trait BarkPersister: Send + Sync + 'static {
 	/// - `RoundStateId`: the storaged ID of the new state
 	///
 	/// Errors:
-	/// - returns an error of the new round state could not be stored or the VTXOs
-	///   couldn't be marked as locked
-	async fn store_round_state_lock_vtxos(&self, round_state: &RoundState) -> anyhow::Result<RoundStateId>;
+	/// - returns an error of the new round state could not be stored
+	async fn store_round_state(&self, round_state: &RoundState) -> anyhow::Result<RoundStateId>;
 
 	/// Update an existing stored pending round state
 	///
@@ -354,6 +336,19 @@ pub trait BarkPersister: Send + Sync + 'static {
 	/// - Returns an error if the lookup fails.
 	async fn get_wallet_vtxo(&self, id: VtxoId) -> anyhow::Result<Option<WalletVtxo>>;
 
+	/// Fetch multiple wallet VTXOs by id, preserving the order of the
+	/// input slice.
+	///
+	/// Parameters:
+	/// - ids: [VtxoId]s to look up.
+	///
+	/// Returns:
+	/// - `Ok(Vec<WalletVtxo>)` with one entry per input id, in order.
+	///
+	/// Errors:
+	/// - Returns an error if any id is missing or the lookup fails.
+	async fn get_wallet_vtxos(&self, ids: &[VtxoId]) -> anyhow::Result<Vec<WalletVtxo>>;
+
 	/// Fetch all wallet VTXOs in the database.
 	///
 	/// Returns:
@@ -369,7 +364,9 @@ pub trait BarkPersister: Send + Sync + 'static {
 	/// - state: Slice of `VtxoStateKind` filters.
 	///
 	/// Returns:
-	/// - `Ok(Vec<WalletVtxo>)` possibly empty.
+	/// - `Ok(Vec<WalletVtxo>)` possibly empty, sorted by expiry height
+	///   ascending, then by amount descending. Callers rely on this order
+	///   to prioritize VTXOs that expire sooner and are larger.
 	///
 	/// Errors:
 	/// - Returns an error if the query fails.
@@ -466,146 +463,76 @@ pub trait BarkPersister: Send + Sync + 'static {
 	/// - Returns error when the provided checkpoint is smaller than the existing checkpoint
 	async fn store_mailbox_checkpoint(&self, checkpoint: u64) -> anyhow::Result<()>;
 
-	/// Store a new pending lightning send.
+	/// Persist or overwrite a wallet action checkpoint.
 	///
 	/// Parameters:
-	/// - invoice: The invoice of the pending lightning send.
-	/// - amount: The amount of the pending lightning send.
-	/// - fee: The fee of the pending lightning send.
-	/// - vtxos: The vtxos of the pending lightning send.
-	/// - movement_id: The movement ID associated with this send.
+	/// - id: stable action identifier (e.g. payment hash hex for a lightning send).
+	/// - checkpoint: the payload to persist; replaces any existing row with the same id.
 	///
 	/// Errors:
-	/// - Returns an error if the pending lightning send cannot be stored.
-	async fn store_new_pending_lightning_send(
+	/// - Returns an error if the write fails.
+	async fn upsert_wallet_action_checkpoint(
 		&self,
-		invoice: &Invoice,
-		amount: Amount,
-		fee: Amount,
-		vtxos: &[VtxoId],
-		movement_id: MovementId,
-	) -> anyhow::Result<LightningSend>;
-
-	/// Get all pending lightning sends.
-	///
-	/// Returns:
-	/// - `Ok(Vec<LightningSend>)` possibly empty.
-	///
-	/// Errors:
-	/// - Returns an error if the query fails.
-	async fn get_all_pending_lightning_send(&self) -> anyhow::Result<Vec<LightningSend>>;
-
-	/// Mark a lightning send as finished.
-	///
-	/// Parameters:
-	/// - payment_hash: The [PaymentHash] of the lightning send to update.
-	/// - preimage: The [Preimage] of the successful lightning send.
-	///
-	/// Errors:
-	/// - Returns an error if the lightning send cannot be updated.
-	async fn finish_lightning_send(
-		&self,
-		payment_hash: PaymentHash,
-		preimage: Option<Preimage>,
+		id: &WalletActionId,
+		checkpoint: &WalletActionCheckpoint,
 	) -> anyhow::Result<()>;
 
-	/// Remove a lightning send.
+	/// Fetch a wallet action checkpoint by id.
 	///
-	/// Parameters:
-	/// - payment_hash: The [PaymentHash] of the lightning send to remove.
+	/// Returns:
+	/// - `Ok(Some(_))` if a row exists, `Ok(None)` otherwise.
 	///
 	/// Errors:
-	/// - Returns an error if the lightning send cannot be removed.
-	async fn remove_lightning_send(&self, payment_hash: PaymentHash) -> anyhow::Result<()>;
+	/// - Returns an error if the lookup or deserialization fails.
+	async fn get_wallet_action_checkpoint(
+		&self,
+		id: &WalletActionId,
+	) -> anyhow::Result<Option<WalletActionCheckpoint>>;
 
-	/// Get a lightning send by payment hash
+	/// Fetch every persisted wallet action checkpoint, oldest first.
 	///
-	/// Parameters:
-	/// - payment_hash: The [PaymentHash] of the lightning send to get.
-	///
-	/// Errors:
-	/// - Returns an error if the lookup fails.
-	async fn get_lightning_send(&self, payment_hash: PaymentHash) -> anyhow::Result<Option<LightningSend>>;
+	/// Used by the periodic sync to find work to re-drive.
+	async fn get_all_wallet_action_checkpoints(
+		&self,
+	) -> anyhow::Result<Vec<WalletActionCheckpoint>>;
 
-	/// Store an incoming Lightning receive record.
+	/// Remove a wallet action checkpoint by id. No-op if absent.
+	async fn remove_wallet_action_checkpoint(
+		&self,
+		id: &WalletActionId,
+	) -> anyhow::Result<()>;
+
+	/// Record a settled outgoing lightning send.
 	///
-	/// Parameters:
-	/// - payment_hash: Unique payment hash.
-	/// - preimage: Payment preimage (kept until disclosure).
-	/// - invoice: The associated BOLT11 invoice.
-	/// - htlc_recv_cltv_delta: The CLTV delta for the HTLC VTXO.
-	///
-	/// Errors:
-	/// - Returns an error if the receive cannot be stored.
-	async fn store_lightning_receive(
+	/// Idempotent: a subsequent call with the same payment_hash is a
+	/// no-op (the existing row wins). This makes retry across a crash
+	/// safe even without a multi-row transaction.
+	async fn record_paid_invoice(
+		&self,
+		payment_hash: PaymentHash,
+		preimage: Preimage,
+	) -> anyhow::Result<()>;
+
+	/// Look up an existing paid-invoice record by payment hash.
+	async fn get_paid_invoice(
+		&self,
+		payment_hash: PaymentHash,
+	) -> anyhow::Result<Option<PaidInvoice>>;
+
+	/// Record a settled incoming lightning receive, ignore if already exists.
+	async fn record_settled_lightning_receive(
 		&self,
 		payment_hash: PaymentHash,
 		preimage: Preimage,
 		invoice: &Bolt11Invoice,
-		htlc_recv_cltv_delta: BlockDelta,
+		amount: Amount,
 	) -> anyhow::Result<()>;
 
-	/// Returns a list of all pending lightning receives
-	///
-	/// Returns:
-	/// - `Ok(Vec<LightningReceive>)` possibly empty.
-	///
-	/// Errors:
-	/// - Returns an error if the query fails.
-	async fn get_all_pending_lightning_receives(&self) -> anyhow::Result<Vec<LightningReceive>>;
-
-	/// Mark a Lightning receive preimage as revealed (e.g., after settlement).
-	///
-	/// Parameters:
-	/// - payment_hash: The payment hash identifying the receive.
-	///
-	/// Errors:
-	/// - Returns an error if the update fails or the receive does not exist.
-	async fn set_preimage_revealed(&self, payment_hash: PaymentHash) -> anyhow::Result<()>;
-
-	/// Set the VTXO IDs and [MovementId] for a [LightningReceive].
-	///
-	/// Parameters:
-	/// - payment_hash: The payment hash identifying the receive.
-	/// - htlc_vtxo_ids: The VTXO IDs to set.
-	/// - movement_id: The movement ID associated with the invoice.
-	///
-	/// Errors:
-	/// - Returns an error if the update fails or the receive does not exist.
-	async fn update_lightning_receive(
+	/// Look up a settled lightning receive record by payment hash.
+	async fn get_settled_lightning_receive(
 		&self,
 		payment_hash: PaymentHash,
-		htlc_vtxo_ids: &[VtxoId],
-		movement_id: MovementId,
-	) -> anyhow::Result<()>;
-
-	/// Fetch a Lightning receive by its payment hash.
-	///
-	/// Parameters:
-	/// - payment_hash: The payment hash to look up.
-	///
-	/// Returns:
-	/// - `Ok(Some(LightningReceive))` if found,
-	/// - `Ok(None)` otherwise.
-	///
-	/// Errors:
-	/// - Returns an error if the lookup fails.
-	async fn fetch_lightning_receive_by_payment_hash(
-		&self,
-		payment_hash: PaymentHash,
-	) -> anyhow::Result<Option<LightningReceive>>;
-
-	/// Mark a Lightning receive as finished by its payment hash.
-	///
-	/// Parameters:
-	/// - payment_hash: The payment hash of the record to mark finished
-	///
-	/// Errors:
-	/// - Returns an error if the operation fails.
-	async fn finish_pending_lightning_receive(
-		&self,
-		payment_hash: PaymentHash,
-	) -> anyhow::Result<()>;
+	) -> anyhow::Result<Option<SettledLightningReceive>>;
 
 	/// Store an entry indicating a [Vtxo] is being exited.
 	///
@@ -633,6 +560,24 @@ pub trait BarkPersister: Send + Sync + 'static {
 	/// Errors:
 	/// - Returns an error if the query fails.
 	async fn get_exit_vtxo_entries(&self) -> anyhow::Result<Vec<StoredExit>>;
+
+	/// List exit entries whose current state matches one of the given [ExitStateKind]s.
+	///
+	/// Errors:
+	/// - Returns an error if the underlying query fails.
+	async fn get_exit_vtxo_entries_with_states(
+		&self,
+		states: &[ExitStateKind],
+	) -> anyhow::Result<Vec<StoredExit>>;
+
+	/// Fetch the exit entry for a single [Vtxo] ID, if any.
+	///
+	/// Returns:
+	/// - `Ok(Some(StoredExit))` if the VTXO has an exit entry, `Ok(None)` otherwise.
+	///
+	/// Errors:
+	/// - Returns an error if the query fails.
+	async fn get_exit_vtxo_entry(&self, id: &VtxoId) -> anyhow::Result<Option<StoredExit>>;
 
 	/// Store a child transaction related to an exit transaction.
 	///
@@ -669,6 +614,13 @@ pub trait BarkPersister: Send + Sync + 'static {
 	/// Updates the state of the VTXO corresponding to the given [VtxoId], provided that their
 	/// current state is one of the given `allowed_states`.
 	///
+	/// The update is idempotent: a VTXO that already carries exactly `new_state` is left
+	/// untouched and returned as-is, whether or not its current state kind appears in
+	/// `allowed_states`. Retrying an interrupted transition therefore succeeds without
+	/// appending a redundant state history entry. Callers who need to know whether they
+	/// were the ones to move the VTXO must track that themselves; the return value does
+	/// not distinguish the two cases.
+	///
 	/// # Parameters
 	/// - `vtxo_id`: The ID of the [Vtxo] to update.
 	/// - `state`: The new state to be set for the specified [Vtxo].
@@ -676,12 +628,13 @@ pub trait BarkPersister: Send + Sync + 'static {
 	///   [Vtxo] must currently be in for their state to be updated to the new `state`.
 	///
 	/// # Returns
-	/// - `Ok(WalletVtxo)` if the state update is successful.
+	/// - `Ok(WalletVtxo)` if the state update is successful, or was already applied.
 	/// - `Err(anyhow::Error)` if the VTXO fails to meet the required conditions,
 	///    or if another error occurs during the operation.
 	///
 	/// # Errors
-	/// - Returns an error if the current state is not within the `allowed_states`.
+	/// - Returns an error if the current state differs from `new_state` and is not
+	///   within the `allowed_states`.
 	/// - Returns an error for any other issues encountered during the operation.
 	async fn update_vtxo_state_checked(
 		&self,
@@ -690,33 +643,108 @@ pub trait BarkPersister: Send + Sync + 'static {
 		allowed_old_states: &[VtxoStateKind],
 	) -> anyhow::Result<WalletVtxo>;
 
-	/// Store a pending offboard record.
-	///
-	/// Parameters:
-	/// - pending: The [PendingOffboard] to store.
-	///
-	/// Errors:
-	/// - Returns an error if the record cannot be stored.
-	async fn store_pending_offboard(
+	/// Release `holder`'s lock on the given vtxo, transitioning it to
+	/// [VtxoState::Spendable]. `holder` must match the value passed at
+	/// lock time (including `None` for locks taken without a holder).
+	/// Any other current state (already Spendable, Locked by a different
+	/// holder, Spent, Exited) is a no-op, so calling this repeatedly is
+	/// equivalent to calling it once.
+	async fn release_vtxo_lock(
 		&self,
-		pending: &PendingOffboard,
+		vtxo_id: VtxoId,
+		holder: Option<&VtxoLockHolder>,
 	) -> anyhow::Result<()>;
 
-	/// Get all pending offboard records.
-	///
-	/// Returns:
-	/// - `Ok(Vec<PendingOffboard>)` possibly empty.
-	///
-	/// Errors:
-	/// - Returns an error if the query fails.
-	async fn get_pending_offboards(&self) -> anyhow::Result<Vec<PendingOffboard>>;
+	/// Transition multiple VTXOs to `new_state` atomically: either every
+	/// vtxo's state changes or none does. A failure must not affect any
+	/// vtxo.
+	async fn update_vtxo_states_checked(
+		&self,
+		vtxo_ids: &[VtxoId],
+		new_state: VtxoState,
+		allowed_old_states: &[VtxoStateKind],
+	) -> anyhow::Result<()>;
 
-	/// Remove a pending offboard record by its [MovementId].
+	/// Force the given VTXOs to [VtxoState::Spent], whatever their current
+	/// state. Used when the server is seen to have acted on a vtxo and the
+	/// wallet state must follow. [VtxoState::Exited] vtxos are left
+	/// unaffected. Errors if any id is unknown.
+	async fn steal_lock_to_spent(&self, vtxo_ids: &[VtxoId]) -> anyhow::Result<()> {
+		let vtxos = self.get_wallet_vtxos(vtxo_ids).await?;
+		let ids = vtxos.iter()
+			.filter(|v| v.state.kind() != VtxoStateKind::Exited)
+			.map(|v| v.vtxo.id())
+			.collect::<Vec<_>>();
+		let allowed = [VtxoStateKind::Spendable, VtxoStateKind::Locked, VtxoStateKind::Spent];
+		self.update_vtxo_states_checked(&ids, VtxoState::Spent, &allowed).await
+	}
+
+	/// Force the given VTXOs to [VtxoState::Locked] under `holder`, whatever
+	/// their current state. Used when the server is seen to hold a vtxo and
+	/// the wallet state must follow. [VtxoState::Exited] vtxos are left
+	/// unaffected. Errors if any id is unknown.
+	async fn steal_lock(
+		&self,
+		vtxo_ids: &[VtxoId],
+		holder: Option<VtxoLockHolder>,
+	) -> anyhow::Result<()> {
+		let vtxos = self.get_wallet_vtxos(vtxo_ids).await?;
+		let ids = vtxos.iter()
+			.filter(|v| v.state.kind() != VtxoStateKind::Exited)
+			.map(|v| v.vtxo.id())
+			.collect::<Vec<_>>();
+		let allowed = [VtxoStateKind::Spendable, VtxoStateKind::Locked, VtxoStateKind::Spent];
+		self.update_vtxo_states_checked(&ids, VtxoState::Locked { holder }, &allowed).await
+	}
+
+	/// Set [WalletVtxo::registered] on the given VTXOs, recording that their
+	/// recovery state (mailbox ID post + signed transaction chain) has been
+	/// asserted with the server so the sync-time catch-up can skip them.
+	async fn mark_vtxos_registered(&self, vtxo_ids: &[VtxoId]) -> anyhow::Result<()>;
+
+	/// Fetch the IDs of all VTXOs whose recovery state still needs to be
+	/// asserted with the server: not yet marked [WalletVtxo::registered] and
+	/// in any state except [VtxoStateKind::Spent], in unspecified order.
 	///
-	/// Parameters:
-	/// - movement_id: The [MovementId] to remove.
-	///
-	/// Errors:
-	/// - Returns an error if the record cannot be removed.
-	async fn remove_pending_offboard(&self, movement_id: MovementId) -> anyhow::Result<()>;
+	/// Exited VTXOs are included: their exit transactions being broadcast
+	/// doesn't mean the resulting on-chain outputs were claimed, so a wallet
+	/// recovering from seed must still learn about them to claim the funds.
+	/// Spent VTXOs were forfeited to the server and carry no recoverable
+	/// value.
+	async fn get_unregistered_vtxo_ids(&self) -> anyhow::Result<Vec<VtxoId>>;
+}
+
+/// Return the recommended [`BarkPersister`] backend for the current
+/// build target.
+///
+/// UNIX and Windows platforms require datadir, wasm32 requires fingerprint.
+#[allow(unreachable_code)]
+pub async fn platform_default(
+	datadir: Option<impl Into<PathBuf>>,
+	wallet_fingerprint: Option<Fingerprint>,
+) -> anyhow::Result<Arc<dyn BarkPersister>> {
+	#[cfg(all(target_arch = "wasm32", feature = "indexed-db"))]
+	{
+		let _ = datadir;
+		let fingerprint = wallet_fingerprint
+			.context("wallet fingerprint argument is required for this platform")?;
+		let client = crate::persist::adaptor::indexed_db::IndexedDbClient::open(
+			&fingerprint.to_string(),
+		).await?;
+		return Ok(Arc::new(self::adaptor::StorageAdaptorWrapper::new(client)))
+	}
+
+	#[cfg(all(any(unix, windows), not(target_arch = "wasm32"), feature = "sqlite"))]
+	{
+		let _ = wallet_fingerprint;
+		let datadir = datadir.context("datadir argument is required for this platform")?;
+		let dbfile = {
+			let mut buf = datadir.into();
+			buf.push(crate::persist::sqlite::DEFAULT_DB_FILE);
+			buf
+		};
+		return Ok(Arc::new(crate::persist::sqlite::SqliteClient::open(dbfile)?));
+	}
+
+	bail!("persist::platform_default: no default backend for this target");
 }

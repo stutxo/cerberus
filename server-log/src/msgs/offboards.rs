@@ -1,5 +1,5 @@
 
-use bitcoin::{Amount, FeeRate, OutPoint, Txid};
+use bitcoin::{Amount, FeeRate, OutPoint, SignedAmount, Txid};
 
 use ark::VtxoId;
 
@@ -14,16 +14,45 @@ pub struct PreparedOffboard {
 	pub net_amount: Amount,
 	pub fee_rate: FeeRate,
 	pub wallet_utxos: Vec<OutPoint>,
+	#[serde(with = "bitcoin::amount::serde::as_sat")]
+	pub onchain_fee: Amount,
+	#[serde(with = "bitcoin::amount::serde::as_sat")]
+	pub user_fee: Amount,
+	/// the fee charged by the server, can be negative
+	#[serde(with = "bitcoin::amount::serde::as_sat")]
+	pub fee: SignedAmount,
 }
 impl_slog!(PreparedOffboard, TRACE, "prepared offboard tx");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayedOffboardSession {
+	pub offboard_txid: Txid,
+	pub input_vtxos: Vec<VtxoId>,
+}
+impl_slog!(ReplayedOffboardSession, DEBUG, "replayed pending offboard session for identical request");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayedOffboardFinish {
+	pub offboard_txid: Txid,
+}
+impl_slog!(ReplayedOffboardFinish, DEBUG, "replayed finished offboard response for identical request");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedOffboard {
 	pub offboard_txid: Txid,
 	pub input_vtxos: Vec<VtxoId>,
 	pub wallet_utxos: Vec<OutPoint>,
+	#[serde(with = "bitcoin::amount::serde::as_sat")]
+	pub amount: Amount,
+	#[serde(with = "bitcoin::amount::serde::as_sat")]
+	pub onchain_fee: Amount,
+	#[serde(with = "bitcoin::amount::serde::as_sat")]
+	pub user_fee: Amount,
+	/// the fee charged by the server, can be negative
+	#[serde(with = "bitcoin::amount::serde::as_sat")]
+	pub fee: SignedAmount,
 }
-impl_slog!(SignedOffboard, TRACE, "signed offboard tx");
+impl_slog!(SignedOffboard, DEBUG, "signed offboard tx");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OffboardTxRejected {

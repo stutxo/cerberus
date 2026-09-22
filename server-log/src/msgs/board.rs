@@ -1,6 +1,6 @@
 
 use ark::VtxoId;
-use bitcoin::{Amount, OutPoint};
+use bitcoin::{address::NetworkUnchecked, Amount, OutPoint};
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,6 +8,7 @@ pub struct CosignedBoard {
 	pub utxo: OutPoint,
 	#[serde(with = "bitcoin::amount::serde::as_sat")]
 	pub amount: Amount,
+	#[serde(with = "bitcoin::amount::serde::as_sat")]
 	pub fee: Amount,
 }
 impl_slog!(CosignedBoard, TRACE, "cosigned board tx for user");
@@ -30,3 +31,14 @@ pub struct UnconfirmedBoardRegisterAttempt {
 	pub confirmations: usize,
 }
 impl_slog!(UnconfirmedBoardRegisterAttempt, TRACE, "user attempted to register a board not sufficiently confirmed");
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardAttemptBlockedAddress {
+	pub address: bitcoin::Address<NetworkUnchecked>,
+	#[serde(default)]
+	pub vtxo: Option<VtxoId>,
+	#[serde(with = "bitcoin::amount::serde::as_sat")]
+	pub amount: Amount,
+}
+impl_slog!(BoardAttemptBlockedAddress, WARN, "user boarded using blocked address");

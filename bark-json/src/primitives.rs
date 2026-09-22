@@ -2,13 +2,14 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
+use bark::actions::WalletActionId;
 use bitcoin::{Amount, OutPoint, SignedAmount, Transaction, Txid};
 use bitcoin::secp256k1::PublicKey;
 #[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
 
 use ark::{Vtxo, VtxoId};
-use ark::vtxo::{Bare, Full, VtxoPolicyKind};
+use ark::vtxo::{Full, VtxoPolicyKind};
 use bark::movement::MovementId;
 use bark::vtxo::VtxoState;
 use bitcoin_ext::{BlockDelta, BlockHeight};
@@ -19,6 +20,7 @@ use bitcoin_ext::{BlockDelta, BlockHeight};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct BlockRef {
+	#[cfg_attr(feature = "utoipa", schema(value_type = u32))]
 	pub height: BlockHeight,
 	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
 	pub hash: bitcoin::BlockHash,
@@ -84,12 +86,12 @@ impl From<bark::onchain::Utxo> for UtxoInfo {
 			bark::onchain::Utxo::Local(o) => UtxoInfo {
 				outpoint: o.outpoint,
 				amount: o.amount,
-				confirmation_height: o.confirmation_height,
+				confirmation_height: o.confirmation_height.map(|h| h.to_u32()),
 			},
 			bark::onchain::Utxo::Exit(e) => UtxoInfo {
 				outpoint: e.vtxo.point(),
 				amount: e.vtxo.amount(),
-				confirmation_height: Some(e.height),
+				confirmation_height: Some(e.height.to_u32()),
 			},
 		}
 	}
@@ -123,9 +125,11 @@ pub struct VtxoInfo {
 	/// The block height at which this VTXO expires. After expiry, the
 	/// server can reclaim the sats. Refresh before expiry to receive
 	/// new VTXOs, or exit to move them on-chain.
+	#[cfg_attr(feature = "utoipa", schema(value_type = u32))]
 	pub expiry_height: BlockHeight,
 	/// The relative timelock, in blocks, that must elapse before the
 	/// final on-chain claim in an emergency exit.
+	#[cfg_attr(feature = "utoipa", schema(value_type = u16))]
 	pub exit_delta: BlockDelta,
 	/// The on-chain outpoint that roots this VTXO, formatted as
 	/// `txid:vout`. Typically an output of a round transaction or a
@@ -136,22 +140,6 @@ pub struct VtxoInfo {
 	/// be broadcast and confirmed on-chain in sequence during an
 	/// emergency exit.
 	pub exit_depth: Option<u16>,
-}
-
-impl<'a> From<&'a Vtxo<Bare>> for VtxoInfo {
-	fn from(v: &'a Vtxo<Bare>) -> VtxoInfo {
-		VtxoInfo {
-			id: v.id(),
-			amount: v.amount(),
-			policy_type: v.policy().policy_type(),
-			user_pubkey: v.user_pubkey(),
-			server_pubkey: v.server_pubkey(),
-			expiry_height: v.expiry_height(),
-			exit_delta: v.exit_delta(),
-			chain_anchor: v.chain_anchor(),
-			exit_depth: None,
-		}
-	}
 }
 
 impl<'a> From<&'a Vtxo<Full>> for VtxoInfo {
@@ -167,12 +155,6 @@ impl<'a> From<&'a Vtxo<Full>> for VtxoInfo {
 			chain_anchor: v.chain_anchor(),
 			exit_depth: Some(v.exit_depth()),
 		}
-	}
-}
-
-impl From<Vtxo<Bare>> for VtxoInfo {
-	fn from(v: Vtxo<Bare>) -> VtxoInfo {
-		VtxoInfo::from(&v)
 	}
 }
 
@@ -193,11 +175,21 @@ pub struct WalletVtxoInfo {
 	pub state: VtxoStateInfo,
 }
 
-impl From<bark::WalletVtxo> for WalletVtxoInfo {
-	fn from(v: bark::WalletVtxo) -> Self {
+impl<'a> From<&'a bark::WalletVtxo> for WalletVtxoInfo {
+	fn from(v: &'a bark::WalletVtxo) -> Self {
 		WalletVtxoInfo {
-			vtxo: v.vtxo.into(),
-			state: v.state.into(),
+			vtxo: VtxoInfo {
+				id: v.id(),
+				amount: v.amount(),
+				policy_type: v.policy().policy_type(),
+				user_pubkey: v.user_pubkey(),
+				server_pubkey: v.server_pubkey(),
+				expiry_height: v.expiry_height(),
+				exit_delta: v.exit_delta(),
+				chain_anchor: v.chain_anchor(),
+				exit_depth: Some(v.exit_depth),
+			},
+			state: VtxoStateInfo::from(&v.state),
 		}
 	}
 }
@@ -227,6 +219,9 @@ pub enum VtxoStateInfo {
 	Spendable,
 	/// The VTXO has already been spent.
 	Spent,
+	/// The VTXO has been moved on-chain via a unilateral exit and is no longer
+	/// usable in the protocol.
+	Exited,
 	/// The VTXO is locked by an in-progress movement (e.g. a pending
 	/// round or Lightning payment).
 	Locked {
@@ -234,16 +229,29 @@ pub enum VtxoStateInfo {
 		#[serde(skip_serializing_if = "Option::is_none")]
 		#[cfg_attr(feature = "utoipa", schema(value_type = u32))]
 		movement_id: Option<MovementId>,
+		/// The action that locked this VTXO, if any.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		#[cfg_attr(feature = "utoipa", schema(value_type = String))]
+		action_id: Option<WalletActionId>,
 	},
 }
 
-impl From<VtxoState> for VtxoStateInfo {
-	fn from(state: VtxoState) -> Self {
+impl<'a> From<&'a VtxoState> for VtxoStateInfo {
+	fn from(state: &'a VtxoState) -> Self {
 		match state {
 			VtxoState::Spendable => VtxoStateInfo::Spendable,
 			VtxoState::Spent => VtxoStateInfo::Spent,
-			VtxoState::Locked { movement_id } => VtxoStateInfo::Locked {
-				movement_id,
+			VtxoState::Exited => VtxoStateInfo::Exited,
+			VtxoState::Locked { holder } => {
+				match holder {
+					Some(bark::vtxo::VtxoLockHolder::Movement { id }) => {
+						VtxoStateInfo::Locked { movement_id: Some(*id), action_id: None }
+					},
+					Some(bark::vtxo::VtxoLockHolder::Action { id }) => {
+						VtxoStateInfo::Locked { movement_id: None, action_id: Some(id.clone()) }
+					},
+					None => VtxoStateInfo::Locked { movement_id: None, action_id: None },
+				}
 			},
 		}
 	}
@@ -304,6 +312,10 @@ pub struct WalletTxInfo {
 	pub balance_change: SignedAmount,
 	/// `Some` when the transaction is mined; `None` while still in the mempool.
 	pub confirmation: Option<BlockRef>,
+	/// `true` when this tx spends a P2A fee anchor output — i.e. it is a CPFP
+	/// child bumping its parent. In bark this typically means the wallet is
+	/// fee-bumping an exit transaction.
+	pub is_cpfp: bool,
 }
 
 impl From<bark::onchain::WalletTxInfo> for WalletTxInfo {
@@ -314,6 +326,7 @@ impl From<bark::onchain::WalletTxInfo> for WalletTxInfo {
 			onchain_fees: v.onchain_fees,
 			balance_change: v.balance_change,
 			confirmation: v.confirmation.map(Into::into),
+			is_cpfp: v.is_cpfp,
 		}
 	}
 }

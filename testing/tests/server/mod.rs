@@ -1,9 +1,13 @@
 mod ban;
+mod blocklist;
 mod block_index;
 mod lightning;
 mod mailbox;
+mod nursery;
+mod offboard;
 mod postgres;
 mod postgres_migrations;
+mod registration;
 mod settler;
 mod watchman;
 
@@ -12,13 +16,16 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use bitcoin::hex::FromHex;
-use bitcoin::{absolute, transaction, Address, Amount, Network, OutPoint, Transaction};
+use bitcoin::{
+	absolute, transaction, Address, Amount, Network, OutPoint, ScriptBuf, Sequence,
+	Transaction, TxIn, TxOut, Txid, Witness,
+};
 use bitcoin::secp256k1::{Keypair, PublicKey, rand::thread_rng};
-use bitcoin_ext::P2TR_DUST_SAT;
+use bitcoin_ext::{BlockDelta, BlockHeight, P2TR_DUST_SAT};
 use futures::future::join_all;
 use futures::{Stream, StreamExt, TryStreamExt};
 use log::{debug, info, trace};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use ark::{
 	musig, ProtocolEncoding, SignedVtxoRequest, Vtxo, VtxoId, VtxoPolicy, VtxoRequest, SECP
@@ -26,10 +33,11 @@ use ark::{
 use ark::arkoor::ArkoorDestination;
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::attestations::ArkoorCosignAttestation;
+use ark::attestations::VtxoStatusAttestation;
 use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
 use ark::rounds::{Challenge, RoundAttemptAttestation, RoundSeq};
 use ark::tree::signed::builder::SignedTreeBuilder;
-use ark::tree::signed::{LeafVtxoCosignContext, UnlockPreimage};
+use ark::tree::signed::{LeafVtxoCosignContext, LeafVtxoCosignRequest, UnlockPreimage};
 use ark::vtxo::Full;
 use bark::Wallet;
 use bark_json::primitives::WalletVtxoInfo;
@@ -95,6 +103,53 @@ async fn get_vtxo() {
 }
 
 #[tokio::test]
+async fn get_vtxo_status() {
+	let ctx = TestContext::new("server/get_vtxo_status").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+	let bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
+
+	bark.board(sat(100_000)).await;
+	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
+	bark.sync().await;
+
+	// Grab the boarded vtxo together with the keypair that controls it, so
+	// we can sign a status attestation the way a real client would.
+	let client = bark.client().await;
+	let bare_vtxo = client.vtxos().await.unwrap().into_iter().next().unwrap().vtxo;
+	let vtxo_id = bare_vtxo.id();
+	let vtxo_keypair = client.pubkey_keypair(&bare_vtxo.user_pubkey()).await
+		.unwrap().expect("known vtxo keypair").1;
+
+	let mut rpc = srv.get_public_rpc().await;
+
+	// Valid vtxo + valid attestation: a freshly boarded vtxo is spendable.
+	let attestation = VtxoStatusAttestation::new(vtxo_id, &vtxo_keypair);
+	let resp = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: vtxo_id.to_bytes().to_vec(),
+		attestation: attestation.serialize(),
+	}).await.unwrap().into_inner();
+	assert_eq!(resp.spend_state, protos::VtxoSpendState::Spendable as i32);
+
+	// Valid vtxo + invalid attestation (signed by a key that doesn't own the
+	// vtxo): the server rejects it as a bad argument.
+	let wrong_keypair = Keypair::new(&SECP, &mut thread_rng());
+	let bad_attestation = VtxoStatusAttestation::new(vtxo_id, &wrong_keypair);
+	let err = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: vtxo_id.to_bytes().to_vec(),
+		attestation: bad_attestation.serialize(),
+	}).await.unwrap_err();
+	assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+	// Non-existent vtxo: not found (the lookup fails before the attestation
+	// is even checked).
+	let err = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: vec![0u8; 36],
+		attestation: attestation.serialize(),
+	}).await.unwrap_err();
+	assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
 async fn integration() {
 	let ctx = TestContext::new("server/integration").await;
 	let srv = ctx.captaind("server").create().await;
@@ -150,6 +205,51 @@ async fn integration() {
 }
 
 #[tokio::test]
+async fn integration_token_quota_is_atomic() {
+	// Regression test for a TOCTOU race between the quota check and token
+	// insert in Server::get_integration_tokens. Two concurrent callers that
+	// both observed open_count < maximum_open_tokens could both insert,
+	// exceeding the operator-configured quota.
+	let ctx = TestContext::new("server/integration_token_quota_is_atomic").await;
+	let srv = ctx.captaind("server").create().await;
+
+	srv.integration_cmd(&["add", "quota-race"]).await;
+	let stdout = srv.integration_cmd(&[
+		"generate-api-key", "quota-race", "racing-key", "1h",
+	]).await;
+	let api_key = stdout.split_whitespace().last().unwrap().to_string();
+	srv.integration_cmd(&[
+		"configure-token-type", "quota-race", "single-use-board", "1", "60",
+	]).await;
+
+	let channel = tonic::transport::Channel::from_shared(srv.integration_url()).unwrap()
+		.connect().await.unwrap();
+	let client = protos::intman::integration_service_client::IntegrationServiceClient::new(channel);
+	let barrier = Arc::new(tokio::sync::Barrier::new(32));
+
+	let requests = (0..32).map(|_| {
+		let mut client = client.clone();
+		let barrier = barrier.clone();
+		let api_key = api_key.clone();
+		async move {
+			barrier.wait().await;
+			client.get_tokens(protos::intman::TokensRequest {
+				api_key,
+				r#type: protos::intman::TokenType::SingleUseBoard.into(),
+				count: Some(1),
+			}).await
+		}
+	});
+
+	let issued = join_all(requests).await.into_iter()
+		.filter_map(Result::ok)
+		.map(|response| response.into_inner().tokens.len())
+		.sum::<usize>();
+
+	assert_eq!(issued, 1, "concurrent requests exceeded the configured token quota");
+}
+
+#[tokio::test]
 async fn bitcoind_auth_connection() {
 	let ctx = TestContext::new("server/bitcoind_auth_connection").await;
 
@@ -172,7 +272,7 @@ async fn bitcoind_cookie_connection() {
 
 #[tokio::test]
 async fn round_started_log_can_be_captured() {
-	let ctx = TestContext::new("server/capture_log").await;
+	let ctx = TestContext::new("server/round_started_log_can_be_captured").await;
 	let srv = ctx.captaind("server").create().await;
 
 	let mut last_log_seq = RoundSeq::new(0);
@@ -214,6 +314,8 @@ async fn fund_captaind() {
 
 #[tokio::test]
 async fn cant_spend_untrusted() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("server/cant_spend_untrusted").await;
 
 	const NEED_CONFS: u32 = 2;
@@ -304,51 +406,191 @@ async fn restart_key_stability() {
 	assert_ne!(addr1, addr2);
 }
 
-#[ignore]
 #[tokio::test]
 async fn max_vtxo_amount() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("server/max_vtxo_amount").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
 		cfg.max_vtxo_amount = Some(Amount::from_sat(500_000));
 	}).create().await;
 	ctx.fund_captaind(&srv, Amount::from_int_btc(10)).await;
-	let mut bark1 = ctx.bark("bark1", &srv).funded(Amount::from_sat(1_500_000)).create().await;
+	// Enough for both boards plus the refused one, whose funding tx also spends
+	// from this wallet even though no VTXO ever comes out of it.
+	let mut bark1 = ctx.bark("bark1", &srv).funded(Amount::from_sat(2_500_000)).create().await;
 
 	let cfg_max_amount = bark1.ark_info().await.max_vtxo_amount.unwrap();
 
-	// exceeds limit, should fail
+	// Confirm each board before making the next one: the second board's funding
+	// tx spends the first one's change, and the server refuses a funding tx
+	// whose input txs it doesn't know yet.
+	bark1.board_and_confirm_and_register(&ctx, Amount::from_sat(500_000)).await;
+	bark1.board_and_confirm_and_register(&ctx, Amount::from_sat(500_000)).await;
+
+	// A board over the limit is refused.
+	//
+	// NB this has to come after the boards above: the cosign is requested before
+	// the funding tx is broadcast, so a refused board leaves that tx in bark's
+	// wallet unbroadcast. A later board would spend its change and be refused
+	// for having an input tx the server doesn't know, not for the amount.
 	let err = bark1.try_board(Amount::from_sat(600_000)).await.unwrap_err().to_alt_string();
 	assert!(err.contains(
-		&format!("bad user input: board amount exceeds limit of {}", cfg_max_amount)
+		&format!("bad user input: board amount exceeds maximum vtxo amount of {}", cfg_max_amount)
 	), "err: {err}");
-
-	bark1.board(Amount::from_sat(500_000)).await;
-	bark1.board(Amount::from_sat(500_000)).await;
-	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
 
 	// then try send in a round
 	bark1.set_timeout(srv.max_round_delay());
-	let err = bark1.try_refresh_all_no_retry().await.unwrap_err().to_alt_string();
+	let (res, _) = tokio::join!(
+		bark1.try_refresh_all_no_retry(),
+		srv.trigger_round(),
+	);
+	let err = res.unwrap_err().to_alt_string();
 	assert!(err.contains(
 		&format!("output exceeds maximum vtxo amount of {}", cfg_max_amount),
 	), "err: {err}");
 
 	// but we can offboard the entire amount!
 	bark1.unset_timeout();
+	// Settle the pool before the offboard, else it can be funded from an
+	// unconfirmed pool issuance tx.
+	srv.wait_for_vtxopool(&ctx).await;
 	let address = ctx.bitcoind().get_new_address();
 	bark1.offboard_all(address.clone()).await;
 	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
 	bark1.maintain().await;
 	let balance = ctx.bitcoind().get_received_by_address(&address);
-	assert_eq!(balance, Amount::from_sat(999_100));
+	// The two boarded VTXOs (1_000_000 sat) minus the offboard fees.
+	assert_eq!(balance, Amount::from_sat(999_146));
+}
+
+#[tokio::test]
+async fn max_board_amount() {
+	let ctx = TestContext::new("server/max_board_amount").await;
+	let srv = ctx.captaind("server").cfg(|cfg| {
+		cfg.max_board_amount = Some(sat(500_000));
+	}).create().await;
+	let bark1 = ctx.bark("bark1", &srv).funded(sat(1_500_000)).create().await;
+
+	// at the limit is allowed
+	bark1.board_and_confirm_and_register(&ctx, sat(500_000)).await;
+
+	// exceeds limit, should fail
+	//
+	// NB a wallet can't board again after a refused board: the cosign is
+	// requested before the funding tx is broadcast, so the refusal leaves that
+	// tx in bark's wallet unbroadcast, and a later board would spend its change
+	// and be refused for an input tx the server doesn't know. So this comes
+	// after the board above, and the disabled case below uses a fresh wallet.
+	let err = bark1.try_board(sat(600_000)).await.unwrap_err().to_alt_string();
+	assert!(err.contains("board amount exceeds limit of 0.00500000 BTC"), "err: {err}");
+
+	// zero disables boards entirely
+	srv.stop().await.unwrap();
+	srv.config_mut().max_board_amount = Some(Amount::ZERO);
+	srv.start().await.unwrap();
+
+	let bark2 = ctx.bark("bark2", &srv).funded(sat(500_000)).create().await;
+	let err = bark2.try_board(sat(100_000)).await.unwrap_err().to_alt_string();
+	assert!(err.contains("board is temporarily disabled"), "err: {err}");
+}
+
+#[tokio::test]
+async fn max_round_amount() {
+	let ctx = TestContext::new("server/max_round_amount").await;
+	let srv = ctx.captaind("server").funded(btc(10)).cfg(|cfg| {
+		cfg.max_round_amount = Some(sat(100_000));
+	}).create().await;
+	let bark1 = ctx.bark("bark1", &srv).funded(sat(1_000_000)).create().await;
+
+	bark1.board(sat(400_000)).await;
+	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
+
+	// the refresh's total output amount exceeds the limit
+	let spendable = bark1.spendable_balance().await;
+	let (res, _) = tokio::join!(
+		bark1.try_refresh_all_no_retry(),
+		srv.trigger_round(),
+	);
+	let err = res.unwrap_err().to_alt_string();
+	assert!(err.contains("round participation amount exceeds limit of 0.00100000 BTC"), "err: {err}");
+
+	// A refused round must leave its registered vtxos spendable.
+	bark1.assert_unchanged_after_refusal(spendable).await;
+
+	// a delegated participation is rejected at registration, no round needed
+	let err = bark1.try_refresh_all_delegated_no_sync().await.unwrap_err().to_alt_string();
+	assert!(err.contains("round participation amount exceeds limit of 0.00100000 BTC"), "err: {err}");
+	bark1.assert_unchanged_after_refusal(spendable).await;
+
+	// zero disables round participation entirely
+	srv.stop().await.unwrap();
+	srv.config_mut().max_round_amount = Some(Amount::ZERO);
+	srv.start().await.unwrap();
+	// A restart reserves new ports, so bark has to be re-pointed at the server.
+	bark1.set_ark_url(&srv).await;
+
+	let (res, _) = tokio::join!(
+		bark1.try_refresh_all_no_retry(),
+		srv.trigger_round(),
+	);
+	let err = res.unwrap_err().to_alt_string();
+	assert!(err.contains("round participation is temporarily disabled"), "err: {err}");
+	bark1.assert_unchanged_after_refusal(spendable).await;
 }
 
 #[tokio::test]
 async fn max_vtxo_exit_depth() {
 	let ctx = TestContext::new("server/max_vtxo_exit_depth").await;
 
-	// Board VTXOs start at exit depth 1. Each OOR adds +2 (checkpoint + arkoor),
-	// so after 5 arkoors the resulting VTXO has depth 9, sixth should fail.
+	// Board VTXOs start at exit depth 1. Each OOR adds +2 (checkpoint + arkoor).
+	// Full-balance self-sends leave no change, so the wallet holds a single VTXO
+	// chain: depth 1 + 2k after k sends. The fifth send spends depth 9 (allowed)
+	// into depth 11, so the sixth send's input meets the maximum of 10.
+	let srv = ctx.captaind("server").cfg(|cfg| {
+		cfg.max_vtxo_exit_depth = 10;
+	}).create().await;
+	ctx.fund_captaind(&srv, btc(10)).await;
+
+	// The wallet itself skips inputs that meet the server's advertised depth
+	// limit, so to exercise the server-side check we proxy the server and
+	// advertise a higher limit, making bark submit the over-depth cosign
+	// request.
+	#[derive(Clone)]
+	struct Proxy;
+	#[async_trait::async_trait]
+	impl captaind::proxy::ArkRpcProxy for Proxy {
+		async fn get_ark_info(
+			&self, upstream: &mut ArkClient, req: protos::Empty,
+		) -> Result<protos::ArkInfo, tonic::Status> {
+			let mut info = upstream.get_ark_info(req).await?.into_inner();
+			info.max_vtxo_exit_depth = 100;
+			Ok(info)
+		}
+	}
+	let proxy = srv.start_proxy_with_mailbox(Proxy, ()).await;
+
+	let bark1 = ctx.bark("bark1", &proxy.address).funded(sat(1_000_000)).create().await;
+
+	bark1.board_and_confirm_and_register(&ctx, sat(800_000)).await;
+
+	for _ in 0..5 {
+		bark1.send_oor(&bark1.address().await, sat(800_000)).await;
+	}
+
+	// Sixth OOR should fail: its input VTXO has exit depth 11 which
+	// meets the server maximum.
+	let err = bark1.try_send_oor(&bark1.address().await, sat(800_000), true).await
+		.unwrap_err().to_alt_string();
+	assert!(
+		err.contains("exit depth"),
+		"expected exit depth rejection, got: {err}",
+	);
+}
+
+#[tokio::test]
+async fn wallet_skips_vtxos_at_exit_depth_limit() {
+	let ctx = TestContext::new("server/wallet_skips_vtxos_at_exit_depth_limit").await;
+
 	let srv = ctx.captaind("server").cfg(|cfg| {
 		cfg.max_vtxo_exit_depth = 10;
 	}).create().await;
@@ -358,18 +600,80 @@ async fn max_vtxo_exit_depth() {
 
 	bark1.board_and_confirm_and_register(&ctx, sat(800_000)).await;
 
+	// Full-balance self-sends build a single chain: depth 11 after 5 sends.
 	for _ in 0..5 {
-		bark1.send_oor(&bark1.address().await, sat(100_000)).await;
+		bark1.send_oor(&bark1.address().await, sat(800_000)).await;
 	}
 
-	// Sixth OOR should fail — the change VTXO from the first OOR has exit depth 9
-	// which meets the server maximum.
-	let err = bark1.try_send_oor(&bark1.address().await, sat(100_000), true).await
+	// The wallet's only VTXO now meets the server's depth limit. Input
+	// selection skips VTXOs the server would reject, so the send fails
+	// as insufficient funds instead of a doomed cosign request.
+	let err = bark1.try_send_oor(&bark1.address().await, sat(800_000), true).await
 		.unwrap_err().to_alt_string();
 	assert!(
-		err.contains("exit depth"),
-		"expected exit depth rejection, got: {err}",
+		err.contains("Insufficient money"),
+		"expected insufficient money, got: {err}",
 	);
+}
+
+#[tokio::test]
+async fn send_onchain_skips_vtxos_at_exit_depth_limit() {
+	require_bark_version!(> "0.6.1");
+
+	let ctx = TestContext::new("server/send_onchain_skips_vtxos_at_exit_depth_limit").await;
+
+	let srv = ctx.captaind("server").cfg(|cfg| {
+		cfg.max_vtxo_exit_depth = 10;
+	}).create().await;
+	ctx.fund_captaind(&srv, btc(10)).await;
+
+	let bark1 = ctx.bark("bark1", &srv).funded(sat(1_000_000)).create().await;
+	let bark2 = ctx.bark("bark2", &srv).create().await;
+
+	bark1.board_and_confirm_and_register(&ctx, sat(800_000)).await;
+
+	// Full-balance self-sends build a single chain: depth 11 after 5 sends.
+	for _ in 0..5 {
+		bark1.send_oor(&bark1.address().await, sat(800_000)).await;
+	}
+
+	// The wallet's only VTXO now meets the server's depth limit. Send-onchain
+	// runs an arkoor split whose inputs the server would reject, so input
+	// selection skips them and the send fails as insufficient funds instead
+	// of a doomed cosign request.
+	let addr = bark2.get_onchain_address().await;
+	let err = bark1.try_send_onchain(&addr, sat(500_000)).await
+		.unwrap_err().to_alt_string();
+	assert!(
+		err.contains("Insufficient money"),
+		"expected insufficient money, got: {err}",
+	);
+}
+
+#[tokio::test]
+async fn change_split_avoids_exit_depth_limit() {
+	let ctx = TestContext::new("server/change_split_avoids_exit_depth_limit").await;
+
+	// Change is split in two on every send, so each payment leaves a shallower
+	// change sibling behind instead of deepening a single chain. All ten sends
+	// succeed, where a single change chain would hit the depth limit at the
+	// sixth send.
+	let srv = ctx.captaind("server").cfg(|cfg| {
+		cfg.max_vtxo_exit_depth = 10;
+	}).create().await;
+	ctx.fund_captaind(&srv, btc(10)).await;
+
+	let bark1 = ctx.bark("bark1", &srv).funded(sat(1_500_000)).create().await;
+	let bark2 = ctx.bark("bark2", &srv).funded(sat(5_000)).create().await;
+
+	bark1.board_and_confirm_and_register(&ctx, sat(1_000_000)).await;
+
+	for _ in 0..10 {
+		bark1.send_oor(&bark2.address().await, sat(10_000)).await;
+	}
+
+	assert_eq!(900_000, bark1.spendable_balance().await.to_sat());
+	assert_eq!(100_000, bark2.spendable_balance().await.to_sat());
 }
 
 #[tokio::test]
@@ -392,7 +696,7 @@ async fn restart_funded_server() {
 async fn restart_custom_cfg_server() {
 	let ctx = TestContext::new("server/restart_custom_cfg_server").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
-		cfg.vtxo_exit_delta = 24;
+		cfg.vtxo_exit_delta = BlockDelta::new(24);
 	}).create_unregistered().await;
 	srv.stop().await.unwrap();
 	srv.start().await.unwrap();
@@ -400,6 +704,8 @@ async fn restart_custom_cfg_server() {
 
 #[tokio::test]
 async fn restart_server_with_payments() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("server/restart_server_with_payments").await;
 	let srv = ctx.captaind("server").funded(btc(10)).create_unregistered().await;
 	let bark1 = ctx.bark("bark1", &srv).create().await;
@@ -424,6 +730,8 @@ async fn restart_server_with_payments() {
 
 #[tokio::test]
 async fn full_round() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("server/full_round").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
 		cfg.round_interval = Duration::from_millis(100_000_000);
@@ -461,23 +769,42 @@ async fn full_round() {
 
 	let (tx, mut rx) = mpsc::unbounded_channel();
 
+	type RoundEventStream = Box<
+		dyn Stream<Item = Result<protos::RoundEvent, tonic::Status>> + Unpin + Send
+	>;
+
 	/// This proxy will keep track of how many times `submit payment` has been called.
 	/// Once it reaches MAX_OUTPUTS, it asserts the next one fails.
 	/// Once that happened succesfully, it fullfils the result channel.
+	///
+	/// It also releases one `subscriptions` permit for every round event
+	/// subscription established with the server.
 	#[derive(Clone)]
-	struct Proxy(Arc<Mutex<usize>>, Arc<mpsc::UnboundedSender<tonic::Status>>);
+	struct Proxy {
+		nb_payments: Arc<Mutex<usize>>,
+		last_payment_err: Arc<mpsc::UnboundedSender<tonic::Status>>,
+		subscriptions: Arc<Semaphore>,
+	}
 	#[async_trait::async_trait]
 	impl captaind::proxy::ArkRpcProxy for Proxy {
+		async fn subscribe_rounds(
+			&self, upstream: &mut ArkClient, req: protos::Empty,
+		) -> Result<RoundEventStream, tonic::Status> {
+			let stream = upstream.subscribe_rounds(req).await?.into_inner();
+			self.subscriptions.add_permits(1);
+			Ok(Box::new(stream))
+		}
+
 		async fn submit_payment(
 			&self, upstream: &mut ArkClient, req: protos::SubmitPaymentRequest,
 		) -> Result<protos::SubmitPaymentResponse, tonic::Status> {
-			let mut lock = self.0.lock().await;
+			let mut lock = self.nb_payments.lock().await;
 			let res = upstream.submit_payment(req).await;
 			// the last bark should fail being registered
 			let ret = if *lock == NB_BARKS-1 {
 				let err = res.expect_err("must error at max");
 				trace!("proxy: NOK: {}", err);
-				self.1.send(err.clone()).unwrap();
+				self.last_payment_err.send(err.clone()).unwrap();
 				Err(err)
 			} else {
 				trace!("proxy: OK (nb={})", *lock);
@@ -488,18 +815,33 @@ async fn full_round() {
 		}
 	}
 
-	let proxy = Proxy(Arc::new(Mutex::new(0)), Arc::new(tx));
+	let subscriptions = Arc::new(Semaphore::new(0));
+	let proxy = Proxy {
+		nb_payments: Arc::new(Mutex::new(0)),
+		last_payment_err: Arc::new(tx),
+		subscriptions: subscriptions.clone(),
+	};
 	let proxy = srv.start_proxy_no_mailbox(proxy).await;
 	futures::future::join_all(barks.iter().map(|bark| bark.set_ark_url(&proxy))).await;
 
 	let mut log_full = srv.subscribe_log::<FullRound>();
-	srv.trigger_round().await;
+	let subs = subscriptions.clone();
 	tokio::spawn(async move {
 		futures::future::join_all(barks.iter().map(|bark| async {
-			// ignoring error as last one will fail
-			let _ = bark.refresh_all_no_retry().await;
+			// The last bark fails only after the round has started; a bark
+			// failing before that never subscribes, so close the semaphore.
+			if bark.try_refresh_all_no_retry().await.is_err() {
+				subs.close();
+			}
 		})).await;
 	});
+
+	// Only trigger the round once every bark is subscribed: the round
+	// leaves its submit phase as soon as it fills up, and a late bark
+	// would wait forever for a next round.
+	let _ = subscriptions.acquire_many(NB_BARKS as u32).await
+		.expect("a bark failed before all barks were subscribed");
+	srv.trigger_round().await;
 
 	let full = log_full.recv().await.unwrap();
 	assert_eq!(full.max_output_vtxos, MAX_OUTPUTS);
@@ -511,8 +853,6 @@ async fn full_round() {
 
 #[tokio::test]
 async fn double_spend_arkoor() {
-	require_bark_version!(> "0.1.4");
-
 	let ctx = TestContext::new("server/double_spend_arkoor").await;
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;
 
@@ -605,8 +945,54 @@ async fn double_spend_arkoor() {
 	}
 }
 
+/// The server refuses to cosign an arkoor whose input vtxo has expired.
+///
+/// The request is built by hand: bark itself no longer selects expired vtxos
+/// as arkoor inputs, so `send_oor` cannot reach this server check.
+#[tokio::test]
+async fn reject_expired_arkoor_cosign() {
+	let ctx = TestContext::new("server/reject_expired_arkoor_cosign").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+
+	let bark = ctx.bark("bark".to_string(), &srv).funded(sat(1_000_000)).create().await;
+	bark.board(sat(800_000)).await;
+	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
+
+	let bark_client = bark.client().await;
+	bark_client.maintenance().await.unwrap();
+
+	let bare_vtxo = bark_client.vtxos().await
+		.unwrap().into_iter().next().unwrap().vtxo;
+	let vtxo_keypair = bark_client.pubkey_keypair(&bare_vtxo.user_pubkey()).await
+		.unwrap().unwrap().1;
+	let vtxo = bark_client.get_full_vtxo(bare_vtxo.id()).await.unwrap();
+	let change_pk = bark_client.derive_store_next_keypair().await.unwrap().0.public_key();
+
+	let builder = ArkoorPackageBuilder::new_single_output_with_checkpoints(
+		[vtxo.clone()],
+		ArkoorDestination {
+			total_amount: sat(100_000),
+			policy: VtxoPolicy::new_pubkey(*RANDOM_PK),
+		},
+		VtxoPolicy::new_pubkey(change_pk),
+	).unwrap();
+	let cosign_request = protos::ArkoorPackageCosignRequest::from(
+		builder.generate_user_nonces(&[vtxo_keypair]).unwrap().cosign_request(),
+	);
+
+	// Let the vtxo expire before the server sees the request.
+	let height = ctx.generate_blocks(srv.config().vtxo_lifetime.to_u32() + 1).await;
+	srv.bitcoind().wait_for_blockheight(height).await;
+
+	let mut rpc = srv.get_public_rpc().await;
+	let err = rpc.request_arkoor_cosign(cosign_request).await.unwrap_err();
+	assert!(err.message().contains("expired"), "unexpected error: {}", err.message());
+}
+
 #[tokio::test]
 async fn double_spend_round() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("server/double_spend_round").await;
 
 	/// This proxy will duplicate all round payment submission requests.
@@ -653,6 +1039,8 @@ async fn double_spend_round() {
 
 #[tokio::test]
 async fn test_participate_round_wrong_step() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("server/test_participate_round_wrong_step").await;
 
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;
@@ -743,7 +1131,7 @@ async fn spend_unregistered_board() {
 
 #[tokio::test]
 async fn bad_round_input() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("server/bad_round_input").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
@@ -927,8 +1315,228 @@ async fn reject_below_minimum_board_cosign() {
 }
 
 #[tokio::test]
+async fn reject_overlong_board_cosign() {
+	let ctx = TestContext::new("server/reject_overlong_board_cosign").await;
+	// min_board_amount = 0 so the amount check passes and we reach the expiry check.
+	let srv = ctx.captaind("server").cfg(|cfg| {
+		cfg.min_board_amount = sat(0);
+	}).create().await;
+
+	let ark_info = srv.ark_info().await;
+	let tip = ctx.bitcoind().get_block_count().await as u32;
+
+	// An evil client picks the worst expiry the bug allows: the largest height the
+	// ingress bound (MAX_BLOCK_HEIGHT) permits whose offset from the tip is a
+	// multiple of 65536. The server checks `requested_lifetime as u16 > cap`, so a
+	// multiple of 65536 truncates to 0 and slips under the cap — even though the
+	// real lifetime is ~499M blocks (~9,500 years) vs the configured ~4320. A board
+	// VTXO with that expiry can never be cheaply swept (the funding output's expiry
+	// leaf is dead until ~year 11,500), stranding the server's reclaim/forfeit path.
+	let offset = ark::vtxo::policy::MAX_BLOCK_HEIGHT.to_u32() - tip;
+	let expiry_height = tip + (offset - offset % 65_536);
+	assert!(expiry_height <= ark::vtxo::policy::MAX_BLOCK_HEIGHT.to_u32());
+	assert!(
+		expiry_height - tip > ark_info.vtxo_lifetime.to_u32(),
+		"test expiry lifetime ({}) must exceed the server's cap ({})",
+		expiry_height - tip, ark_info.vtxo_lifetime,
+	);
+
+	// An honest client computes a sane expiry, so only a hand-built request
+	// exercises the server's validation. The expiry check runs before any signing
+	// and before the funding tx is validated, so a freshly generated nonce, a
+	// throwaway outpoint and an empty funding tx suffice to reach it.
+	let user_key = Keypair::new(&SECP, &mut thread_rng());
+	let (_sec_nonce, pub_nonce) = musig::nonce_pair(&user_key);
+	let funding_tx = Transaction {
+		version: transaction::Version::TWO,
+		lock_time: absolute::LockTime::ZERO,
+		input: vec![],
+		output: vec![],
+	};
+
+	let mut rpc = srv.get_public_rpc().await;
+	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
+		amount: sat(100_000).to_sat(),
+		utxo: OutPoint::null().serialize(),
+		expiry_height,
+		user_pubkey: user_key.public_key().serialize().to_vec(),
+		pub_nonce: pub_nonce.serialize().to_vec(),
+		funding_tx: bitcoin::consensus::serialize(&funding_tx),
+	}).await;
+
+	let err = res.expect_err("server must refuse a board expiry beyond its lifetime cap");
+	assert!(
+		err.message().contains("too high"),
+		"expected a lifetime rejection, got [{}]: {}", err.code(), err.message(),
+	);
+	assert_eq!(err.code(), tonic::Code::InvalidArgument, "err: {err}");
+}
+
+/// A tx spending `inputs` with `nb_outputs` outputs.
+///
+/// The board cosign validation only inspects the funding tx' txid, its inputs
+/// and its number of outputs, so nothing here has to be signed or spendable.
+fn dummy_funding_tx(inputs: &[OutPoint], nb_outputs: usize) -> Transaction {
+	Transaction {
+		version: transaction::Version::TWO,
+		lock_time: absolute::LockTime::ZERO,
+		input: inputs.iter().map(|p| TxIn {
+			previous_output: *p,
+			script_sig: ScriptBuf::new(),
+			sequence: Sequence::ZERO,
+			witness: Witness::new(),
+		}).collect(),
+		output: iter::repeat_with(|| TxOut {
+			value: sat(100_000),
+			script_pubkey: ScriptBuf::new(),
+		}).take(nb_outputs).collect(),
+	}
+}
+
+/// Request a board cosign for `utxo`, claiming `funding_tx` as its funding tx.
+///
+/// All the other fields are valid, so only the funding tx validation can reject
+/// this request.
+async fn request_board_cosign_with_funding_tx(
+	ctx: &TestContext,
+	srv: &Captaind,
+	utxo: OutPoint,
+	funding_tx: &Transaction,
+) -> Result<protos::BoardCosignResponse, tonic::Status> {
+	let ark_info = srv.ark_info().await;
+	let tip = ctx.bitcoind().get_block_count().await as u32;
+	let user_key = Keypair::new(&SECP, &mut thread_rng());
+	let (_sec_nonce, pub_nonce) = musig::nonce_pair(&user_key);
+
+	let mut rpc = srv.get_public_rpc().await;
+	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
+		amount: sat(100_000).to_sat(),
+		utxo: utxo.serialize(),
+		expiry_height: tip + ark_info.vtxo_lifetime.to_u32(),
+		user_pubkey: user_key.public_key().serialize().to_vec(),
+		pub_nonce: pub_nonce.serialize().to_vec(),
+		funding_tx: bitcoin::consensus::serialize(funding_tx),
+	}).await;
+	res.map(|r| r.into_inner())
+}
+
+/// The board utxo must be an output of the funding tx the client sends along.
+///
+/// Without this check the server cosigns a board for an outpoint it has never
+/// seen, so the client can pick any outpoint it likes.
+#[tokio::test]
+async fn reject_board_cosign_utxo_not_in_funding_tx() {
+	let ctx = TestContext::new("server/reject_board_cosign_utxo_not_in_funding_tx").await;
+	let srv = ctx.captaind("server").create().await;
+
+	// A single-output funding tx spending a real utxo, so that only the
+	// outpoint-vs-funding-tx checks can fail.
+	let addr = ctx.bitcoind().get_new_address();
+	let input_txid = ctx.bitcoind().fund_addr(&addr, btc(1)).await;
+	ctx.generate_blocks(1).await;
+	srv.bitcoind().await_transaction(input_txid).await;
+	let funding_tx = dummy_funding_tx(&[OutPoint::new(input_txid, 0)], 1);
+	let funding_txid = funding_tx.compute_txid();
+
+	// The funding tx has only one output, so vout 1 doesn't exist.
+	let err = request_board_cosign_with_funding_tx(
+		&ctx, &srv, OutPoint::new(funding_txid, 1), &funding_tx,
+	).await.expect_err("server must refuse a board utxo the funding tx doesn't have");
+	assert_eq!(err.code(), tonic::Code::InvalidArgument, "err: {err}");
+	assert!(
+		err.message().contains("board outpoint does not match funding tx (vout)"),
+		"err: {err}",
+	);
+
+	// An outpoint of a completely different tx.
+	let err = request_board_cosign_with_funding_tx(
+		&ctx, &srv, OutPoint::new(input_txid, 0), &funding_tx,
+	).await.expect_err("server must refuse a board utxo from another tx");
+	assert_eq!(err.code(), tonic::Code::InvalidArgument, "err: {err}");
+	assert!(
+		err.message().contains("board outpoint does not match funding tx (txid)"),
+		"err: {err}",
+	);
+}
+
+/// A funding tx must spend inputs our bitcoind knows, otherwise it is made up.
+#[tokio::test]
+async fn reject_board_cosign_unknown_funding_input() {
+	let ctx = TestContext::new("server/reject_board_cosign_unknown_funding_input").await;
+	let srv = ctx.captaind("server").create().await;
+
+	// A txid that was never broadcast anywhere.
+	let unknown_txid = Txid::from_str(
+		"0000000000000000000000000000000000000000000000000000000000000001",
+	).unwrap();
+	let funding_tx = dummy_funding_tx(&[OutPoint::new(unknown_txid, 0)], 1);
+	let utxo = OutPoint::new(funding_tx.compute_txid(), 0);
+
+	let err = request_board_cosign_with_funding_tx(&ctx, &srv, utxo, &funding_tx).await
+		.expect_err("server must refuse a funding tx spending unknown inputs");
+	assert_eq!(err.code(), tonic::Code::InvalidArgument, "err: {err}");
+	assert!(
+		err.message().contains(&format!("unknown input tx {}", unknown_txid)),
+		"err: {err}",
+	);
+}
+
+/// An unconfirmed input is known to our bitcoind, so boarding on top of a tx
+/// that is still in the mempool must keep working.
+#[tokio::test]
+async fn accept_board_cosign_with_unconfirmed_funding_input() {
+	let ctx = TestContext::new("server/accept_board_cosign_with_unconfirmed_funding_input").await;
+	let srv = ctx.captaind("server").create().await;
+
+	// A fresh block gets both bitcoinds out of IBD, in which they don't relay
+	// mempool txs to each other.
+	let height = ctx.generate_blocks(1).await;
+	srv.bitcoind().wait_for_blockheight(height).await;
+
+	// Deliberately not confirmed: it should sit in both mempools.
+	let addr = ctx.bitcoind().get_new_address();
+	let input_txid = ctx.bitcoind().fund_addr(&addr, btc(1)).await;
+	srv.bitcoind().await_transaction(input_txid).await;
+
+	let funding_tx = dummy_funding_tx(&[OutPoint::new(input_txid, 0)], 1);
+	let utxo = OutPoint::new(funding_tx.compute_txid(), 0);
+
+	let res = request_board_cosign_with_funding_tx(&ctx, &srv, utxo, &funding_tx).await
+		.expect("server must cosign a board funded by an unconfirmed tx");
+	// A parsable response means the server did cosign.
+	let _: ark::board::BoardCosignResponse = res.try_into()
+		.expect("invalid cosign response from server");
+}
+
+/// A VTXO is not an on-chain utxo, so it can never fund a board.
+///
+/// A client boarding on a VTXO would get a board VTXO whose funding output
+/// doesn't exist on chain, which the server can never claim.
+#[tokio::test]
+async fn reject_board_cosign_funding_tx_spending_vtxo() {
+	let ctx = TestContext::new("server/reject_board_cosign_funding_tx_spending_vtxo").await;
+	let srv = ctx.captaind("server").create().await;
+
+	// Registering the board makes the server store the VTXO.
+	let bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
+	bark.board_all_and_confirm_and_register(&ctx).await;
+	let [vtxo] = bark.vtxos().await.try_into().unwrap();
+
+	let funding_tx = dummy_funding_tx(&[vtxo.id.to_point()], 1);
+	let utxo = OutPoint::new(funding_tx.compute_txid(), 0);
+
+	let err = request_board_cosign_with_funding_tx(&ctx, &srv, utxo, &funding_tx).await
+		.expect_err("server must refuse a funding tx spending a VTXO");
+	assert_eq!(err.code(), tonic::Code::InvalidArgument, "err: {err}");
+	assert!(
+		err.message().contains(&format!("input is a VTXO: {}", vtxo.id)),
+		"err: {err}",
+	);
+}
+
+#[tokio::test]
 async fn reject_dust_vtxo_request() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("server/reject_dust_vtxo_request").await;
 	let srv = ctx.captaind("server").create().await;
@@ -944,7 +1552,7 @@ async fn reject_dust_vtxo_request() {
 	#[derive(Clone)]
 	struct Proxy {
 		vtxo: WalletVtxoInfo,
-		wallet: Arc<Wallet>,
+		wallet: Wallet,
 		challenge:  Arc<Mutex<Option<Challenge>>>
 	}
 	#[async_trait::async_trait]
@@ -996,7 +1604,7 @@ async fn reject_dust_vtxo_request() {
 
 	let proxy = Proxy {
 		vtxo: vtxo.clone(),
-		wallet: Arc::new(bark_client),
+		wallet: bark_client,
 		challenge: Arc::new(Mutex::new(None)),
 	};
 	let proxy = srv.start_proxy_no_mailbox(proxy).await;
@@ -1022,9 +1630,11 @@ async fn run_two_captainds() {
 
 #[tokio::test]
 async fn captaind_config_change(){
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("server/captaind_config_change").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
-		cfg.vtxo_exit_delta = 12;
+		cfg.vtxo_exit_delta = BlockDelta::new(12);
 	}).create_unregistered().await;
 	ctx.fund_captaind(&srv, btc(10)).await;
 	let bark1 = ctx.bark("bark1", &srv).create().await;
@@ -1040,7 +1650,7 @@ async fn captaind_config_change(){
 
 	srv.stop().await.unwrap();
 
-	srv.config_mut().vtxo_exit_delta = 24;
+	srv.config_mut().vtxo_exit_delta = BlockDelta::new(24);
 	srv.config_mut().round_interval = Duration::from_secs(3600);
 
 	srv.start().await.unwrap();
@@ -1052,9 +1662,9 @@ async fn captaind_config_change(){
 
 	let vtxos1 = bark1.vtxos().await;
 	let vtxos2 = bark2.vtxos().await;
-	assert_eq!(vtxos1[0].exit_delta, 12);
-	assert_eq!(vtxos2[0].exit_delta, 12);
-	assert_eq!(srv.config().vtxo_exit_delta, 24);
+	assert_eq!(vtxos1[0].exit_delta, BlockDelta::new(12));
+	assert_eq!(vtxos2[0].exit_delta, BlockDelta::new(12));
+	assert_eq!(srv.config().vtxo_exit_delta, BlockDelta::new(24));
 
 	// transactions still work
 
@@ -1068,7 +1678,7 @@ async fn captaind_config_change(){
 
 	// new vtxo should have new exit_delta
 	let new_vtxo = bark1.vtxos().await;
-	assert_eq!(new_vtxo[0].exit_delta, 24);
+	assert_eq!(new_vtxo[0].exit_delta, BlockDelta::new(24));
 }
 
 #[tokio::test]
@@ -1098,7 +1708,7 @@ async fn test_cosign_vtxo_tree() {
 	let ctx = TestContext::new("server/test_cosign_vtxo_tree").await;
 	let srv = ctx.new_server_with_cfg("server", None, |_| { }).await;
 
-	let expiry = 100_000;
+	let expiry = BlockHeight::new(100_000);
 	let exit_delta = srv.ark_info().vtxo_exit_delta;
 
 	let vtxo_key = Keypair::from_str("b44d09e86c02df6b57b6e92ac1c63b72c8781d5ed90d6f42073e4f47945d9e0d").unwrap();
@@ -1140,11 +1750,40 @@ async fn test_cosign_vtxo_tree() {
 
 	let mut vtxos = tree.into_cached_tree().output_vtxos().collect::<Vec<_>>();
 	for vtxo in vtxos.iter_mut() {
-		let (ctx, req) = LeafVtxoCosignContext::new(vtxo, &funding_tx, &vtxo_key);
-		let resp = srv.cosign_hashlocked_leaf(&req, vtxo, &funding_tx);
+		let (ctx, req) = LeafVtxoCosignContext::new(vtxo, &funding_tx, &vtxo_key).unwrap();
+		let resp = srv.cosign_hashlocked_leaf(&req, vtxo, &funding_tx).unwrap();
 		assert!(ctx.finalize(vtxo, resp));
 	}
 
+}
+
+#[tokio::test]
+async fn leaf_cosign_refuses_non_hark_vtxo() {
+	let ctx = TestContext::new("server/leaf_cosign_refuses_non_hark_vtxo").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+
+	let bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
+	let bark2 = ctx.bark("bark2", &srv).create().await;
+
+	bark.board(sat(800_000)).await;
+	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
+	ctx.refresh_all(&srv, &[&bark]).await;
+	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
+
+	// an arkoor send leaves a change VTXO whose chain anchor is the round
+	// funding tx, but whose last genesis transition is not hash-locked
+	bark.send_oor(bark2.address().await, sat(100_000)).await;
+	let vtxo_id = bark.vtxo_ids().await[0];
+
+	let key = Keypair::new(&SECP, &mut thread_rng());
+	let (_sec_nonce, pub_nonce) = musig::nonce_pair(&key);
+	let req = LeafVtxoCosignRequest { vtxo_id, pub_nonce };
+
+	let mut rpc = srv.get_public_rpc().await;
+	let err = rpc.request_leaf_vtxo_cosign(protos::LeafVtxoCosignRequest::from(req)).await
+		.expect_err("leaf cosign of a non-hArk VTXO should be refused");
+	assert_eq!(err.code(), tonic::Code::InvalidArgument, "unexpected error: {err:?}");
+	assert!(err.message().contains("not a hArk leaf"), "unexpected message: {}", err.message());
 }
 
 #[tokio::test]
@@ -1195,6 +1834,8 @@ async fn should_refuse_oor_with_invalid_attestation() {
 
 #[tokio::test]
 async fn should_refuse_ln_pay_with_invalid_attestation() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("server/should_refuse_ln_pay_with_invalid_attestation").await;
 
 	let lightningd = ctx.lightningd("lightningd").create().await;
@@ -1242,10 +1883,9 @@ async fn should_refuse_ln_pay_with_invalid_attestation() {
 
 #[tokio::test]
 async fn should_refuse_oor_input_vtxo_that_is_being_exited() {
-	require_bark_version!(> "0.1.4");
-
 	let ctx = TestContext::new("server/should_refuse_oor_input_vtxo_that_is_being_exited").await;
-	let srv = ctx.captaind("server").create().await;
+	// the watchmand marks the exited vtxo, which makes the server refuse it
+	let srv = ctx.captaind("server").watchmand().create().await;
 
 	let bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
 	let bark2 = ctx.bark("bark2", &srv).create().await;
@@ -1267,7 +1907,7 @@ async fn should_refuse_oor_input_vtxo_that_is_being_exited() {
 	assert_eq!(bark.onchain_balance().await, sat(596_429));
 
 	#[derive(Clone)]
-	struct Proxy(Arc<Wallet>, WalletVtxoInfo);
+	struct Proxy(Wallet, WalletVtxoInfo);
 	#[async_trait::async_trait]
 	impl captaind::proxy::ArkRpcProxy for Proxy {
 		async fn request_arkoor_cosign(
@@ -1290,7 +1930,7 @@ async fn should_refuse_oor_input_vtxo_that_is_being_exited() {
 	}
 
 	let proxy = srv.start_proxy_no_mailbox(
-		Proxy(Arc::new(bark.client().await), vtxo_a.clone())
+		Proxy(bark.client().await, vtxo_a.clone())
 	).await;
 
 	bark.set_ark_url(&proxy.address).await;
@@ -1298,14 +1938,12 @@ async fn should_refuse_oor_input_vtxo_that_is_being_exited() {
 	let err = bark.try_send_oor(&bark2.address().await, sat(100_000), false).await
 		.expect_err("Server should refuse oor").to_alt_string();
 	assert!(err.contains(
-		&format!("bad user input: cannot spend vtxo that is already exited: {}", vtxo_a.id)
+		&format!("bad user input: vtxo {} has exited onchain", vtxo_a.id)
 	), "err: {err}");
 }
 
 #[tokio::test]
 async fn mailbox_post_and_process_with_auth() {
-	require_bark_version!(> "0.1.4");
-
 	let ctx = TestContext::new("server/mailbox_post_and_process_with_auth").await;
 	let srv = ctx.captaind("server").create().await;
 
@@ -1327,7 +1965,7 @@ async fn mailbox_post_and_process_with_auth() {
 
 	let read_mailbox = protos::mailbox_server::MailboxRequest {
 		authorization,
-		unblinded_id: unblinded_id.clone(),
+		mailbox_id: unblinded_id.clone(),
 		checkpoint: 0,
 	};
 
@@ -1367,7 +2005,7 @@ async fn mailbox_post_and_process_with_auth() {
 
 	let incorrect_read_mailbox = protos::mailbox_server::MailboxRequest {
 		authorization: invalid_authorization,
-		unblinded_id: unblinded_id.clone(),
+		mailbox_id: unblinded_id.clone(),
 		checkpoint: 0,
 	};
 
@@ -1385,7 +2023,7 @@ async fn mailbox_post_and_process_with_auth() {
 	let expired_authorization = Some(expired_mailbox_auth.serialize().to_vec());
 
 	let expired_read_mailbox = protos::mailbox_server::MailboxRequest {
-		unblinded_id: unblinded_id.clone(),
+		mailbox_id: unblinded_id.clone(),
 		authorization: expired_authorization.clone(),
 		checkpoint: 0,
 	};
@@ -1400,7 +2038,7 @@ async fn mailbox_post_and_process_with_auth() {
 
 	// Now we check that the server rejects requests with no authorization
 	let no_auth_read_mailbox = protos::mailbox_server::MailboxRequest {
-		unblinded_id: unblinded_id.clone(),
+		mailbox_id: unblinded_id.clone(),
 		authorization: None,
 		checkpoint: 0,
 	};
@@ -1434,14 +2072,15 @@ async fn mailbox_post_and_process_with_auth() {
 
 #[tokio::test]
 async fn should_refuse_round_input_vtxo_that_is_being_exited() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("server/should_refuse_round_input_vtxo_that_is_being_exited").await;
 
 	trace!("Start lightningd-1");
 	let lightningd = ctx.lightningd("lightningd-1").create().await;
 
-	let srv = ctx.captaind("server").lightningd(&lightningd).create().await;
+	// the watchmand marks the exited vtxo, which makes the server refuse it
+	let srv = ctx.captaind("server").lightningd(&lightningd).watchmand().create().await;
 
 	let mut bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
 
@@ -1463,7 +2102,7 @@ async fn should_refuse_round_input_vtxo_that_is_being_exited() {
 
 	#[derive(Clone)]
 	struct Proxy {
-		pub wallet: Arc<Wallet>,
+		pub wallet: Wallet,
 		pub challenge: Arc<Mutex<Option<Challenge>>>,
 		pub vtxo: WalletVtxoInfo
 	}
@@ -1515,7 +2154,7 @@ async fn should_refuse_round_input_vtxo_that_is_being_exited() {
 	}
 
 	let proxy = Proxy {
-		wallet: Arc::new(bark.client().await),
+		wallet: bark.client().await,
 		challenge: Arc::new(Mutex::new(None)),
 		vtxo: vtxo_a.clone(),
 	};
@@ -1528,9 +2167,11 @@ async fn should_refuse_round_input_vtxo_that_is_being_exited() {
 		async { bark.try_refresh_all_no_retry().await.unwrap_err().to_alt_string() },
 		srv.trigger_round(),
 	);
-	assert!(err.contains(&format!(
-		"bad user input: cannot spend vtxo that is already exited: {}", vtxo_a.id,
-	)), "err: {err:#}");
+	// The server refuses a vtxo that is already exited
+	assert!(
+		err.contains("not spendable") && err.contains(&vtxo_a.id.to_string()),
+		"err: {err:#}",
+	);
 }
 
 
@@ -1554,7 +2195,7 @@ async fn test_register_board() {
 	// Get server info and calculate expiry height
 	let ark_info = srv.ark_info().await;
 	let current_height = ctx.generate_blocks(1).await;
-	let expiry_height = current_height + ark_info.vtxo_expiry_delta as u32;
+	let expiry_height = current_height + ark_info.vtxo_lifetime;
 
 	// Create a board builder to get the funding script
 	let board_amount = sat(100_000);
@@ -1586,9 +2227,10 @@ async fn test_register_board() {
 	let cosign_request = protos::BoardCosignRequest {
 		amount: board_amount.to_sat(),
 		utxo: board_utxo.serialize(),
-		expiry_height,
+		expiry_height: expiry_height.into(),
 		user_pubkey: client_cosign_keypair.public_key().serialize().to_vec(),
 		pub_nonce: board_builder.user_pub_nonce().serialize().to_vec(),
+		funding_tx: bitcoin::consensus::serialize(&funding_tx),
 	};
 
 	let mut rpc = srv.get_public_rpc().await;
@@ -1747,6 +2389,8 @@ async fn grpc_health_check() {
 
 #[tokio::test]
 async fn undo_round() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("server/undo_round").await;
 	let srv = ctx.captaind("server").funded(btc(10)).cfg(|cfg| {
 		cfg.round_interval = Duration::from_secs(3600);
@@ -1789,8 +2433,6 @@ async fn undo_round() {
 /// spent and rejects the register_board_vtxo call.
 #[tokio::test]
 async fn board_exit_tx_prevents_registration() {
-	require_bark_version!(> "0.1.2");
-
 	let ctx = TestContext::new("server/board_exit_tx_prevents_registration").await;
 	let srv = ctx.captaind("server").funded(btc(1)).create().await;
 	let bark = ctx.bark("bark1", &srv).funded(sat(200_000)).create().await;

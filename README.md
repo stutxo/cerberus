@@ -45,7 +45,9 @@ No Rust, no problem!
 
 **barkd** is an Ark wallet that runs as a daemon and exposes a REST API over HTTP. It's well suited for power users and great for automation—think web shops, Telegram/Discord bots, and similar use cases. The [barkd-clients repository](https://gitlab.com/ark-bitcoin/barkd-clients) provides clients in TypeScript and C#.
 
-**uniffi-bindings** are the better choice if you're building a native desktop or mobile application. The bindings are available in the [bark-ffi repository](https://gitlab.com/ark-bitcoin/bark-ffi). These are still experimental, but stabilizing quickly.
+barkd serves plaintext HTTP and binds loopback by default. A bearer token holding full wallet access travels in every request, so exposing the port beyond loopback requires a reverse proxy that terminates TLS: barkd has no TLS of its own, and the token is readable by anyone on the path. `--no-auth` removes the token requirement entirely, and refuses to start on a non-loopback bind; `--dangerously-allow-remote-no-auth` is the flag that does both, disabling auth on a bind address anyone can reach.
+
+**uniffi-bindings** are the better choice if you're building a native desktop or mobile application. The bindings are available in the [bark-ffi repository](https://gitlab.com/ark-bitcoin/bark-ffi) and power the published Bark SDK packages.
 
 ## Why Ark?
 
@@ -72,6 +74,12 @@ For a detailed technical explanation, see our [protocol documentation](https://s
 
 ![An example of an Ark transaction tree from a refresh](assets/tx-tree-refresh.jpg)
 _A transaction tree showing how Ark enables multiple users to share control of a single UTXO through pre-signed transactions._
+
+## Building Bark
+
+Both bark's client and server binaries can be built with either cargo or nix.
+Nix builds are reproducible and are used for official releases.
+For more info, see the [`BUILDING.md`](BUILDING.md) file.
 
 ## Minimum supported Rust version (MSRV)
 
@@ -103,12 +111,6 @@ If you run into any issues at all, let us know:
 - [Community forum](https://community.second.tech)
 - [Community chat](https://chat.second.tech)
 - [Issue tracker](https://gitlab.com/ark-bitcoin/bark/issues)
-
-## Security policy and responsible disclosure
-
-**The Ark protocol code is experimental and must not be used in production.**
-
-If you happen to find a vulnerability we invite you to [file a public issue](https://gitlab.com/ark-bitcoin/bark/issues/new).
 
 ## License
 

@@ -1,6 +1,5 @@
 
 use std::borrow::Borrow;
-use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -60,7 +59,7 @@ pub(crate) fn row_to_movement(row: &Row) -> anyhow::Result<Movement> {
 		},
 		metadata: row.get::<_, Option<String>>("metadata")?
 			.map(|s| from_json_text(&s))
-			.unwrap_or_else(|| Ok(HashMap::new()))?,
+			.unwrap_or_else(|| Ok(serde_json::Map::new()))?,
 		intended_balance: SignedAmount::from_sat(row.get("intended_balance")?),
 		effective_balance: SignedAmount::from_sat(row.get("effective_balance")?),
 		offchain_fee: Amount::from_sat(row.get("offchain_fee")?),
@@ -107,8 +106,9 @@ pub (crate) fn row_to_wallet_vtxo(row: &Row<'_>) -> anyhow::Result<WalletVtxo> {
 
 	let exit_depth = row.get::<_, i64>("exit_depth")? as u16;
 	let exit_tx_weight = Weight::from_wu(row.get::<_, i64>("exit_tx_weight")? as u64);
+	let registered = row.get::<_, bool>("registered")?;
 
-	Ok(WalletVtxo { vtxo, state, exit_depth, exit_tx_weight })
+	Ok(WalletVtxo { vtxo, state, exit_depth, exit_tx_weight, registered })
 }
 
 pub (crate) fn rows_to_wallet_vtxos(mut rows: Rows<'_>) -> anyhow::Result<Vec<WalletVtxo>> {

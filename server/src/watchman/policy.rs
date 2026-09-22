@@ -1,11 +1,11 @@
 
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::Txid;
+use bitcoin::{Amount, Transaction, Txid};
 
 use ark::{ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
 use ark::lightning::PaymentHash;
 use bitcoind_async_client::Client as BitcoindClient;
-use bitcoin_ext::{BlockDelta, BlockHeight};
+use bitcoin_ext::{fee, BlockDelta, BlockHeight, P2TR_DUST};
 use server_log::slog;
 use tracing::{error, warn};
 
@@ -17,6 +17,22 @@ use super::{Action, Config};
 struct ProgressSpec {
 	next_txid: Txid,
 	is_signed: bool,
+}
+
+/// We ignore transactions with dust-outputs because they are non-standard.
+/// Their is no point in trying to claim them. We will only get warnings
+///
+/// We only do this if the input is sufficiently small so we only
+/// do this on txs that are not economically relevant.`
+fn is_ignorable_dust(tx: &Transaction, input_amount: Amount) -> bool {
+	if input_amount >= P2TR_DUST * 2 || tx.input.len() != 1 {
+		return false;
+	}
+	tx.output.iter().any(|o| {
+		!o.script_pubkey.is_op_return()
+			&& o.script_pubkey != *fee::P2A_SCRIPT
+			&& o.value < o.script_pubkey.minimal_non_dust()
+	})
 }
 
 struct ActionParams<T = ()> {
@@ -88,12 +104,12 @@ fn try_progress<T>(
 	};
 
 	if let Some(wait_blocks) = params.progress_grace_period {
-		if params.chain_tip_height.saturating_sub(params.confirmed_at) < wait_blocks.into() {
+		if params.chain_tip_height.checked_blocks_since(params.confirmed_at).unwrap_or(0) < wait_blocks.to_u32() {
 			return Some(Action::Wait);
 		}
 	}
 
-	Some(Action::Progress { txid, deadline: Some(deadline) })
+	Some(Action::Progress { txid, deadline })
 }
 
 /// Determine the action for an ServerOwned policy
@@ -103,7 +119,7 @@ fn try_progress<T>(
 /// be swept.
 fn decide_server_owned(params: &ActionParams) -> Action {
 	if params.chain_tip_height >= params.expiry_height {
-		Action::Claim { deadline: None }
+		Action::Sweep
 	} else {
 		Action::Wait
 	}
@@ -111,10 +127,10 @@ fn decide_server_owned(params: &ActionParams) -> Action {
 
 /// Determine the action for an Expiry policy
 ///
-/// Claim if expired, otherwise wait
+/// Sweep if expired, otherwise wait
 fn decide_action_expiry(params: &ActionParams) -> Action {
 	if params.chain_tip_height >= params.expiry_height {
-		Action::Claim { deadline: None }
+		Action::Sweep
 	} else {
 		Action::Wait
 	}
@@ -124,9 +140,8 @@ fn decide_action_expiry(params: &ActionParams) -> Action {
 ///
 /// Always claim
 fn decide_action_hark_forfeit(params: &ActionParams) -> Action {
-	let deadline = params.confirmed_at.checked_add(BlockHeight::from(params.exit_delta))
-		.expect("confirmed_at + exit_delta within u32 by MAX_BLOCK_HEIGHT invariant");
-	Action::Claim { deadline: Some(deadline) }
+	let deadline = params.confirmed_at + params.exit_delta;
+	Action::Claim { deadline }
 }
 
 /// Determine action for Pubkey policy.
@@ -135,10 +150,9 @@ fn decide_action_hark_forfeit(params: &ActionParams) -> Action {
 /// longer the rightful owner — try to progress as watchtower for the new
 /// owner, even if we still hold the ephemeral key. Otherwise, if we know
 /// the key (e.g. an unspent pool vtxo whose parent tx hit the chain via a
-/// sibling exit), claim after the exit delta.
+/// sibling exit), sweep after the exit delta.
 fn decide_action_pubkey(params: &ActionParams<PubkeyExtra>) -> Action {
-	let after_exit_delta = params.confirmed_at.checked_add(BlockHeight::from(params.exit_delta))
-		.expect("confirmed_at + exit_delta within u32 by MAX_BLOCK_HEIGHT invariant");
+	let after_exit_delta = params.confirmed_at + params.exit_delta;
 
 	// Check next_tx before server_knows_key. We drop the input key when
 	// arkooring out a pool vtxo, but rows arkoored before that fix
@@ -157,7 +171,7 @@ fn decide_action_pubkey(params: &ActionParams<PubkeyExtra>) -> Action {
 	if params.policy_extras.server_knows_key
 		&& params.chain_tip_height >= after_exit_delta
 	{
-		return Action::Claim { deadline: None };
+		return Action::Sweep;
 	}
 
 	Action::Wait
@@ -170,10 +184,7 @@ fn decide_action_pubkey(params: &ActionParams<PubkeyExtra>) -> Action {
 ///
 /// Deadline is `min(htlc_expiry, confirmed_at + 2*exit_delta)`.
 fn decide_action_server_htlc_send(params: &ActionParams<HtlcSendExtra>) -> Action {
-	let twice_exit_delta = params.exit_delta.checked_mul(2)
-		.expect("2*exit_delta fits in BlockDelta by MAX_BLOCK_DELTA invariant");
-	let confirmed_plus_2x = params.confirmed_at.checked_add(BlockHeight::from(twice_exit_delta))
-		.expect("confirmed_at + 2*exit_delta within u32 by MAX_BLOCK_HEIGHT invariant");
+	let confirmed_plus_2x = params.confirmed_at + params.exit_delta * 2;
 	let deadline = std::cmp::min(params.policy_extras.htlc_expiry, confirmed_plus_2x);
 
 	if let Some(action) = try_progress(params, params.policy_extras.next_tx, deadline) {
@@ -181,10 +192,9 @@ fn decide_action_server_htlc_send(params: &ActionParams<HtlcSendExtra>) -> Actio
 	}
 
 	if params.policy_extras.has_preimage {
-		let claim_height = params.confirmed_at.checked_add(BlockHeight::from(params.exit_delta))
-			.expect("confirmed_at + exit_delta within u32 by MAX_BLOCK_HEIGHT invariant");
+		let claim_height = params.confirmed_at + params.exit_delta;
 		if params.chain_tip_height >= claim_height {
-			return Action::Claim { deadline: Some(deadline) };
+			return Action::Claim { deadline };
 		}
 	}
 
@@ -198,11 +208,8 @@ fn decide_action_server_htlc_send(params: &ActionParams<HtlcSendExtra>) -> Actio
 ///
 /// Deadline is `confirmed_at + htlc_expiry_delta + exit_delta`.
 fn decide_action_server_htlc_recv(params: &ActionParams<HtlcRecvExtra>) -> Action {
-	let confirmed_plus_exit = params.confirmed_at.checked_add(BlockHeight::from(params.exit_delta))
-		.expect("confirmed_at + exit_delta within u32 by MAX_BLOCK_HEIGHT invariant");
-	let deadline = confirmed_plus_exit
-		.checked_add(BlockHeight::from(params.policy_extras.htlc_expiry_delta))
-		.expect("confirmed_at + exit_delta + htlc_expiry_delta within u32 by MAX_BLOCK_HEIGHT invariant");
+	let confirmed_plus_exit = params.confirmed_at + params.exit_delta;
+	let deadline = confirmed_plus_exit + params.policy_extras.htlc_expiry_delta;
 
 	if let Some(action) = try_progress(params, params.policy_extras.next_tx, deadline) {
 		return action;
@@ -210,7 +217,7 @@ fn decide_action_server_htlc_recv(params: &ActionParams<HtlcRecvExtra>) -> Actio
 
 	let claim_height = std::cmp::max(params.policy_extras.htlc_expiry, confirmed_plus_exit);
 	if params.chain_tip_height >= claim_height {
-		return Action::Claim { deadline: Some(deadline) };
+		return Action::Claim { deadline };
 	}
 
 	Action::Wait
@@ -242,12 +249,13 @@ impl ActionContextFetcher<'_> {
 			ServerVtxoPolicy::Expiry(_)
 				| ServerVtxoPolicy::Checkpoint(_)
 				| ServerVtxoPolicy::HarkLeaf(_)
+				| ServerVtxoPolicy::HarkLeaf_v0(_)
 			=> {
 				// all these three are just an expiry for us, we can sweep them
 				// when they expire and don't have to do anything otherwise
 				decide_action_expiry(&params)
 			},
-			ServerVtxoPolicy::HarkForfeit(_) => {
+			ServerVtxoPolicy::HarkForfeit(_) | ServerVtxoPolicy::HarkForfeit_v0(_) => {
 				decide_action_hark_forfeit(&params)
 			},
 			ServerVtxoPolicy::User(VtxoPolicy::Pubkey(p)) => {
@@ -266,7 +274,23 @@ impl ActionContextFetcher<'_> {
 				});
 				decide_action_server_htlc_send(&params)
 			},
+			ServerVtxoPolicy::User(VtxoPolicy::ServerHtlcSend_v0(p)) => {
+				let params = params.with_policy_extras(HtlcSendExtra {
+					next_tx: self.fetch_progress(vtxo).await,
+					htlc_expiry: p.htlc_expiry,
+					has_preimage: self.check_have_payment_preimage(p.payment_hash).await,
+				});
+				decide_action_server_htlc_send(&params)
+			},
 			ServerVtxoPolicy::User(VtxoPolicy::ServerHtlcRecv(p)) => {
+				let params = params.with_policy_extras(HtlcRecvExtra {
+					next_tx: self.fetch_progress(vtxo).await,
+					htlc_expiry: p.htlc_expiry,
+					htlc_expiry_delta: p.htlc_expiry_delta,
+				});
+				decide_action_server_htlc_recv(&params)
+			},
+			ServerVtxoPolicy::User(VtxoPolicy::ServerHtlcRecv_v0(p)) => {
 				let params = params.with_policy_extras(HtlcRecvExtra {
 					next_tx: self.fetch_progress(vtxo).await,
 					htlc_expiry: p.htlc_expiry,
@@ -277,21 +301,25 @@ impl ActionContextFetcher<'_> {
 		};
 
 		match &action {
-			Action::Progress { deadline: Some(d), .. } if self.chain_tip_height > *d => {
+			Action::Progress { deadline: d, .. } if self.chain_tip_height > *d => {
 				slog!(ProgressDeadlineExceeded,
 					vtxo_id: vtxo.id(),
 					deadline: *d,
 					current_height: self.chain_tip_height,
 				);
 			},
-			Action::Claim { deadline: Some(d) } if self.chain_tip_height > *d => {
+			Action::Claim { deadline: d } if self.chain_tip_height > *d => {
 				slog!(ClaimDeadlineExceeded,
 					vtxo_id: vtxo.id(),
 					deadline: *d,
 					current_height: self.chain_tip_height,
 				);
 			},
-			Action::Wait | Action::Progress { .. } | Action::Claim { .. } => {},
+			Action::Wait
+				| Action::Sweep
+				| Action::Progress { .. }
+				| Action::Claim { .. }
+			=> {},
 		}
 
 		action
@@ -322,6 +350,13 @@ impl ActionContextFetcher<'_> {
 		let vtx = self.db.read(async |t| t.get_virtual_transaction_by_txid(oor_txid).await).await
 			.inspect_err(|e| warn!("DB error: {:#}", e))
 			.ok()??;
+
+		if let Some(ref tx) = vtx.signed_tx {
+			if is_ignorable_dust(tx.as_ref(), vtxo.amount()) {
+				slog!(ProgressIgnoredDust, vtxo_id: vtxo.id(), txid: oor_txid);
+				return None;
+			}
+		}
 
 		// For forfeit txs with connector inputs, we check if we should broadcast
 		// the connector tx first.
@@ -399,11 +434,11 @@ mod tests {
 	fn pubkey_waits_before_progress() {
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 105,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(105),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: PubkeyExtra {
 				next_tx: None,
 				server_knows_key: false,
@@ -419,18 +454,18 @@ mod tests {
 		let txid = Txid::from_byte_array([1; 32]);
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 106,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(106),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: PubkeyExtra {
 				next_tx: Some(ProgressSpec { next_txid: txid, is_signed: true }),
 				server_knows_key: false,
 			},
 		};
 		// deadline = confirmed_at + exit_delta = 100 + 144 = 244
-		assert_eq!(decide_action_pubkey(&params), Action::Progress { txid, deadline: Some(244) });
+		assert_eq!(decide_action_pubkey(&params), Action::Progress { txid, deadline: BlockHeight::new(244) });
 	}
 
 	/// If no progress is available, the server waits even if the wait
@@ -439,11 +474,11 @@ mod tests {
 	fn pubkey_waits_without_progress() {
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 106,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(106),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: PubkeyExtra {
 				next_tx: None,
 				server_knows_key: false,
@@ -458,11 +493,11 @@ mod tests {
 		let txid = Txid::from_byte_array([1; 32]);
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 106,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(106),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: PubkeyExtra {
 				next_tx: Some(ProgressSpec { next_txid: txid, is_signed: false }),
 				server_knows_key: false,
@@ -477,11 +512,11 @@ mod tests {
 	fn pubkey_knows_key_waits_before_exit_delta() {
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 243,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(243),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: PubkeyExtra {
 				next_tx: None,
 				server_knows_key: true,
@@ -492,25 +527,25 @@ mod tests {
 		assert_eq!(decide_action_pubkey(&params), Action::Wait);
 	}
 
-	/// When the server knows the key and the exit delta has passed, it claims
-	/// with no deadline (it owns the key directly, no competing expiry).
+	/// When the server knows the key and the exit delta has passed, the vtxo
+	/// is swept: the server owns the key directly, so nobody competes for it.
 	#[test]
-	fn pubkey_knows_key_claims_at_exit_delta() {
+	fn pubkey_knows_key_sweeps_at_exit_delta() {
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 244,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(244),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: PubkeyExtra {
 				next_tx: None,
 				server_knows_key: true,
 			},
 		};
 		// after_exit_delta = 100 + 144 = 244, chain_tip >= after_exit_delta
-		// deadline is None: server owns the key directly, no competing expiry
-		assert_eq!(decide_action_pubkey(&params), Action::Claim { deadline: None });
+		// no deadline: server owns the key directly, no competing expiry
+		assert_eq!(decide_action_pubkey(&params), Action::Sweep);
 	}
 
 	/// When the server still holds the ephemeral key (e.g. for a pool vtxo)
@@ -522,17 +557,17 @@ mod tests {
 		let txid = Txid::from_byte_array([1; 32]);
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 244,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(244),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: PubkeyExtra {
 				next_tx: Some(ProgressSpec { next_txid: txid, is_signed: true }),
 				server_knows_key: true,
 			},
 		};
-		assert_eq!(decide_action_pubkey(&params), Action::Progress { txid, deadline: Some(244) });
+		assert_eq!(decide_action_pubkey(&params), Action::Progress { txid, deadline: BlockHeight::new(244) });
 	}
 
 	/// If the next tx exists but is not signed, wait for the signature
@@ -543,11 +578,11 @@ mod tests {
 		let txid = Txid::from_byte_array([1; 32]);
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 300,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(300),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: PubkeyExtra {
 				next_tx: Some(ProgressSpec { next_txid: txid, is_signed: false }),
 				server_knows_key: true,
@@ -564,18 +599,18 @@ mod tests {
 		let txid = Txid::from_byte_array([2; 32]);
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 900,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(900),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: PubkeyExtra {
 				next_tx: Some(ProgressSpec { next_txid: txid, is_signed: true }),
 				server_knows_key: true,
 			},
 		};
 		// after_exit_delta = 244; tip is at 900, well past it. Still progress.
-		assert_eq!(decide_action_pubkey(&params), Action::Progress { txid, deadline: Some(244) });
+		assert_eq!(decide_action_pubkey(&params), Action::Progress { txid, deadline: BlockHeight::new(244) });
 	}
 
 	/// Even when the server doesn't know the key, a signed `next_tx` whose
@@ -586,17 +621,17 @@ mod tests {
 		let txid = Txid::from_byte_array([3; 32]);
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 500,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(500),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: PubkeyExtra {
 				next_tx: Some(ProgressSpec { next_txid: txid, is_signed: true }),
 				server_knows_key: false,
 			},
 		};
-		assert_eq!(decide_action_pubkey(&params), Action::Progress { txid, deadline: Some(244) });
+		assert_eq!(decide_action_pubkey(&params), Action::Progress { txid, deadline: BlockHeight::new(244) });
 	}
 
 	/// When the server holds the key and a signed `next_tx` is available
@@ -607,11 +642,11 @@ mod tests {
 		let txid = Txid::from_byte_array([4; 32]);
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 105,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(105),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: PubkeyExtra {
 				next_tx: Some(ProgressSpec { next_txid: txid, is_signed: true }),
 				server_knows_key: true,
@@ -628,17 +663,17 @@ mod tests {
 		let txid = Txid::from_byte_array([5; 32]);
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 100,
+			chain_tip_height: BlockHeight::new(100),
 			progress_grace_period: None,
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: PubkeyExtra {
 				next_tx: Some(ProgressSpec { next_txid: txid, is_signed: true }),
 				server_knows_key: true,
 			},
 		};
-		assert_eq!(decide_action_pubkey(&params), Action::Progress { txid, deadline: Some(244) });
+		assert_eq!(decide_action_pubkey(&params), Action::Progress { txid, deadline: BlockHeight::new(244) });
 	}
 
 	/// A signed checkpoint tx is broadcast once the grace period passes,
@@ -648,18 +683,18 @@ mod tests {
 		let txid = Txid::from_byte_array([1; 32]);
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 106,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(106),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: PubkeyExtra {
 				next_tx: Some(ProgressSpec { next_txid: txid, is_signed: true }),
 				server_knows_key: false,
 			},
 		};
 		// deadline = confirmed_at + exit_delta = 100 + 144 = 244
-		assert_eq!(decide_action_pubkey(&params), Action::Progress { txid, deadline: Some(244) });
+		assert_eq!(decide_action_pubkey(&params), Action::Progress { txid, deadline: BlockHeight::new(244) });
 	}
 
 	/// Server waits for the safety margin before broadcasting progress,
@@ -669,14 +704,14 @@ mod tests {
 		let txid = Txid::from_byte_array([1; 32]);
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 105,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(105),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: HtlcSendExtra {
 				next_tx: Some(ProgressSpec { next_txid: txid, is_signed: true }),
-				htlc_expiry: 500,
+				htlc_expiry: BlockHeight::new(500),
 				has_preimage: false,
 			},
 		};
@@ -690,19 +725,19 @@ mod tests {
 		let txid = Txid::from_byte_array([1; 32]);
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 106,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(106),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: HtlcSendExtra {
 				next_tx: Some(ProgressSpec { next_txid: txid, is_signed: true }),
-				htlc_expiry: 500,
+				htlc_expiry: BlockHeight::new(500),
 				has_preimage: false,
 			},
 		};
 		// deadline = min(htlc_expiry, confirmed_at + 2*exit_delta) = min(500, 100 + 288) = 388
-		assert_eq!(decide_action_server_htlc_send(&params), Action::Progress { txid, deadline: Some(388) });
+		assert_eq!(decide_action_server_htlc_send(&params), Action::Progress { txid, deadline: BlockHeight::new(388) });
 	}
 
 	/// Server has the preimage but must wait until the claim height
@@ -711,14 +746,14 @@ mod tests {
 	fn htlc_send_waits_with_preimage_before_claim_height() {
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 243,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(243),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: HtlcSendExtra {
 				next_tx: None,
-				htlc_expiry: 500,
+				htlc_expiry: BlockHeight::new(500),
 				has_preimage: true,
 			},
 		};
@@ -732,20 +767,20 @@ mod tests {
 	fn htlc_send_claims_with_preimage_at_claim_height() {
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 244,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(244),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: HtlcSendExtra {
 				next_tx: None,
-				htlc_expiry: 500,
+				htlc_expiry: BlockHeight::new(500),
 				has_preimage: true,
 			},
 		};
 		// claim_height = 100 + 144 = 244, chain_tip >= claim_height
 		// deadline = min(500, 100 + 288) = 388
-		assert_eq!(decide_action_server_htlc_send(&params), Action::Claim { deadline: Some(388) });
+		assert_eq!(decide_action_server_htlc_send(&params), Action::Claim { deadline: BlockHeight::new(388) });
 	}
 
 	/// Without a preimage or progress tx, the server can only wait.
@@ -753,14 +788,14 @@ mod tests {
 	fn htlc_send_waits_without_preimage_and_progress() {
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 300,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(300),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: HtlcSendExtra {
 				next_tx: None,
-				htlc_expiry: 500,
+				htlc_expiry: BlockHeight::new(500),
 				has_preimage: false,
 			},
 		};
@@ -773,15 +808,15 @@ mod tests {
 		let txid = Txid::from_byte_array([1; 32]);
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 105,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(105),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: HtlcRecvExtra {
 				next_tx: Some(ProgressSpec { next_txid: txid, is_signed: true }),
-				htlc_expiry: 500,
-				htlc_expiry_delta: 40,
+				htlc_expiry: BlockHeight::new(500),
+				htlc_expiry_delta: BlockDelta::new(40),
 			},
 		};
 		assert_eq!(decide_action_server_htlc_recv(&params), Action::Wait);
@@ -794,21 +829,21 @@ mod tests {
 		let txid = Txid::from_byte_array([1; 32]);
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 106,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(106),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: HtlcRecvExtra {
 				next_tx: Some(ProgressSpec { next_txid: txid, is_signed: true }),
-				htlc_expiry: 500,
-				htlc_expiry_delta: 40,
+				htlc_expiry: BlockHeight::new(500),
+				htlc_expiry_delta: BlockDelta::new(40),
 			},
 		};
 		// deadline = confirmed_at + htlc_expiry_delta + exit_delta = 100 + 40 + 144 = 284
 		assert_eq!(
 			decide_action_server_htlc_recv(&params),
-			Action::Progress { txid, deadline: Some(284) },
+			Action::Progress { txid, deadline: BlockHeight::new(284) },
 		);
 	}
 
@@ -818,15 +853,15 @@ mod tests {
 	fn htlc_recv_waits_before_claim_height() {
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 499,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(499),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: HtlcRecvExtra {
 				next_tx: None,
-				htlc_expiry: 500,
-				htlc_expiry_delta: 40,
+				htlc_expiry: BlockHeight::new(500),
+				htlc_expiry_delta: BlockDelta::new(40),
 			},
 		};
 		// claim_height = max(500, 100 + 144) = max(500, 244) = 500
@@ -839,19 +874,78 @@ mod tests {
 	fn htlc_recv_claims_at_claim_height() {
 		let params = ActionParams {
 			vtxo_id: test_vtxo_id(),
-			chain_tip_height: 500,
-			progress_grace_period: Some(6),
-			expiry_height: 1000,
-			exit_delta: 144,
-			confirmed_at: 100,
+			chain_tip_height: BlockHeight::new(500),
+			progress_grace_period: Some(BlockDelta::new(6)),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(144),
+			confirmed_at: BlockHeight::new(100),
 			policy_extras: HtlcRecvExtra {
 				next_tx: None,
-				htlc_expiry: 500,
-				htlc_expiry_delta: 40,
+				htlc_expiry: BlockHeight::new(500),
+				htlc_expiry_delta: BlockDelta::new(40),
 			},
 		};
 		// claim_height = max(500, 244) = 500, chain_tip >= claim_height
 		// deadline = 100 + 40 + 144 = 284
-		assert_eq!(decide_action_server_htlc_recv(&params), Action::Claim { deadline: Some(284) });
+		assert_eq!(decide_action_server_htlc_recv(&params), Action::Claim { deadline: BlockHeight::new(284) });
+	}
+
+	fn p2tr_spk() -> bitcoin::ScriptBuf {
+		bitcoin::ScriptBuf::from_hex(
+			"51201234123412341234123412341234123412341234123412341234123412341234",
+		).unwrap()
+	}
+
+	fn tx_with_outputs(nb_inputs: usize, outputs: Vec<bitcoin::TxOut>) -> Transaction {
+		Transaction {
+			version: bitcoin::transaction::Version(3),
+			lock_time: bitcoin::absolute::LockTime::ZERO,
+			input: vec![Default::default(); nb_inputs],
+			output: outputs,
+		}
+	}
+
+	/// A tx with a sub-dust P2TR output and a sub-660-sat input is ignorable.
+	#[test]
+	fn ignorable_dust_sub_dust_output_small_input() {
+		let tx = tx_with_outputs(1, vec![
+			bitcoin::TxOut { value: Amount::from_sat(308), script_pubkey: p2tr_spk() },
+			bitcoin::TxOut { value: Amount::from_sat(340), script_pubkey: p2tr_spk() },
+			bitcoin_ext::fee::fee_anchor(),
+		]);
+		assert!(is_ignorable_dust(&tx, Amount::from_sat(648)));
+	}
+
+	/// A tx funded by 660 sats or more is never ignored, even with a
+	/// sub-dust output.
+	#[test]
+	fn ignorable_dust_input_at_threshold_kept() {
+		let tx = tx_with_outputs(1, vec![
+			bitcoin::TxOut { value: Amount::from_sat(308), script_pubkey: p2tr_spk() },
+			bitcoin_ext::fee::fee_anchor(),
+		]);
+		assert!(!is_ignorable_dust(&tx, Amount::from_sat(660)));
+	}
+
+	/// A 330-sat P2TR output is not dust and the 0-value anchor is exempt
+	/// from the dust check, so the tx can be relayed and is never ignored.
+	#[test]
+	fn ignorable_dust_relayable_tx_kept() {
+		let tx = tx_with_outputs(1, vec![
+			bitcoin::TxOut { value: Amount::from_sat(330), script_pubkey: p2tr_spk() },
+			bitcoin_ext::fee::fee_anchor(),
+		]);
+		assert!(!is_ignorable_dust(&tx, Amount::from_sat(648)));
+	}
+
+	/// With more than one input the vtxo amount doesn't bound the total
+	/// input value, so the tx is never ignored.
+	#[test]
+	fn ignorable_dust_multi_input_kept() {
+		let tx = tx_with_outputs(2, vec![
+			bitcoin::TxOut { value: Amount::from_sat(308), script_pubkey: p2tr_spk() },
+			bitcoin_ext::fee::fee_anchor(),
+		]);
+		assert!(!is_ignorable_dust(&tx, Amount::from_sat(648)));
 	}
 }

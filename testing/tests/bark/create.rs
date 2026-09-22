@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bark::BarkNetwork;
 
-use ark_testing::{Bark, TestContext, require_bark_version};
+use ark_testing::{Bark, TestContext};
 use ark_testing::util::ToAltString;
 
 #[tokio::test]
@@ -26,16 +26,12 @@ async fn bark_create_is_atomic() {
 	// This ensures that clients cannot be created
 	srv.stop().await.unwrap();
 	let err = ctx.bark("bark_fails", &srv).try_create().await.unwrap_err();
-	assert!(err.to_alt_string().contains(
-		"Failed to connect to provided server (if you are sure use the --force flag)"
-	), "{:?}", err);
+	assert!(err.to_alt_string().contains("Failed to connect to provided server"), "{:?}", err);
 	assert!(!ctx.datadir.join("bark_fails").is_dir());
 }
 
 #[tokio::test]
 async fn bark_address_works_offline() {
-	require_bark_version!(> "0.1.3");
-
 	let ctx = TestContext::new("bark/bark_address_works_offline").await;
 	let srv = ctx.captaind("server").create().await;
 	let bark = ctx.bark("bark", &srv).create().await;

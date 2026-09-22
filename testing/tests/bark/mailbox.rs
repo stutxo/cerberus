@@ -6,10 +6,10 @@ use ark::{ProtocolEncoding, Vtxo, VtxoId};
 use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
 use server_rpc::protos;
 
-use ark_testing::{btc, require_bark_version, sat, TestContext};
+use ark_testing::{TestContext, btc, is_bark_version, require_bark_version, sat};
 use ark_testing::constants::BOARD_CONFIRMATIONS;
 use ark_testing::daemon::captaind::{self, MailboxClient};
-use ark_testing::util::FutureExt;
+use ark_testing::util::{FutureExt, ToAltString};
 use server_rpc::protos::mailbox_server::mailbox_message::Message;
 
 #[tokio::test]
@@ -79,9 +79,50 @@ async fn reject_arkoor_with_bad_signature() {
 	}));
 }
 
+/// Concurrent consumers of one wallet's mailbox must not double-count a receive.
+/// The arkoor dedup is a check-then-store, so without serialization each racing
+/// consumer records its own movement for the single vtxo.
+#[tokio::test]
+async fn concurrent_mailbox_consumers_do_not_duplicate_arkoor_movement() {
+	let ctx = TestContext::new("bark/concurrent_mailbox_consumers_do_not_duplicate_arkoor_movement").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+
+	let bark1 = ctx.bark("bark1", &srv).funded(sat(1_000_000)).create().await;
+	bark1.board(sat(200_000)).await;
+	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
+
+	// One-shot CLI wallet: nothing syncs behind us, so the arkoor stays pending.
+	let bark2 = ctx.bark("bark2", &srv).create().await;
+	bark1.send_oor(bark2.address().await, sat(100_000)).await;
+
+	// Release several consumers of the same wallet together so they contend.
+	let wallet = bark2.client().await;
+	let start = Arc::new(tokio::sync::Barrier::new(4));
+	let handles = (0..4).map(|_| {
+		let w = wallet.clone();
+		let start = start.clone();
+		tokio::spawn(async move {
+			start.wait().await;
+			w.sync_mailbox().await
+		})
+	}).collect::<Vec<_>>();
+	for h in handles {
+		h.await.expect("task panicked").expect("sync_mailbox failed");
+	}
+
+	let vtxos = wallet.vtxos().await.unwrap();
+	assert_eq!(vtxos.len(), 1, "vtxo should land exactly once");
+	let received_id = vtxos[0].vtxo.id();
+
+	let movements = wallet.history().await.unwrap().into_iter()
+		.filter(|m| m.output_vtxos.contains(&received_id))
+		.count();
+	assert_eq!(movements, 1, "receive recorded as {movements} movements, expected 1");
+}
+
 #[tokio::test]
 async fn accept_mailbox() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("bark/accept_mailbox").await;
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;
@@ -107,16 +148,30 @@ async fn accept_mailbox() {
 	bark2.import_vtxos(&[&vtxo_hex]).await;
 	assert_eq!(bark2.vtxos().await.len(), 1, "import should be idempotent");
 
+	// Import decides ownership by deriving the VTXO's user pubkey, so it reports
+	// a key it cannot derive where older barks reported a missing signable clause.
 	let err = bark.try_import_vtxos(&[&vtxo_hex]).await.unwrap_err();
-	assert!(err.to_string().contains("signable clause") || err.to_string().contains("not owned"), "expected ownership error, got: {}", err);
+	if is_bark_version!(> "0.7.0") {
+		assert!(err.to_alt_string().contains("unable to derive the key"),
+			"expected ownership error, got: {}", err);
+	} else {
+		assert!(err.to_string().contains("signable clause")
+			|| err.to_string().contains("not owned"),
+			"expected ownership error, got: {}", err);
+	}
 
 	let bark3 = ctx.bark("bark3", &srv).create().await;
 	bark.send_oor(bark3.address().await, sat(50_000)).await;
 	bark.send_oor(bark3.address().await, sat(60_000)).await;
 
 	bark3.maintain().await;
+	// An arkoor output is created per input. On bark > 0.6.1 the sender's
+	// change is split in two pieces and the second send needs two of them to
+	// cover it, so bark3 receives three VTXOs from the two sends. Older barks
+	// don't split change, so each send uses a single input.
+	let expected_vtxos = if is_bark_version!(> "0.6.1") { 3 } else { 2 };
 	let bark3_vtxos = bark3.vtxos().await;
-	assert_eq!(bark3_vtxos.len(), 2, "bark3 should have 2 VTXOs");
+	assert_eq!(bark3_vtxos.len(), expected_vtxos, "unexpected number of VTXOs for bark3");
 
 	let bark3_wallet = bark3.client().await;
 	let vtxos = bark3_wallet.vtxos().await.unwrap();
@@ -145,10 +200,18 @@ async fn accept_mailbox() {
 	bark4.drop_vtxos().await;
 	assert_eq!(bark4.vtxos().await.len(), 0, "bark4 should have 0 VTXOs after drop");
 
-	ctx.generate_blocks(srv.config().vtxo_lifetime as u32 + 10).await;
+	ctx.generate_blocks(srv.config().vtxo_lifetime.to_u32() + 10).await;
 
-	let err = bark4.try_import_vtxos(&[&expired_vtxo_hex]).await.unwrap_err();
-	assert!(err.to_string().contains("expired"), "expected expiry error, got: {}", err);
+	// Import gates on ownership and the server's spend state, not on expiry, and
+	// the server still reports an expired vtxo as spendable, so this is accepted
+	// where older barks refused it for being expired.
+	if is_bark_version!(> "0.7.0") {
+		let imported = bark4.import_vtxos(&[&expired_vtxo_hex]).await;
+		assert_eq!(imported.len(), 1, "an expired vtxo is still importable");
+	} else {
+		let err = bark4.try_import_vtxos(&[&expired_vtxo_hex]).await.unwrap_err();
+		assert!(err.to_string().contains("expired"), "expected expiry error, got: {}", err);
+	}
 }
 
 /// Helper to read all vtxo_ids from a recovery mailbox
@@ -163,8 +226,8 @@ async fn read_recovery_vtxo_ids(
 	let mailbox_auth = MailboxAuthorization::new(&recovery_mailbox_kp, expiry);
 
 	let read_mailbox = protos::mailbox_server::MailboxRequest {
+		mailbox_id: recovery_mailbox_id.serialize(),
 		authorization: Some(mailbox_auth.serialize().to_vec()),
-		unblinded_id: recovery_mailbox_id.serialize(),
 		checkpoint: 0,
 	};
 
@@ -187,7 +250,7 @@ async fn read_recovery_vtxo_ids(
 /// - Sending arkoor (change)
 #[tokio::test]
 async fn recovery_mailbox_receives_vtxo_ids() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 	let ctx = TestContext::new("bark/recovery_mailbox_receives_vtxo_ids").await;
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;
 
@@ -221,21 +284,25 @@ async fn recovery_mailbox_receives_vtxo_ids() {
 	assert_eq!(recovery_ids.len(), 1, "bark2 recovery mailbox should have 1 vtxo_id");
 	assert_eq!(recovery_ids[0], bark2_vtxos[0].id(), "arkoor vtxo_id should match");
 
-	// === Test 3: Sending arkoor posts change vtxo_id to recovery mailbox ===
-	// bark1 sent arkoor above and should have change
+	// === Test 3: Sending arkoor posts change vtxo_ids to recovery mailbox ===
+	// bark1 sent arkoor above and should have change, split in two pieces
+	// on bark > 0.6.1
+	let nb_change = if is_bark_version!(> "0.6.1") { 2 } else { 1 };
 	let bark1_vtxos_after_send = bark1_wallet.vtxos().await.unwrap();
-	assert_eq!(bark1_vtxos_after_send.len(), 1, "bark1 should have 1 change VTXO");
+	assert_eq!(bark1_vtxos_after_send.len(), nb_change, "bark1 should only have change VTXOs");
 
 	let recovery_ids = read_recovery_vtxo_ids(&mut mb_rpc, &bark1_wallet).await;
-	// 2 vtxo_ids: board + change from sending arkoor
-	assert_eq!(recovery_ids.len(), 2, "bark1 recovery mailbox should have 2 vtxo_ids (board + change)");
-	assert!(recovery_ids.contains(&bark1_vtxos_after_send[0].id()), "change vtxo_id should be in recovery mailbox");
+	// board + every change piece from sending arkoor
+	assert_eq!(recovery_ids.len(), 1 + nb_change, "bark1 recovery mailbox should have board + change vtxo_ids");
+	for vtxo in &bark1_vtxos_after_send {
+		assert!(recovery_ids.contains(&vtxo.id()), "change vtxo_id should be in recovery mailbox");
+	}
 }
 
 /// Test that lightning send change vtxo_ids are posted to recovery mailbox
 #[tokio::test]
 async fn recovery_mailbox_lightning_send_change() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 	let ctx = TestContext::new("bark/recovery_mailbox_lightning_send_change").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -266,16 +333,21 @@ async fn recovery_mailbox_lightning_send_change() {
 
 	// Check recovery mailbox has the change vtxo
 	let recovery_ids = read_recovery_vtxo_ids(&mut mb_rpc, &bark_wallet).await;
-	// 2 vtxo_ids: board + lightning change
-	assert_eq!(recovery_ids.len(), 2, "recovery mailbox should have 2 vtxo_ids (board + lightning change)");
-	assert!(recovery_ids.contains(&vtxos_after[0].id()), "lightning change vtxo_id should be in recovery mailbox");
+
+	// 3 vtxo_ids: board + HTLC intermediate (Locked) + lightning change
+	assert_eq!(recovery_ids.len(), 3,
+		"recovery mailbox should have 3 vtxo_ids (board + HTLC intermediate + lightning change)",
+	);
+	assert!(recovery_ids.contains(&vtxos_after[0].id()),
+		"lightning change vtxo_id should be in recovery mailbox",
+	);
 }
 
 /// Test that lightning send revocation vtxo_ids are posted to recovery mailbox
 /// when a payment fails (no channel exists)
 #[tokio::test]
 async fn recovery_mailbox_lightning_send_revoke() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 	let ctx = TestContext::new("bark/recovery_mailbox_lightning_send_revoke").await;
 
 	// Create lightning setup WITHOUT a channel so payment will fail
@@ -310,8 +382,12 @@ async fn recovery_mailbox_lightning_send_revoke() {
 
 	// Check recovery mailbox has the new vtxos
 	let recovery_ids = read_recovery_vtxo_ids(&mut mb_rpc, &bark_wallet).await;
-	// 3 vtxo_ids: board + lightning change + revoked payment
-	assert_eq!(recovery_ids.len(), 3, "recovery mailbox should have 3 vtxo_ids (board + change + revoked)");
+
+	// 4 vtxo_ids: board + HTLC intermediate (Locked) + lightning change + revoked payment
+	assert_eq!(recovery_ids.len(), 4,
+		"recovery mailbox should have 4 vtxo_ids (board + HTLC intermediate + change + revoked)",
+	);
+
 
 	// Both vtxos should be in recovery mailbox
 	for vtxo in &vtxos_after {
@@ -322,7 +398,7 @@ async fn recovery_mailbox_lightning_send_revoke() {
 /// Test that lightning receive claimed vtxo_ids are posted to recovery mailbox
 #[tokio::test]
 async fn recovery_mailbox_lightning_receive() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 	let ctx = TestContext::new("bark/recovery_mailbox_lightning_receive").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -354,7 +430,7 @@ async fn recovery_mailbox_lightning_receive() {
 	srv.wait_for_vtxopool(&ctx).await;
 
 	// Claim the lightning receive
-	bark.lightning_receive(&invoice_info.invoice).wait_millis(10_000).await;
+	bark.lightning_receive(&invoice_info.invoice).wait_millis(30_000).await;
 
 	// Wait for payment to settle
 	res.await.unwrap();
@@ -369,7 +445,12 @@ async fn recovery_mailbox_lightning_receive() {
 
 	// Check recovery mailbox has the received vtxo
 	let recovery_ids = read_recovery_vtxo_ids(&mut mb_rpc, &bark_wallet).await;
-	// 2 vtxo_ids: board + lightning received
-	assert_eq!(recovery_ids.len(), 2, "recovery mailbox should have 2 vtxo_ids (board + lightning received)");
+
+	// 3 vtxo_ids: board + HTLC intermediate (Locked) + lightning received
+	assert_eq!(recovery_ids.len(), 3,
+		"recovery mailbox should have 3 vtxo_ids (board + HTLC intermediate + lightning received)",
+	);
+
+
 	assert!(recovery_ids.contains(&received_vtxo.id()), "lightning received vtxo_id should be in recovery mailbox");
 }

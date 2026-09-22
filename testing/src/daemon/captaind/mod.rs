@@ -21,19 +21,46 @@ use server_rpc::{self as rpc, protos};
 pub use server::config::{self, Config};
 
 use crate::daemon::captaind::proxy::{ArkRpcProxy, ArkRpcProxyServer, MailboxRpcProxy};
-use crate::{secs, Bitcoind, Daemon, DaemonHelper, TestContext};
+use crate::daemon::watchmand::Watchmand;
+use crate::{Bitcoind, Daemon, DaemonHelper, TestContext};
 use crate::daemon::{DaemonState, LogHandler, STDOUT_LOGFILE};
-use crate::constants::env::CAPTAIND_EXEC;
-use crate::util::resolve_path;
+use crate::constants::env::{CAPTAIND_EXEC, OLD_CAPTAIND_EXEC};
+use crate::ports::pick_port;
+use crate::util::{poll_interval, resolve_path};
 
 pub type Captaind = Daemon<CaptaindHelper>;
 
-pub type ArkClient = rpc::ArkServiceClient<tonic::transport::Channel>;
+/// Interceptor that stamps the protocol-version header on every RPC the test
+/// harness makes through an [ArkClient].
+///
+/// Real bark clients attach this header via their own interceptor once the
+/// handshake has negotiated a version. We need this for certain RPCs like
+/// when we claim a lightning receive.
+type PverInterceptor = fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>;
+
+fn inject_pver(mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+	rpc::RequestExt::set_pver(&mut req, rpc::MAX_PROTOCOL_VERSION);
+	Ok(req)
+}
+
+/// Connect an [ArkClient] to `url` with the [inject_pver] interceptor attached.
+async fn connect_ark_client(url: &str) -> anyhow::Result<ArkClient> {
+	let channel = tonic::transport::Endpoint::from_shared(url.to_owned())
+		.context("invalid ark url")?
+		.connect().await
+		.context("connecting ark rpc")?;
+	Ok(rpc::ArkServiceClient::with_interceptor(channel, inject_pver as PverInterceptor))
+}
+
+pub type ArkClient = rpc::ArkServiceClient<
+	tonic::service::interceptor::InterceptedService<tonic::transport::Channel, PverInterceptor>,
+>;
 pub type MailboxClient = rpc::mailbox::MailboxServiceClient<tonic::transport::Channel>;
 pub type WalletAdminClient = rpc::admin::WalletAdminServiceClient<tonic::transport::Channel>;
 pub type RoundAdminClient = rpc::admin::RoundAdminServiceClient<tonic::transport::Channel>;
 pub type SweepAdminClient = rpc::admin::SweepAdminServiceClient<tonic::transport::Channel>;
 pub type BanAdminClient = rpc::admin::BanAdminServiceClient<tonic::transport::Channel>;
+pub type NurseryAdminClient = rpc::admin::NurseryAdminServiceClient<tonic::transport::Channel>;
 pub type HealthClient = tonic_health::pb::health_client::HealthClient<tonic::transport::Channel>;
 
 
@@ -58,13 +85,11 @@ where
 #[derive(Debug, Clone)]
 pub struct WalletStatuses {
 	pub rounds: rpc::WalletStatus,
-	pub watchman: Option<rpc::WalletStatus>,
 }
 
 impl WalletStatuses {
 	pub fn total(&self) -> Amount {
-		let watchman = self.watchman.as_ref().map_or(Amount::ZERO, |w| w.total_balance);
-		self.rounds.total_balance + watchman
+		self.rounds.total_balance
 	}
 }
 
@@ -106,6 +131,12 @@ pub struct CaptaindHelper {
 	bitcoind: Arc<Bitcoind>,
 	slog_handler_tx: parking_lot::Mutex<Option<mpsc::Sender<Box<dyn SlogHandler>>>>,
 	state: Arc<parking_lot::Mutex<State>>,
+	/// The watchmand process accompanying this captaind,
+	/// attached by the builder right after startup.
+	watchmand: std::sync::OnceLock<Watchmand>,
+	/// Path to the captaind binary to run. When None, the
+	/// CAPTAIND_EXEC env var is used.
+	exec: parking_lot::Mutex<Option<PathBuf>>,
 }
 
 impl Captaind {
@@ -144,6 +175,14 @@ impl Captaind {
 		Command::new(exec)
 	}
 
+	/// The path to a previous captaind release binary, from the
+	/// OLD_CAPTAIND_EXEC env var. Used by the server-migrations tests
+	/// to start a server on the old version and upgrade it mid-test.
+	pub fn old_exec() -> PathBuf {
+		let e = env::var(OLD_CAPTAIND_EXEC).expect("OLD_CAPTAIND_EXEC env not set");
+		resolve_path(e).expect("failed to resolve OLD_CAPTAIND_EXEC")
+	}
+
 	/// Creates server with a bitcoind daemon.
 	pub fn new(name: impl AsRef<str>, bitcoind: Arc<Bitcoind>, cfg: Config) -> Self {
 		let helper = CaptaindHelper {
@@ -152,9 +191,18 @@ impl Captaind {
 			bitcoind,
 			slog_handler_tx: parking_lot::Mutex::new(None),
 			state: Arc::new(parking_lot::Mutex::new(State::default())),
+			watchmand: std::sync::OnceLock::new(),
+			exec: parking_lot::Mutex::new(None),
 		};
 
 		Daemon::wrap(helper)
+	}
+
+	/// Override the captaind binary this instance runs, e.g. an old
+	/// release from [Captaind::old_exec]. Takes effect on the next
+	/// (re)start; pass None to return to the CAPTAIND_EXEC binary.
+	pub fn set_exec(&self, exec: Option<PathBuf>) {
+		*self.inner.exec.lock() = exec;
 	}
 
 	pub async fn get_custom_command(&self, args: &[&str]) -> anyhow::Result<Command> {
@@ -188,8 +236,12 @@ impl Captaind {
 		self.inner.ark_url()
 	}
 
+	pub fn integration_url(&self) -> String {
+		self.inner.integration_url()
+	}
+
 	pub async fn get_public_rpc(&self) -> ArkClient {
-		ArkClient::connect(self.ark_url()).await.expect("can't connect server public rpc")
+		connect_ark_client(&self.ark_url()).await.expect("can't connect server public rpc")
 	}
 
 	pub async fn get_mailbox_public_rpc(&self) -> MailboxClient {
@@ -216,12 +268,32 @@ impl Captaind {
 		RoundAdminClient::connect(self.inner.admin_url()).await.expect("can't connect server wallet rpc")
 	}
 
-	pub async fn get_sweep_rpc(&self) -> SweepAdminClient {
-		SweepAdminClient::connect(self.inner.admin_url()).await.expect("can't connect server wallet rpc")
-	}
-
 	pub async fn get_ban_rpc(&self) -> BanAdminClient {
 		BanAdminClient::connect(self.inner.admin_url()).await.expect("can't connect server ban rpc")
+	}
+
+	pub async fn get_nursery_rpc(&self) -> NurseryAdminClient {
+		NurseryAdminClient::connect(self.inner.admin_url()).await
+			.expect("can't connect server nursery rpc")
+	}
+
+	pub async fn abandon(&self, txid: bitcoin::Txid) -> Result<(), tonic::Status> {
+		self.get_nursery_rpc().await
+			.abandon(protos::AbandonRequest {
+				txid: txid.to_string(),
+			}).await.map(|_| ())
+	}
+
+	pub async fn list_nursery_txs(
+		&self,
+		include_confirmed: bool,
+		include_abandoned: bool,
+	) -> Vec<protos::NurseryTxInfo> {
+		self.get_nursery_rpc().await
+			.list_nursery_txs(protos::ListNurseryTxsRequest {
+				include_confirmed, include_abandoned,
+			}).await.expect("list_nursery_txs rpc failed")
+			.into_inner().txs
 	}
 
 	pub async fn ban_vtxo(&self, vtxo_id: ark::VtxoId, ban_blocks: u32) {
@@ -265,7 +337,6 @@ impl Captaind {
 		let res = rpc.wallet_status(protos::Empty{}).await.expect("wallet status error").into_inner();
 		WalletStatuses {
 			rounds: res.rounds.unwrap().try_into().unwrap(),
-			watchman: res.watchman.map(|w| w.try_into().unwrap()),
 		}
 	}
 
@@ -278,13 +349,22 @@ impl Captaind {
 
 	pub async fn trigger_round(&self) {
 		self.bitcoind().generate(1).await;
-		let height = self.bitcoind().get_block_count().await as BlockHeight;
+		let height = BlockHeight::new(self.bitcoind().get_block_count().await as u32);
 		self.wait_for_sync_height(height).await;
 		self.get_round_rpc().await.trigger_round(protos::Empty {}).await.unwrap();
 	}
 
-	pub async fn trigger_sweep(&self) {
-		self.get_sweep_rpc().await.trigger_sweep(protos::Empty {}).await.unwrap();
+	/// The watchmand process accompanying this captaind.
+	pub fn watchmand(&self) -> &Watchmand {
+		self.inner.watchmand.get()
+			.expect("no watchmand attached to this captaind; enable it with CaptaindBuilder::watchmand")
+	}
+
+	/// Attach the watchmand process accompanying this captaind.
+	pub fn attach_watchmand(&self, watchmand: Watchmand) {
+		if self.inner.watchmand.set(watchmand).is_err() {
+			panic!("this captaind already has a watchmand attached");
+		}
 	}
 
 	pub fn add_slog_handler<L: SlogHandler>(&self, handler: L) {
@@ -356,7 +436,45 @@ impl Captaind {
 				ctx.await_transaction(txid).await;
 				return;
 			}
-			tokio::time::sleep(secs(1)).await;
+			tokio::time::sleep(poll_interval()).await;
+		}
+	}
+
+	/// Snapshot the current vtxopool issuance txid (if any).
+	///
+	/// Callers wanting to wait for a fresh issuance should capture the baseline
+	/// with this helper before triggering the issuance, then pass it to
+	/// [`wait_for_vtxopool_issuance_after`]. Sampling only after the trigger
+	/// races the issuance path, which since the chain-tip rewire can complete
+	/// before the waiter reads the state.
+	pub fn vtxopool_last_issuance(&self) -> Option<Txid> {
+		match self.inner.state.lock().vtxopool_state {
+			VtxoPoolState::Ready(txid) => Some(txid),
+			VtxoPoolState::NotReady => None,
+		}
+	}
+
+	/// Wait for a vtxopool issuance more recent than `last`.
+	///
+	/// Pool issuance runs off chain-tip changes, so tests that drain the pool
+	/// between blocks must generate a block and wait for the resulting refill
+	/// before continuing.
+	pub async fn wait_for_vtxopool_issuance_after(
+		&self,
+		ctx: &TestContext,
+		last: Option<Txid>,
+	) {
+		info!("Waiting for next VtxoPool issuance (last: {:?})...", last);
+		loop {
+			let vtxopool_state = self.inner.state.lock().vtxopool_state.clone();
+			if let VtxoPoolState::Ready(txid) = vtxopool_state {
+				if Some(txid) != last {
+					info!("VtxoPool issued: waiting for tx {} propagation", txid);
+					ctx.await_transaction(txid).await;
+					return;
+				}
+			}
+			tokio::time::sleep(poll_interval()).await;
 		}
 	}
 
@@ -378,7 +496,7 @@ impl Captaind {
 					return;
 				}
 			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
+			tokio::time::sleep(poll_interval()).await;
 		}
 	}
 }
@@ -396,7 +514,7 @@ impl DaemonHelper for CaptaindHelper {
 	async fn get_command(&self) -> anyhow::Result<Command> {
 		let config_file = self.get_config_file().await;
 
-		let mut cmd = Captaind::base_cmd();
+		let mut cmd = self.cmd();
 		let args = vec![
 			"start",
 			"--config",
@@ -409,9 +527,9 @@ impl DaemonHelper for CaptaindHelper {
 	}
 
 	async fn make_reservations(&self) -> anyhow::Result<()> {
-		let public_port = portpicker::pick_unused_port().expect("No ports free");
-		let admin_port = portpicker::pick_unused_port().expect("No ports free");
-		let integration_port = portpicker::pick_unused_port().expect("No ports free");
+		let public_port = pick_port();
+		let admin_port = pick_port();
+		let integration_port = pick_port();
 
 		let public_address = format!("0.0.0.0:{}", public_port);
 		let admin_address = format!("127.0.0.1:{}", admin_port);
@@ -422,6 +540,7 @@ impl DaemonHelper for CaptaindHelper {
 
 		self.cfg.lock().rpc = config::Rpc {
 			public_address: SocketAddr::from_str(public_address.as_str())?,
+			max_pending_accept_reset_streams: None,
 			admin_address: Some(SocketAddr::from_str(admin_address.as_str())?),
 			integration_address: Some(SocketAddr::from_str(integration_address.as_str())?),
 		};
@@ -456,7 +575,7 @@ impl DaemonHelper for CaptaindHelper {
 
 	async fn wait_for_init(&self) -> anyhow::Result<()> {
 		while !self.is_ready().await {
-			tokio::time::sleep(Duration::from_millis(100)).await;
+			tokio::time::sleep(poll_interval()).await;
 		}
 		Ok(())
 	}
@@ -475,10 +594,19 @@ impl DaemonHelper for CaptaindHelper {
 }
 
 impl CaptaindHelper {
+	/// The command for this instance's binary: the per-instance exec
+	/// override when set, the CAPTAIND_EXEC binary otherwise.
+	fn cmd(&self) -> Command {
+		match self.exec.lock().as_ref() {
+			Some(exec) => Command::new(exec),
+			None => Captaind::base_cmd(),
+		}
+	}
+
 	async fn get_custom_command(&self, args: &[&str]) -> anyhow::Result<Command> {
 		let config_file = self.get_config_file().await;
 
-		let mut cmd = Captaind::base_cmd();
+		let mut cmd = self.cmd();
 		let mut new_args = args.to_vec();
 		new_args.push("--config");
 		new_args.push(config_file.to_str().unwrap());
@@ -490,8 +618,11 @@ impl CaptaindHelper {
 	}
 
 	async fn try_is_ready(&self) -> anyhow::Result<()> {
-		let mut public = ArkClient::connect(self.ark_url()).await.context("public rpc")?;
-		let req = protos::HandshakeRequest { bark_version: None };
+		let mut public = connect_ark_client(&self.ark_url()).await.context("public rpc")?;
+		// Mirror a real bark client so the server classifies as Known.
+		let req = protos::HandshakeRequest {
+			bark_version: Some(rpc::BARK_CRATE_VERSION.to_string()),
+		};
 		let _ = public.handshake(req).await.context("handshake")?;
 
 		let mut wallet = WalletAdminClient::connect(self.admin_url()).await.context("wallet")?;
@@ -521,10 +652,14 @@ impl CaptaindHelper {
 		format!("http://{}", self.cfg.lock().rpc.admin_address.expect("missing admin addr"))
 	}
 
+	pub fn integration_url(&self) -> String {
+		format!("http://{}", self.cfg.lock().rpc.integration_address.expect("missing integration addr"))
+	}
+
 	async fn create(&self) -> anyhow::Result<()> {
 		let config_file = self.get_config_file().await;
 
-		let mut cmd = Captaind::base_cmd();
+		let mut cmd = self.cmd();
 		let args = vec![
 			"create",
 			"--config",
@@ -657,7 +792,7 @@ async fn spawn_slf_pipe(datadir: PathBuf) {
 			match reader.read_line(&mut line).await {
 				Ok(0) => {
 					// EOF or no data yet, wait a bit
-					tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+					tokio::time::sleep(poll_interval()).await;
 				}
 				Ok(_) => {
 					if let Err(e) = stdin.write_all(line.as_bytes()).await {

@@ -1,4 +1,3 @@
-
 use std::env;
 use std::collections::HashSet;
 use std::io::Write;
@@ -16,19 +15,26 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tonic::transport::{Certificate, Channel, channel::ClientTlsConfig, Identity, Uri};
 
+use ark::lightning::PaymentHash;
 use cln_rpc::node_client::NodeClient;
+use cln_rpc::plugins::hold;
 use cln_rpc::plugins::hold::hold_client::HoldClient;
 
 use crate::Bitcoind;
 use crate::constants::bitcoind::{BITCOINRPC_TEST_PASSWORD, BITCOINRPC_TEST_USER};
 use crate::constants::env::{LIGHTNINGD_DOCKER_IMAGE, LIGHTNINGD_EXEC, LIGHTNINGD_PLUGIN_DIR};
 use crate::daemon::{Daemon, DaemonHelper};
-use crate::util::resolve_path;
+use crate::ports::pick_port;
+use crate::util::{poll_interval, resolve_path, FutureExt};
 
 pub type Lightningd = Daemon<LightningDHelper>;
 
 impl Lightningd {
-	pub fn command(config: &LightningdConfig, grpc_port: u16) -> anyhow::Result<Command> {
+	pub fn command(
+		config: &LightningdConfig,
+		grpc_port: u16,
+		container_name: &str,
+	) -> anyhow::Result<Command> {
 		let (docker_exec, docker_image) = Self::docker();
 		let lightningd_exec = Self::exec();
 		if docker_exec.is_some() && docker_image.is_some() {
@@ -38,6 +44,7 @@ impl Lightningd {
 			cmd.args([
 				"run",
 				"--rm",
+				"--name", container_name,
 				"--mount", &format!("type=bind,source={},target=/data/.lightning", &config.lightning_dir.to_string_lossy()),
 				"--mount", &format!("type=bind,source={},target=/data/.bitcoin", &config.bitcoin_dir.to_string_lossy()),
 				"--user", &format!("{}:{}", uid, gid),
@@ -89,6 +96,49 @@ impl Lightningd {
 			_ => false,
 		}
 	}
+
+	/// Human-readable container name prefix derived from the datadir. A
+	/// random suffix is appended so identical datadir paths on a shared
+	/// docker daemon never clash on `--name`.
+	fn container_name_prefix(config: &LightningdConfig) -> String {
+		let sanitized = config.lightning_dir.to_string_lossy()
+			.chars()
+			.map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') { c } else { '-' })
+			.collect::<String>();
+		format!("cln{}", sanitized)
+	}
+
+	/// Force-remove a container by exact name, ignoring failure (e.g. it
+	/// doesn't exist). Sync because it must also run from [Drop].
+	fn remove_container(container_name: &str) {
+		if let (Some(docker_exec), Some(_)) = Self::docker() {
+			let _ = std::process::Command::new(docker_exec)
+				.args(["rm", "-f", container_name])
+				.output();
+		}
+	}
+
+	/// Remove any container still bind-mounting this datadir, left behind by
+	/// a previously killed run (docker only honors `--rm` on graceful
+	/// termination; SIGKILLing the docker client leaves the container
+	/// running). Matched by exact mount source, never by name, so concurrent
+	/// containers of the same test are unaffected. A stale container keeps
+	/// the datadir's PID file locked, which would wedge this startup.
+	fn remove_stale_containers(config: &LightningdConfig) {
+		if let (Some(docker_exec), Some(_)) = Self::docker() {
+			let filter = format!("volume={}", config.lightning_dir.to_string_lossy());
+			let stale = std::process::Command::new(&docker_exec)
+				.args(["ps", "-aq", "--filter", &filter])
+				.output();
+			if let Ok(out) = stale {
+				for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+					let _ = std::process::Command::new(&docker_exec)
+						.args(["rm", "-f", id])
+						.output();
+				}
+			}
+		}
+	}
 }
 
 #[derive(Default)]
@@ -109,6 +159,7 @@ pub struct LightningDHelper {
 	name: String,
 	config: LightningdConfig,
 	bitcoind: Arc<Bitcoind>,
+	container_name: String,
 	state: Arc<Mutex<LightningDHelperState>>
 }
 
@@ -309,9 +360,9 @@ impl DaemonHelper for LightningDHelper {
 	}
 
 	async fn make_reservations(&self) -> anyhow::Result<()> {
-		let grpc_port = portpicker::pick_unused_port().expect("No ports free");
-		let hold_port = portpicker::pick_unused_port().expect("No ports free");
-		let port = portpicker::pick_unused_port().expect("No ports free");
+		let grpc_port = pick_port();
+		let hold_port = pick_port();
+		let port = pick_port();
 
 		trace!("Reserved grpc_port={}, hold_port={} and port={}", grpc_port, hold_port, port);
 		let mut state = self.state.lock().await;
@@ -327,7 +378,7 @@ impl DaemonHelper for LightningDHelper {
 			if self.is_ready().await {
 				return Ok(());
 			}
-			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+			tokio::time::sleep(poll_interval()).await;
 		}
 	}
 
@@ -335,21 +386,34 @@ impl DaemonHelper for LightningDHelper {
 		if !self.config.lightning_dir.exists() {
 			fs::create_dir_all(&self.config.lightning_dir).await?;
 		}
+		Lightningd::remove_stale_containers(&self.config);
 		self.write_config_file().await;
 		Ok(())
 	}
 
 	async fn get_command(&self) -> anyhow::Result<Command> {
-		Lightningd::command(&self.config, self.state.lock().await.grpc_port.unwrap())
+		Lightningd::command(
+			&self.config,
+			self.state.lock().await.grpc_port.unwrap(),
+			&self.container_name,
+		)
+	}
+
+	fn cleanup_external(&self) {
+		Lightningd::remove_container(&self.container_name);
 	}
 }
 
 impl Lightningd {
 	pub fn new(name: impl AsRef<str>, bitcoind: Arc<Bitcoind>, config: LightningdConfig) -> Self {
+		let container_name = format!("{}-{:08x}",
+			Self::container_name_prefix(&config), rand::random::<u32>(),
+		);
 		let inner = LightningDHelper {
 			name: name.as_ref().to_owned(),
 			config,
 			bitcoind,
+			container_name,
 			state: Arc::new(Mutex::new(LightningDHelperState::default()))
 		};
 		Daemon::wrap(inner)
@@ -369,6 +433,37 @@ impl Lightningd {
 
 	pub async fn hold_details(&self) -> GrpcDetails {
 		self.inner.hold_details().await
+	}
+
+	pub async fn try_hold_client(&self) -> anyhow::Result<HoldClient<Channel>> {
+		self.inner.try_hold_client().await
+	}
+
+	pub async fn hold_client(&self) -> HoldClient<Channel> {
+		self.try_hold_client().await.expect("failed to create hold rpc client")
+	}
+
+	/// Wait until this node's hold plugin holds the payment's HTLCs.
+	///
+	/// The invoice turns ACCEPTED only once every HTLC is irrevocably
+	/// committed and handed to the plugin, so it is the signal that the
+	/// receiving side has something to claim. Waiting for it beats sleeping:
+	/// a sleep also passes when the payment never arrived.
+	pub async fn wait_for_hold_invoice_accepted(&self, payment_hash: PaymentHash) {
+		let mut client = self.hold_client().await;
+		async {
+			loop {
+				let invoices = client.list(hold::ListRequest {
+					constraint: Some(hold::list_request::Constraint::PaymentHash(
+						payment_hash.as_ref().to_vec(),
+					)),
+				}).await.expect("list hold invoices").into_inner().invoices;
+				if invoices.first().is_some_and(|i| i.state() == hold::InvoiceState::Accepted) {
+					break;
+				}
+				tokio::time::sleep(poll_interval()).await;
+			}
+		}.wait_millis(30_000).await
 	}
 
 	pub async fn port(&self) -> Option<u16> {
@@ -405,7 +500,7 @@ impl Lightningd {
 		trace!("{} - Wait for block {}", self.name, blockheight);
 		let mut client = self.grpc_client().await;
 		client.wait_block_height(cln_rpc::WaitblockheightRequest {
-			blockheight: blockheight,
+			blockheight: blockheight.to_u32(),
 			timeout: None,
 		}).await.unwrap();
 	}
@@ -417,7 +512,7 @@ impl Lightningd {
 	/// Wait until lightnignd is synced with bitcoind
 	pub async fn wait_for_block_sync(&self) {
 		let height = self.bitcoind().get_block_count().await;
-		self.wait_for_block(height as BlockHeight).await;
+		self.wait_for_block(BlockHeight::new(height as u32)).await;
 	}
 
 	pub async fn get_onchain_address(&self) -> bitcoin::Address {
@@ -499,6 +594,35 @@ impl Lightningd {
 		}).await.unwrap().into_inner().bolt11
 	}
 
+	/// Create an invoice with a specific preimage (and thus payment hash).
+	pub async fn invoice_with_preimage(
+		&self,
+		amount: Option<Amount>,
+		label: impl AsRef<str>,
+		description: impl AsRef<str>,
+		preimage: [u8; 32],
+	) -> String {
+		let mut client = self.grpc_client().await;
+		client
+			.invoice(cln_rpc::InvoiceRequest {
+				description: description.as_ref().to_owned(),
+				label: label.as_ref().to_owned(),
+				amount_msat: Some(amount_or_any(amount)),
+				cltv: None,
+				fallbacks: vec![],
+				preimage: Some(
+					preimage.to_vec(),
+				),
+				expiry: None,
+				exposeprivatechannels: vec![],
+				deschashonly: None,
+			})
+			.await
+			.unwrap()
+			.into_inner()
+			.bolt11
+	}
+
 	pub async fn offer(
 		&self,
 		amount: Option<Amount>,
@@ -524,29 +648,36 @@ impl Lightningd {
 	}
 
 	pub async fn try_pay_bolt11(&self, bolt11: impl AsRef<str>) -> anyhow::Result<()> {
+		// CLN v26.06's xpay+injectpaymentonion flow no longer pads the
+		// outgoing CLTV. If lightningd's tip lags bitcoind's, the outgoing
+		// HTLC's cltv_expiry is computed from the stale tip and gets
+		// rejected by the receiver as `final_incorrect_cltv_expiry`. Wait
+		// for block sync so cltv is based on the current tip.
+		self.wait_for_block_sync().await;
+
 		let mut client = self.grpc_client().await;
-		let response = client.pay(cln_rpc::PayRequest {
-			bolt11: bolt11.as_ref().to_string(),
+		let response = client.xpay(cln_rpc::XpayRequest {
+			invstring: bolt11.as_ref().to_string(),
 			amount_msat: None,
-			label: None,
-			maxfeepercent: None,
 			maxfee: None,
+			layers: vec![],
 			retry_for: None,
-			maxdelay: None,
-			exemptfee: None,
-			riskfactor: None,
-			exclude: vec![],
-			description: None,
-			localinvreqid: None,
 			partial_msat: None,
+			maxdelay: None,
+			payer_note: None,
+			label: None,
+			localinvreqid: None,
+			dev_use_shadow: None,
 		}).await?.into_inner();
 
-		if response.status == cln_rpc::pay_response::PayStatus::Complete as i32 {
-			Ok(())
-		} else {
+		// xpay signals success by returning a non-empty payment_preimage;
+		// any other outcome (including partial success) surfaces as an RPC
+		// error above.
+		if response.payment_preimage.is_empty() {
 			error!("{:?}", response);
 			bail!("Payment failed");
 		}
+		Ok(())
 	}
 
 	pub async fn pay_bolt11(&self, bolt11: impl AsRef<str>) {
@@ -571,7 +702,7 @@ impl Lightningd {
 
 			trace!("Waiting for gossip...");
 			trace!("{:?}", res.channels);
-			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+			tokio::time::sleep(poll_interval()).await;
 		}
 	}
 

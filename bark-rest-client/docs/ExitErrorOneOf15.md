@@ -4,8 +4,9 @@
 
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
-**error** | **String** |  | 
-**r#type** | **String** |  | 
+**txid** | **String** |  | 
+**r#type** | **Type** |  (enum: exit-tx-already-broadcast) | 
+**vtxo** | **String** |  | 
 
 [[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)
 

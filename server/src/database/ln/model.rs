@@ -14,7 +14,7 @@ use ark::VtxoId;
 use ark::lightning::PaymentHash;
 use bitcoin_ext::{AmountExt, BlockHeight};
 
-use super::ClnNodeId;
+use super::LightningNodeId;
 
 
 #[derive(Debug, Clone, Default)]
@@ -36,6 +36,15 @@ pub enum LightningPaymentStatus {
 	Requested,
 	#[postgres(name = "submitted")]
 	Submitted,
+	/// NB: this is NOT authoritative for settlement. The lightning node can
+	/// settle a payment without this status write committing (a lost
+	/// optimistic-lock race, or a crash between recording the preimage and
+	/// updating the status), so the status may still read `Submitted` or even
+	/// `Failed` for a payment that actually completed. Never gate a
+	/// fund-releasing decision (revocation, refund, re-issuing sender vtxos) on
+	/// this variant: use `HtlcSettler::is_settled` or the transaction's
+	/// `ensure_not_settled`, as the `htlc_settlement` table is the single source
+	/// of truth for settlement.
 	#[postgres(name = "succeeded")]
 	Succeeded,
 	#[postgres(name = "failed")]
@@ -67,15 +76,51 @@ impl fmt::Display for LightningPaymentStatus {
 #[derive(Debug, Clone)]
 pub struct LightningPaymentAttempt {
 	pub id: i64,
-	pub lightning_node_id: ClnNodeId,
+	pub lightning_node_id: LightningNodeId,
 	pub payment_hash: PaymentHash,
+	/// Invoice amount in msats: what the payee receives. Set at initiation
+	/// from the invoice / requested payment amount, immutable after.
 	pub amount_msat: u64,
+	/// Total msats CLN put on the wire to fulfil the invoice
+	/// (`amount_msat + LN routing fee`), from CLN's `amount_sent_msat`.
+	/// `None` on intra-Ark self-payments (no CLN send) and while the attempt
+	/// is still open. Does not include the Ark `user_fee`.
 	pub final_amount_msat: Option<u64>,
 	pub status: LightningPaymentStatus,
-	pub is_self_payment: bool,
+	/// The htlc subscription this attempt was initiated against, if any.
+	///
+	/// Set once, at initiation, when the payment is an intra-Ark
+	/// self-payment. Never derive this from the current presence of a
+	/// subscription with the same payment hash: a receive registered after
+	/// the attempt was initiated must not retroactively turn it into a
+	/// self-payment.
+	pub lightning_htlc_subscription_id: Option<i64>,
 	pub error: Option<String>,
+	/// Chain-tip height at cosign time. `None` for pre-V57 rows and legacy
+	/// protocol versions.
+	pub block_height: Option<BlockHeight>,
+	/// Fee quoted to the user at initiation (`base_fee + expiry_fee`).
+	/// `None` for pre-V57 rows.
+	pub user_fee: Option<Amount>,
 	pub created_at: DateTime<Local>,
 	pub updated_at: DateTime<Local>,
+}
+
+impl LightningPaymentAttempt {
+	/// Whether this attempt is an intra-Ark self-payment.
+	pub fn is_self_payment(&self) -> bool {
+		self.lightning_htlc_subscription_id.is_some()
+	}
+
+	/// Derive routing fee from CLN's `amount_sent_msat`; 0 when unset
+	/// (intra-Ark self-pay or a Failed attempt CLN never accepted).
+	pub fn routing_fee_sat_from(&self, final_amount_msat: Option<u64>) -> u64 {
+		final_amount_msat
+			.map(|sent| Amount::from_msat_ceil(
+				sent.saturating_sub(self.amount_msat),
+			).to_sat())
+			.unwrap_or(0)
+	}
 }
 
 impl TryFrom<Row> for LightningPaymentAttempt {
@@ -89,9 +134,12 @@ impl TryFrom<Row> for LightningPaymentAttempt {
 				.context("error decoding payment hash from db")?,
 			amount_msat: row.get::<_, i64>("amount_msat") as u64,
 			final_amount_msat: row.get::<_, Option<i64>>("final_amount_msat").map(|i| i as u64),
-			is_self_payment: row.get::<_, bool>("is_self_payment"),
+			lightning_htlc_subscription_id: row.get("lightning_htlc_subscription_id"),
 			status: row.get("status"),
 			error: row.get("error"),
+			block_height: row.get::<_, Option<i32>>("block_height").map(|i| BlockHeight::try_from(i).expect("invalid block height in db")),
+			user_fee: row.get::<_, Option<i64>>("user_fee_sat")
+				.map(|f| Amount::from_sat(u64::try_from(f).expect("negative user_fee_sat in db row"))),
 			created_at: row.get("created_at"),
 			updated_at: row.get("updated_at"),
 		})
@@ -156,7 +204,7 @@ impl From<LightningHtlcSubscriptionStatus> for protos::LightningReceiveStatus {
 #[derive(Debug, Clone)]
 pub struct LightningHtlcSubscription {
 	pub id: i64,
-	pub lightning_node_id: ClnNodeId,
+	pub lightning_node_id: LightningNodeId,
 	pub payment_hash: PaymentHash,
 	pub invoice: Bolt11Invoice,
 	pub status: LightningHtlcSubscriptionStatus,
@@ -189,7 +237,8 @@ impl <'a>TryFrom<&'a Row> for LightningHtlcSubscription {
 				.context("error decoding payment hash from db")?,
 			invoice: invoice,
 			status: row.get("status"),
-			lowest_incoming_htlc_expiry: row.get::<_, Option<i64>>("lowest_incoming_htlc_expiry").map(|i| i as BlockHeight),
+			lowest_incoming_htlc_expiry: row.get::<_, Option<i64>>("lowest_incoming_htlc_expiry")
+				.map(|i| BlockHeight::try_from(i).expect("invalid block height in db")),
 			accepted_at: row.try_get("accepted_at").ok(),
 			created_at: row.get("created_at"),
 			updated_at: row.get("updated_at"),

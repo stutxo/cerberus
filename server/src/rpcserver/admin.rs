@@ -1,3 +1,9 @@
+//! The admin gRPC interface of captaind and watchmand.
+//!
+//! This interface deliberately has no authentication, authorization or transport encryption. It is
+//! an operator plane as privileged as shell access on the host, kept unreachable by deployment and
+//! not by the daemon.
+
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{atomic, Arc};
@@ -7,7 +13,10 @@ use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
 use tracing::{info, trace, warn};
 use server_rpc::{self as rpc, protos};
 
-use crate::rpcserver::{middleware, StatusContext, ToStatusResult, RPC_RICH_ERRORS};
+use crate::rpcserver::{
+	middleware, StatusContext, ToStatusResult,
+	DEFAULT_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS, RPC_RICH_ERRORS,
+};
 use crate::system::RuntimeManager;
 use crate::Server;
 
@@ -19,22 +28,12 @@ impl rpc::server::WalletAdminService for Server {
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<protos::WalletStatusResponse>, tonic::Status> {
 
-		let rounds = async {
-			Ok(self.rounds_wallet.lock().await.status())
-		};
-		let watchman = async {
-			if let Some(ref fw) = self.watchman_wallet {
-				Ok::<_, anyhow::Error>(Some(fw.lock().await.status()))
-			} else {
-				Ok(None)
-			}
-		};
-
-		let (rounds, watchman) = tokio::try_join!(rounds, watchman).to_status()?;
+		let rounds = self.rounds_wallet.lock().await.status();
 
 		Ok(tonic::Response::new(protos::WalletStatusResponse {
 			rounds: Some(rounds.into()),
-			watchman: watchman.map(|f| f.into()),
+			// the watchman wallet is managed by the watchmand process
+			watchman: None,
 		}))
 	}
 }
@@ -68,7 +67,7 @@ impl rpc::server::LightningAdminService for Server {
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
 		let req = req.into_inner();
 		let uri = http::Uri::from_str(req.uri.as_str()).unwrap();
-		let _ = self.cln.activate(uri);
+		let _ = self.lightning_manager.activate(uri);
 		Ok(tonic::Response::new(protos::Empty{}))
 	}
 
@@ -79,26 +78,8 @@ impl rpc::server::LightningAdminService for Server {
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
 		let req = req.into_inner();
 		let uri = http::Uri::from_str(req.uri.as_str()).unwrap();
-		let _ = self.cln.disable(uri);
+		let _ = self.lightning_manager.disable(uri);
 		Ok(tonic::Response::new(protos::Empty{}))
-	}
-}
-
-#[async_trait]
-impl rpc::server::SweepAdminService for Server {
-	#[tracing::instrument(skip(self, _req))]
-	async fn trigger_sweep(
-		&self,
-		_req: tonic::Request<protos::Empty>,
-	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
-
-		match &self.watchman_handle {
-			Some(handle) => {
-				handle.trigger_sweep();
-				Ok(tonic::Response::new(protos::Empty {}))
-			},
-			None => Err(tonic::Status::unavailable("watchman not enabled")),
-		}
 	}
 }
 
@@ -116,6 +97,46 @@ impl rpc::server::SweepAdminService for crate::watchman::Daemon {
 }
 
 #[async_trait]
+impl rpc::server::NurseryAdminService for Server {
+	#[tracing::instrument(skip(self, req))]
+	async fn list_nursery_txs(
+		&self,
+		req: tonic::Request<protos::ListNurseryTxsRequest>,
+	) -> Result<tonic::Response<protos::ListNurseryTxsResponse>, tonic::Status> {
+		let req = req.into_inner();
+		let txs = self.tx_nursery.list_txs(req.include_confirmed, req.include_abandoned).await
+			.to_status()?;
+		Ok(tonic::Response::new(protos::ListNurseryTxsResponse {
+			txs: txs.into_iter().map(|r| protos::NurseryTxInfo {
+				txid: r.tx.txid.to_string(),
+				kind: r.tx.kind.name().into(),
+				in_mempool: r.in_mempool,
+				chunk_fee_rate_kwu: r.chunk_fee_rate.map(|f| f.to_sat_per_kwu()),
+				confirm_target_height: r.tx.confirm_target_height.into(),
+				confirmed_at_height: r.tx.confirmed_at_height.map(Into::into),
+				created_at: r.tx.created_at.timestamp() as u64,
+				abandoned_at: r.tx.abandoned_at.map(|t| t.timestamp() as u64),
+			}).collect(),
+		}))
+	}
+
+	#[tracing::instrument(skip(self, req))]
+	async fn abandon(
+		&self,
+		req: tonic::Request<protos::AbandonRequest>,
+	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		let req = req.into_inner();
+		let txid = bitcoin::Txid::from_str(&req.txid)
+			.badarg("invalid txid")?;
+		if self.tx_nursery.abandon(txid).await.to_status()? {
+			Ok(tonic::Response::new(protos::Empty {}))
+		} else {
+			Err(tonic::Status::not_found("no active nursery tx with that txid"))
+		}
+	}
+}
+
+#[async_trait]
 impl rpc::server::BanAdminService for Server {
 	#[tracing::instrument(skip(self, req))]
 	async fn ban_vtxo(
@@ -126,7 +147,9 @@ impl rpc::server::BanAdminService for Server {
 		let vtxo_id = VtxoId::from_slice(&req.vtxo_id)
 			.badarg("invalid vtxo id")?;
 		let chain_tip = self.chain_tip().height;
-		let until_height = chain_tip.saturating_add(req.ban_blocks);
+		let until_height = bitcoin_ext::BlockHeight::new(
+			chain_tip.to_u32().saturating_add(req.ban_blocks),
+		);
 		self.db.write(async |t| t.ban_vtxo(vtxo_id, until_height).await).await.to_status()?;
 		Ok(tonic::Response::new(protos::Empty {}))
 	}
@@ -153,14 +176,14 @@ impl rpc::server::BanAdminService for Server {
 		let banned_vtxos = banned.into_iter().map(|v| {
 			protos::BannedVtxo {
 				vtxo_id: v.vtxo_id.to_bytes().to_vec(),
-				banned_until_height: v.banned_until_height.unwrap_or(0),
+				banned_until_height: v.banned_until_height.into(),
 			}
 		}).collect();
 		Ok(tonic::Response::new(protos::ListBannedVtxosResponse { banned_vtxos }))
 	}
 }
 
-/// Run the public gRPC endpoint.
+/// Run the captaind admin gRPC endpoint.
 pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 	RPC_RICH_ERRORS.store(srv.config.rpc_rich_errors, atomic::Ordering::Relaxed);
 
@@ -173,10 +196,11 @@ pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 		.add_service(rpc::server::WalletAdminServiceServer::from_arc(srv.clone()))
 		.add_service(rpc::server::RoundAdminServiceServer::from_arc(srv.clone()))
 		.add_service(rpc::server::LightningAdminServiceServer::from_arc(srv.clone()))
-		.add_service(rpc::server::SweepAdminServiceServer::from_arc(srv.clone()))
-		.add_service(rpc::server::BanAdminServiceServer::from_arc(srv.clone()));
+		.add_service(rpc::server::BanAdminServiceServer::from_arc(srv.clone()))
+		.add_service(rpc::server::NurseryAdminServiceServer::from_arc(srv.clone()));
 
 	tonic::transport::Server::builder()
+		.http2_max_pending_accept_reset_streams(Some(DEFAULT_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS))
 		.layer(OtelGrpcLayer::default())
 		.layer(middleware::TelemetryMetricsLayer)
 		.add_routes(routes)
@@ -199,6 +223,7 @@ pub async fn run_watchmand_admin_rpc_server(
 		.add_service(rpc::server::SweepAdminServiceServer::from_arc(daemon));
 
 	tonic::transport::Server::builder()
+		.http2_max_pending_accept_reset_streams(Some(DEFAULT_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS))
 		.layer(OtelGrpcLayer::default())
 		.layer(middleware::TelemetryMetricsLayer)
 		.add_routes(routes)

@@ -1,10 +1,13 @@
-use bitcoin::{Amount, FeeRate, Txid};
+use bitcoin::{Amount, Txid};
 use bitcoin::address::FromScriptError;
 use thiserror::Error;
 
 use ark::VtxoId;
+use ark::vtxo::VtxoStandardnessError;
 use bitcoin_ext::BlockHeight;
 
+use crate::chain::BroadcastError;
+use crate::exit::models::ExitStateKind;
 use crate::exit::models::states::ExitTxStatus;
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -17,6 +20,9 @@ pub enum ExitError {
 
 	#[error("Block Retrieval Failure: Unable to retrieve a block at height {height}: {error}")]
 	BlockRetrievalFailure { height: BlockHeight, error: String },
+
+	#[error("Cannot Cancel Exit: The exit for VTXO {vtxo} can no longer be canceled (state: {state})")]
+	CannotCancelExit { vtxo: VtxoId, state: ExitStateKind },
 
 	#[error("Claim Missing Inputs: No inputs given to claim")]
 	ClaimMissingInputs,
@@ -47,16 +53,20 @@ pub enum ExitError {
 	#[error("Database Retrieval Failure: Unable to get child tx: {error}")]
 	DatabaseChildRetrievalFailure { error: String },
 
-	#[error("Dust Limit Error: The dust limit for a VTXO is {dust} but the balance is only {vtxo}")]
+	#[error("Database Store Failure: Unable to store child tx: {error}")]
+	DatabaseChildStoreFailure { error: String },
+
+	#[error("Dust Limit Error: The dust limit for a VTXO is {dust} but vtxo {vtxo} is only {amount}")]
 	DustLimit {
-		vtxo: Amount,
+		vtxo: VtxoId,
+		amount: Amount,
 		dust: Amount
 	},
 
 	#[error("Exit Package Broadcast Failure: Unable to broadcast exit transaction package {txid}: {error}")]
 	ExitPackageBroadcastFailure {
 		txid: Txid,
-		error: String
+		error: BroadcastError,
 	},
 
 	#[error("Exit Package Finalize Failure: Unable to create exit transaction package: {error}")]
@@ -68,17 +78,13 @@ pub enum ExitError {
 		error: String
 	},
 
+	#[error("Exit Tx Already Broadcast: Cannot cancel the exit for VTXO {vtxo}, its final exit tx {txid} has already been broadcast")]
+	ExitTxAlreadyBroadcast { vtxo: VtxoId, txid: Txid },
+
 	#[error("Insufficient Confirmed Funds: {needed} is needed but only {available} is available")]
 	InsufficientConfirmedFunds {
 		needed: Amount,
 		available: Amount
-	},
-
-	#[error("Insufficient Fee Error: Your balance is {balance} but an estimated {total_fee} (fee rate of {fee_rate}) is required to exit the VTXO")]
-	InsufficientFeeToStart {
-		balance: Amount,
-		total_fee: Amount,
-		fee_rate: FeeRate,
 	},
 
 	#[error("Internal Error: An unexpected problem occurred, {error}")]
@@ -103,8 +109,17 @@ pub enum ExitError {
 	#[error("Missing VTXO Transaction: Couldn't find exit tx {txid}")]
 	MissingExitTransaction { txid: Txid },
 
+	#[error("Non-Standard VTXO {vtxo}: exit chain is not relayable: {error}")]
+	NonStandardVtxo {
+		vtxo: VtxoId,
+		error: VtxoStandardnessError,
+	},
+
 	#[error("Movement Registration Failure: {error}")]
 	MovementRegistrationFailure { error: String },
+
+	#[error("Not Exiting: VTXO {vtxo} has no unilateral exit")]
+	NotExiting { vtxo: VtxoId },
 
 	#[error("Tip Retrieval Failure: Unable to retrieve the blockchain tip height: {error}")]
 	TipRetrievalFailure { error: String },
@@ -114,6 +129,15 @@ pub enum ExitError {
 
 	#[error("VTXO Not Spendable Error: Attempted to claim a VTXO which is not in a spendable state: {vtxo}")]
 	VtxoNotClaimable { vtxo: VtxoId },
+
+	#[error("Unknown VTXO: {vtxo} is not known to this wallet")]
+	UnknownVtxo { vtxo: VtxoId },
+
+	#[error("VTXO Already Exited: {vtxo} has already completed its unilateral exit")]
+	VtxoAlreadyExited { vtxo: VtxoId },
+
+	#[error("VTXO Already Spent: {vtxo} has already been spent and can no longer be exited")]
+	VtxoAlreadySpent { vtxo: VtxoId },
 
 	#[error("VTXO ScriptPubKey Invalid: {error}")]
 	VtxoScriptPubKeyInvalid { error: String },

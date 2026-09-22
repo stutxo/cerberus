@@ -7,12 +7,14 @@ Method | HTTP request | Description
 [**address**](WalletApi.md#address) | **POST** /api/v1/wallet/addresses/next | Generate Ark address
 [**ark_info**](WalletApi.md#ark_info) | **GET** /api/v1/wallet/ark-info | Get Ark server info
 [**balance**](WalletApi.md#balance) | **GET** /api/v1/wallet/balance | Get wallet balance
+[**bip321_uri**](WalletApi.md#bip321_uri) | **POST** /api/v1/wallet/bip321 | Build a BIP 321 payment URI
 [**connected**](WalletApi.md#connected) | **GET** /api/v1/wallet/connected | Check server connection
 [**create_wallet**](WalletApi.md#create_wallet) | **POST** /api/v1/wallet/create | Create a wallet
 [**get_vtxo**](WalletApi.md#get_vtxo) | **GET** /api/v1/wallet/vtxos/{id} | Get VTXO detail
 [**get_vtxo_encoded**](WalletApi.md#get_vtxo_encoded) | **GET** /api/v1/wallet/vtxos/{id}/encoded | Get encoded VTXO
-[**history**](WalletApi.md#history) | **GET** /api/v1/wallet/history | Get wallet history
+[**history**](WalletApi.md#history) | **GET** /api/v1/wallet/history | Get wallet history (deprecated)
 [**import_vtxo**](WalletApi.md#import_vtxo) | **POST** /api/v1/wallet/import-vtxo | Import a VTXO
+[**mnemonic**](WalletApi.md#mnemonic) | **GET** /api/v1/wallet/mnemonic | Get wallet mnemonic
 [**movements**](WalletApi.md#movements) | **GET** /api/v1/wallet/movements | List movements (deprecated)
 [**next_round**](WalletApi.md#next_round) | **GET** /api/v1/wallet/next-round | Get next round time
 [**offboard_all**](WalletApi.md#offboard_all) | **POST** /api/v1/wallet/offboard/all | Offboard all VTXOs
@@ -21,13 +23,14 @@ Method | HTTP request | Description
 [**pending_rounds**](WalletApi.md#pending_rounds) | **GET** /api/v1/wallet/rounds | List round participations
 [**refresh_all**](WalletApi.md#refresh_all) | **POST** /api/v1/wallet/refresh/all | Refresh all VTXOs
 [**refresh_counterparty**](WalletApi.md#refresh_counterparty) | **POST** /api/v1/wallet/refresh/counterparty | Refresh received VTXOs
+[**refresh_delegated**](WalletApi.md#refresh_delegated) | **POST** /api/v1/wallet/refresh/delegated/vtxos | Refresh VTXOs in delegated mode
 [**refresh_vtxos**](WalletApi.md#refresh_vtxos) | **POST** /api/v1/wallet/refresh/vtxos | Refresh specific VTXOs
 [**send**](WalletApi.md#send) | **POST** /api/v1/wallet/send | Send a payment
 [**send_onchain**](WalletApi.md#send_onchain) | **POST** /api/v1/wallet/send-onchain | Send on-chain from Ark balance
 [**sync**](WalletApi.md#sync) | **POST** /api/v1/wallet/sync | Sync wallet
 [**sync_mailbox**](WalletApi.md#sync_mailbox) | **POST** /api/v1/wallet/sync/mailbox | Sync mailbox only
 [**vtxos**](WalletApi.md#vtxos) | **GET** /api/v1/wallet/vtxos | List VTXOs
-[**wallet_delete**](WalletApi.md#wallet_delete) | **DELETE** /api/v1/wallet | 
+[**wallet_delete**](WalletApi.md#wallet_delete) | **DELETE** /api/v1/wallet | Delete the wallet
 [**wallet_exists**](WalletApi.md#wallet_exists) | **GET** /api/v1/wallet | 
 
 
@@ -108,6 +111,37 @@ This endpoint does not need any parameter.
 ### HTTP request headers
 
 - **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
+## bip321_uri
+
+> models::Bip321UriResponse bip321_uri(bip321_uri_request, uppercase)
+Build a BIP 321 payment URI
+
+Builds a single BIP 321 `bitcoin:` URI bundling multiple ways to receive the same payment, so one call prepares everything needed for an incoming payment. A fresh Ark address is always included. When `amount_sat` is given, a BOLT11 invoice for that amount is generated and the amount is embedded in the URI. When `onchain` is `true`, a fresh on-chain address is added (placed in the URI body on mainnet, as a `tb=` parameter on test networks). Set the `uppercase` query parameter to upper-case the `bip321` URI so QR encoders can use the compact alphanumeric mode; this fails if the URI carries case-sensitive data. The individual `ark`, `bolt11`, and `onchain` destinations are always returned in their natural case for direct use.
+
+### Parameters
+
+
+Name | Type | Description  | Required | Notes
+------------- | ------------- | ------------- | ------------- | -------------
+**bip321_uri_request** | [**Bip321UriRequest**](Bip321UriRequest.md) |  | [required] |
+**uppercase** | Option<**bool**> | Upper-case the returned `bip321` URI for compact QR encoding. Defaults to false. Fails with 400 if the URI carries case-sensitive data (a label, message, or base58 address). |  |
+
+### Return type
+
+[**models::Bip321UriResponse**](Bip321UriResponse.md)
+
+### Authorization
+
+[bearer](../README.md#bearer)
+
+### HTTP request headers
+
+- **Content-Type**: application/json
 - **Accept**: application/json
 
 [[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
@@ -233,9 +267,9 @@ Name | Type | Description  | Required | Notes
 ## history
 
 > Vec<models::Movement> history()
-Get wallet history
+Get wallet history (deprecated)
 
-Returns the full history of wallet movements ordered from newest to oldest. A movement represents any wallet operation that affects VTXOs—an arkoor send or receive, Lightning send or receive, board, offboard, or refresh. Each entry records which VTXOs were consumed and produced, the effective balance change (if any), fees paid, and the operation status.
+Deprecated: use `GET /api/v1/history` instead.
 
 ### Parameters
 
@@ -262,7 +296,7 @@ This endpoint does not need any parameter.
 > Vec<models::WalletVtxoInfo> import_vtxo(import_vtxo_request)
 Import a VTXO
 
-Imports hex-encoded serialized VTXOs into the wallet. Validates that each VTXO is anchored on-chain, owned by this wallet, and has not expired. Useful for restoring VTXOs after database loss or re-importing from the server mailbox. The operation is idempotent.
+Imports the hex-encoded serialized VTXOs in the request body into the wallet; it does not read them from the server mailbox. Validates that each VTXO is anchored on-chain and owned by this wallet. Useful for restoring VTXOs after database loss, or for re-importing ones obtained elsewhere. Ownership is resolved by scanning the seed-derived key space, bounded by `gap_limit` or the wallet's configured gap limit; a key the scan does not reach is a 400. Only VTXOs the server reports as spendable or spent are stored, in that state, so one that has already been spent is recorded as spent rather than rejected. A VTXO still in flight (unclaimed, unregistered, or awaiting a preimage) is rejected with a 422, because it becomes importable once that flow finishes. Pass `skip_status_check` to store them as spendable without asking the server. Expiry is not checked. The VTXOs are imported together, in one key scan and one transaction, so a rejected VTXO leaves none of them stored; pass `allow_partial` to keep the VTXOs that did import, and the response then lists only those. Already-imported VTXOs are skipped, so the operation is idempotent and a failed request can be retried.
 
 ### Parameters
 
@@ -282,6 +316,33 @@ Name | Type | Description  | Required | Notes
 ### HTTP request headers
 
 - **Content-Type**: application/json
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
+## mnemonic
+
+> models::MnemonicResponse mnemonic()
+Get wallet mnemonic
+
+Returns the BIP-39 mnemonic phrase backing the wallet. Returns 404 when mnemonic exposure is disabled. Exposure is off by default; the endpoint returns 404 unless barkd is started with the `--expose-mnemonic` flag.
+
+### Parameters
+
+This endpoint does not need any parameter.
+
+### Return type
+
+[**models::MnemonicResponse**](MnemonicResponse.md)
+
+### Authorization
+
+[bearer](../README.md#bearer)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
 - **Accept**: application/json
 
 [[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
@@ -512,6 +573,36 @@ This endpoint does not need any parameter.
 [[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
 
 
+## refresh_delegated
+
+> models::PendingRoundInfo refresh_delegated(delegated_refresh_request)
+Refresh VTXOs in delegated mode
+
+Registers the specified VTXOs for refresh as a delegated participation: the wallet hands the server a signed participation and the server carries it through the round, so the wallet doesn't need to follow the round interactively. The input VTXOs are locked immediately and will be forfeited once the round completes, yielding new VTXOs with a fresh expiry.  Set `height` to schedule the refresh for a future block height: the refresh fee is priced at that height and the server includes the participation in the first round once the chain tip reaches it. When `height` is omitted, the participation is eligible for the next round. Use the `rounds` endpoint to track progress.
+
+### Parameters
+
+
+Name | Type | Description  | Required | Notes
+------------- | ------------- | ------------- | ------------- | -------------
+**delegated_refresh_request** | [**DelegatedRefreshRequest**](DelegatedRefreshRequest.md) |  | [required] |
+
+### Return type
+
+[**models::PendingRoundInfo**](PendingRoundInfo.md)
+
+### Authorization
+
+[bearer](../README.md#bearer)
+
+### HTTP request headers
+
+- **Content-Type**: application/json
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
 ## refresh_vtxos
 
 > models::PendingRoundInfo refresh_vtxos(refresh_request)
@@ -689,7 +780,9 @@ Name | Type | Description  | Required | Notes
 ## wallet_delete
 
 > models::WalletDeleteResponse wallet_delete(wallet_delete_request)
+Delete the wallet
 
+Stops the wallet and removes every wallet file from the datadir; barkd's own files survive. Requires `dangerous: true` and, while a wallet is loaded, the wallet's fingerprint. With no wallet loaded, the call still removes any leftover wallet files. A retry completes an interrupted deletion.
 
 ### Parameters
 

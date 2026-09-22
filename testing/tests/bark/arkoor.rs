@@ -6,8 +6,6 @@ use futures::StreamExt;
 
 #[tokio::test]
 async fn send_simple_arkoor() {
-	require_bark_version!(> "0.1.4");
-
 	let ctx = TestContext::new("bark/send_simple_arkoor").await;
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;
 	let bark1 = ctx.bark("bark1", &srv).funded(sat(90_000)).create().await;
@@ -35,9 +33,6 @@ async fn send_simple_arkoor() {
 	assert_eq!(60_000, bark1.spendable_balance().await.to_sat());
 	assert_eq!(20_000, bark2_wallet.balance().await.unwrap().spendable.to_sat());
 
-	// Address lookup is only supported in beta.9 and later
-	require_bark_version!(>= "0.1.0-beta.9");
-
 	// send a second payment to the same address
 	bark1.send_oor(&addr2, sat(30_000)).await;
 
@@ -54,6 +49,29 @@ async fn send_simple_arkoor() {
 	let addr2_unused = bark2.address().await;
 	let movements = bark2.history_by_arkoor_addr(&addr2_unused).await;
 	assert!(movements.is_empty());
+}
+
+/// A payment received while offline is kept even if the VTXO expired before
+/// the receiver synced. The sender paid with a valid VTXO; the receiver only
+/// needs to refresh it.
+#[tokio::test]
+async fn receive_expired_arkoor_while_offline() {
+	require_bark_version!(> "0.6.2");
+
+	let ctx = TestContext::new("bark/receive_expired_arkoor_while_offline").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+	let bark1 = ctx.bark("bark1", &srv).funded(sat(1_000_000)).create().await;
+	let bark2 = ctx.bark("bark2", &srv).create().await;
+
+	bark1.board_and_confirm_and_register(&ctx, sat(800_000)).await;
+	bark1.send_oor(bark2.address().await, sat(100_000)).await;
+
+	// bark2 stays offline until the VTXO has expired.
+	ctx.generate_blocks(srv.config().vtxo_lifetime.to_u32() + 1).await;
+
+	bark2.sync().await;
+	assert_eq!(bark2.vtxos().await.len(), 1);
+	assert_eq!(bark2.spendable_balance().await, sat(100_000));
 }
 
 #[tokio::test]
@@ -99,6 +117,50 @@ async fn send_arkoor_package() {
 }
 
 #[tokio::test]
+async fn oor_change_split() {
+	require_bark_version!(> "0.6.1");
+
+	let ctx = TestContext::new("bark/oor_change_split").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+	let bark1 = ctx.bark("bark1", &srv).funded(sat(100_000)).create().await;
+	let bark2 = ctx.bark("bark2", &srv).funded(sat(5_000)).create().await;
+
+	bark1.board_and_confirm_and_register(&ctx, sat(80_000)).await;
+
+	// Large change is split in two so that spending builds a tree of
+	// change VTXOs instead of a chain.
+	bark1.send_oor(&bark2.address().await, sat(20_000)).await;
+
+	let mut vtxos = bark1.vtxos().await;
+	vtxos.sort_by_key(|v| v.amount);
+	let [piece1, piece2] = vtxos.try_into().expect("should have two change vtxos");
+	assert_eq!(piece1.amount, sat(30_000));
+	assert_eq!(piece2.amount, sat(30_000));
+
+	// Change too small to split is kept whole.
+	bark1.send_oor(&bark2.address().await, sat(45_000)).await;
+
+	let [change] = bark1.vtxos().await.try_into().expect("should have one change vtxo");
+	assert_eq!(change.amount, sat(15_000));
+
+	assert_eq!(65_000, bark2.spendable_balance().await.to_sat());
+}
+
+#[tokio::test]
+async fn send_to_arkade_address_is_rejected() {
+	let ctx = TestContext::new("bark/send_to_arkade_address_is_rejected").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+	let bark1 = ctx.bark("bark1", &srv).funded(sat(90_000)).create().await;
+
+	// An Arkade (version 0) address. Bark does not support these and should
+	// return an explicit error rather than treating it as an unknown destination.
+	let arkade_addr = "ark1qzpq904am6clw3pgqwyh4p02708fy4xs0hcpwt7rwfdttuxsjamecr7zmxcnglmw0pqg99mp96dn5duae0l7cr7lm0gt59nhh4psml45xrdk57";
+
+	let err = bark1.try_send_oor(arkade_addr, sat(10_000), false).await.unwrap_err().to_alt_string();
+	assert!(err.contains("Ark address is for different server"), "err: {err:#}");
+}
+
+#[tokio::test]
 async fn test_ark_address_other_ark() {
 	let ctx = TestContext::new("bark/test_ark_address_other_ark").await;
 
@@ -115,5 +177,45 @@ async fn test_ark_address_other_ark() {
 
 	let addr1 = bark1.address().await;
 	let err = bark2.try_send_oor(addr1, sat(10_000), false).await.unwrap_err().to_alt_string();
-	assert!(err.contains("Ark address is for different server"), "err: {err:#}");
+	assert!(err.contains("invalid ark server") || err.contains("Ark address is for different server"), "err: {err:#}");
+}
+
+#[tokio::test]
+async fn max_arkoor_amount() {
+	let ctx = TestContext::new("bark/max_arkoor_amount").await;
+	let srv = ctx.captaind("server").funded(btc(10)).cfg(|cfg| {
+		cfg.max_arkoor_amount = Some(sat(100_000));
+		// The offboard limit may not exceed the arkoor one, see Config::validate.
+		cfg.max_offboard_amount = Some(sat(100_000));
+	}).create().await;
+	let bark1 = ctx.bark("bark1", &srv).funded(sat(500_000)).create().await;
+	let bark2 = ctx.bark("bark2", &srv).create().await;
+
+	bark1.board_and_confirm_and_register(&ctx, sat(400_000)).await;
+
+	// the input vtxo exceeds the limit
+	let addr2 = bark2.address().await;
+	let spendable = bark1.spendable_balance().await;
+	let err = bark1.try_send_oor(&addr2, sat(200_000), true).await.unwrap_err().to_alt_string();
+	assert!(err.contains("arkoor send amount exceeds limit of 0.00100000 BTC"), "err: {err}");
+	bark1.assert_unchanged_after_refusal(spendable).await;
+
+	// a send within the limit still works
+	srv.stop().await.unwrap();
+	srv.config_mut().max_arkoor_amount = Some(sat(500_000));
+	srv.start().await.unwrap();
+	// A restart reserves new ports, so bark has to be re-pointed at the server.
+	bark1.set_ark_url(&srv).await;
+
+	bark1.send_oor(&addr2, sat(20_000)).await;
+
+	// zero disables arkoor sends entirely, and offboards with them
+	srv.stop().await.unwrap();
+	srv.config_mut().max_arkoor_amount = Some(sat(0));
+	srv.config_mut().max_offboard_amount = Some(sat(0));
+	srv.start().await.unwrap();
+	bark1.set_ark_url(&srv).await;
+
+	let err = bark1.try_send_oor(&addr2, sat(20_000), true).await.unwrap_err().to_alt_string();
+	assert!(err.contains("arkoor send is temporarily disabled"), "err: {err}");
 }

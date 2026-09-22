@@ -1,6 +1,9 @@
 # Find the target directory
 CARGO_TARGET := `cargo metadata --format-version 1 --no-deps | jq -r '.target_directory'`
 JUSTFILE_DIR := justfile_directory()
+# The rust target triple of this machine, the default for single-target nix
+# builds. Matches the target suffixes of the flake's release packages.
+HOST_TARGET := `rustc -vV | sed -n 's/^host: //p'`
 export CAPTAIND_EXEC := env("CAPTAIND_EXEC", CARGO_TARGET / "debug" / "captaind")
 export WATCHMAND_EXEC := env("WATCHMAND_EXEC", CARGO_TARGET / "debug" / "watchmand")
 export BARK_EXEC := env("BARK_EXEC", CARGO_TARGET / "debug" / "bark")
@@ -13,7 +16,6 @@ SERVER_SQL_SCHEMA_PATH := "server/schema.sql"
 BARK_SQL_SCHEMA_PATH := "bark/schema.sql"
 BARK_OPENAPI_SCHEMA_PATH := "bark-rest/openapi.json"
 BARK_REST_CLIENT_DIR := "bark-rest-client"
-BARK_REST_VERSION := `grep '^version = ' bark-rest/Cargo.toml | sed -E 's/^version = "([^"]+)"/\1/'`
 
 EXAMPLES_DIR := env("EXAMPLES_DIR", CARGO_TARGET / "debug" / "examples")
 
@@ -29,10 +31,41 @@ check:
 	cargo version
 	cargo check --all --tests --examples
 
+check-wasm-tests:
+	ARK_CONTROL_URL="" ARK_ESPLORA_URL="" ARK_SERVER_URL="" \
+		cargo check -p wasm-testing --tests \
+		--no-default-features --features wasm \
+		--target wasm32-unknown-unknown
+
 check-lib-arithmetic:
 	cargo clippy -p ark-lib --tests
 
-checks: prechecks check check-lib-arithmetic
+check-fuzz:
+	cargo check --manifest-path fuzz/Cargo.toml
+
+check-release:
+	cargo check --release -p bark-cli -p bark-server
+
+check-bark-as-libs:
+	cargo check -p ark-lib
+	cargo check -p ark-lib --no-default-features
+	cargo check -p bark-bitcoin-ext
+	cargo check -p bark-bitcoin-ext --no-default-features
+	cargo check -p bark-wallet
+	cargo check -p bark-wallet -F native --no-default-features
+	cargo check -p bark-json
+	cargo check -p bark-json --no-default-features
+	cargo check -p bark-rest
+	cargo check -p bark-rest --no-default-features
+	cargo check -p bark-rest-client
+
+# Confirms bark-wallet is still consumable as a plain crates.io dependency.
+check-use-bark-as-dependency:
+	rm -rf barktest
+	cargo init barktest
+	cd barktest && cargo add bark-wallet && cargo update && cargo build
+
+checks: prechecks check-lib-arithmetic check-wasm-tests check
 
 check-commits:
 	bash contrib/check-commits.sh
@@ -84,6 +117,24 @@ build-codecov:
 	cargo llvm-cov clean --workspace
 	cargo build --workspace
 
+build-msrv-lib:
+	cd testing/msrv-lib && cargo build
+
+build-bark-wasm:
+	cargo build --target wasm32-unknown-unknown --lib --no-default-features \
+		-p ark-lib --features wasm-web
+	cargo build --target wasm32-unknown-unknown --lib --no-default-features \
+		-p bark-bitcoin-ext --features wasm-web
+	cargo build --target wasm32-unknown-unknown --lib --no-default-features \
+		-p bark-server-rpc --features tonic-web
+	cargo build --target wasm32-unknown-unknown --lib --no-default-features \
+		-p bark-wallet --features wasm-web
+	cargo build --target wasm32-unknown-unknown --lib --no-default-features \
+		-p bark-wallet --features wasm-web,indexed-db
+
+build-lib-wasm-release:
+	cd lib/ && cargo build --release --target wasm32-unknown-unknown --lib --features wasm-web
+
 docker-pull:
 	if [ -n "${LIGHTNINGD_DOCKER_IMAGE-""}" ]; then docker image inspect "$LIGHTNINGD_DOCKER_IMAGE" > /dev/null 2>&1 && echo "Image already exists locally." || (echo "Image not found locally. Pulling..." && docker pull "$LIGHTNINGD_DOCKER_IMAGE"); fi
 
@@ -92,20 +143,51 @@ test-unit TEST="":
 		--exclude ark-testing {{TEST}}
 alias unit := test-unit
 
+test-unit-prebuilt:
+	cargo nextest run --archive-file {{CARGO_TARGET}}/ci/unit-tests.tar.zst
+
+test-doc:
+	cargo test --doc
+
 test-unit-codecov TEST="":
 	cargo llvm-cov nextest --profile {{NEXTEST_PROFILE}} --workspace \
 		--exclude ark-testing --no-report {{TEST}}
 
 test-integration TEST="": ensure-build-bins docker-pull
 	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
-		-E 'not binary(tor)' {{TEST}}
+		-E 'not binary(tor) and not binary(server-migrations)' {{TEST}}
 alias int := test-integration
+
+# Run the server upgrade/migration tests. Requires OLD_CAPTAIND_EXEC to
+# point at a previous captaind release binary, e.g.:
+#   OLD_CAPTAIND_EXEC=/opt/second/captaind-0.7.0 just int-server-migrations
+test-integration-server-migrations TEST="": ensure-build-bins docker-pull
+	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
+		--test server-migrations {{TEST}}
+alias int-server-migrations := test-integration-server-migrations
 
 # run integration tests for bark and barkd test files only
 test-integration-bark: ensure-build-bins docker-pull
 	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
 		--test bark --test barkd
 alias int-bark := test-integration-bark
+
+# Run the integration tests that drive wallet actions (bark, barkd, bark-sdk)
+# double-driving every action step (BARK_DOUBLE_DRIVE_ACTIONS) to check
+# reentrancy.
+[doc("run the bark/barkd/bark-sdk integration tests double-driving every action step to check reentrancy")]
+test-integration-bark-int-action-reentrancy TEST="": ensure-build-bins docker-pull
+	BARK_DOUBLE_DRIVE_ACTIONS=1 \
+		cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
+		--test bark --test barkd --test bark-sdk {{TEST}}
+alias int-bark-int-action-reentrancy := test-integration-bark-int-action-reentrancy
+
+# Must not run under backward-compat mode (BARK_EXEC override has no effect
+# on tests linked against the current bark-wallet crate).
+test-integration-bark-sdk: ensure-build-bins docker-pull
+	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
+		--test bark-sdk
+alias int-bark-sdk := test-integration-bark-sdk
 
 # run tor integration tests
 test-integration-tor: ensure-build-bins docker-pull
@@ -126,9 +208,22 @@ test-integration-bark-prebuilt: docker-pull
 	cargo nextest run --archive-file {{CARGO_TARGET}}/ci/integration-tests.tar.zst \
 		-E 'binary(bark) + binary(barkd)'
 
+test-integration-bark-sdk-prebuilt: docker-pull
+	cargo nextest run --archive-file {{CARGO_TARGET}}/ci/integration-tests.tar.zst \
+		-E 'binary(=bark-sdk)'
+
 test-integration-core-prebuilt: docker-pull
 	cargo nextest run --archive-file {{CARGO_TARGET}}/ci/integration-tests.tar.zst \
 		-E 'binary(core) + binary(server)'
+
+test-integration-bark-int-prebuilt: docker-pull
+	RUST_MIN_STACK=33554432 \
+	cargo nextest run --archive-file {{CARGO_TARGET}}/ci/integration-tests.tar.zst \
+		-E 'binary(bark) + binary(barkd) + binary(=bark-sdk)'
+
+test-integration-server-migrations-prebuilt: docker-pull
+	cargo nextest run --archive-file {{CARGO_TARGET}}/ci/integration-tests.tar.zst \
+		-E 'binary(=server-migrations)'
 
 test-integration-codecov TEST="": docker-pull
 	#!/usr/bin/env bash
@@ -169,33 +264,19 @@ test-all-codecov:
 	just test-integration-all-codecov
 test: test-unit test-integration test-integration-esplora test-integration-mempool
 
+test-wasm TEST="": ensure-build-bins docker-pull
+	CHAIN_SOURCE=esplora cargo run -p wasm-testing --bin wasm-test-suite --features=bin -- "{{TEST}}"
+alias wasm := test-wasm
+
+test-wasm-unit:
+	wasm-pack test --headless --firefox bark-runtime --lib
+alias wasm-unit := test-wasm-unit
+
+test-bark-wasm-indexed-db:
+	wasm-pack test --headless --firefox bark --no-default-features --features 'indexed-db wasm-web' --lib
+
 codecov-report:
 	cargo llvm-cov report --html --output-dir "./target/debug/codecov/"
-
-release-server:
-	RUSTFLAGS="-C debuginfo=2" cargo build --release --locked \
-		--manifest-path server/Cargo.toml --target x86_64-unknown-linux-gnu
-
-release-bark-linux:
-	cargo build --release --target x86_64-unknown-linux-gnu                        \
-		--locked --manifest-path bark-cli/Cargo.toml
-	RUSTC_WRAPPER= cargo zigbuild --release --target aarch64-unknown-linux-gnu     \
-		--locked --manifest-path bark-cli/Cargo.toml \
-		--no-default-features --features tls-webpki-roots
-	RUSTC_WRAPPER= cargo zigbuild --release --target armv7-unknown-linux-gnueabihf \
-		--locked --manifest-path bark-cli/Cargo.toml \
-		--no-default-features --features tls-webpki-roots
-
-release-bark: release-bark-linux
-	cargo build --release --target x86_64-pc-windows-gnu                  \
-		--locked --manifest-path bark-cli/Cargo.toml
-	RUSTC_WRAPPER= cargo zigbuild --release --target x86_64-apple-darwin  \
-		--locked --manifest-path bark-cli/Cargo.toml \
-		--no-default-features --features tls-webpki-roots
-	RUSTC_WRAPPER= cargo zigbuild --release --target aarch64-apple-darwin \
-		--locked --manifest-path bark-cli/Cargo.toml \
-		--no-default-features --features tls-webpki-roots
-
 
 RUSTDOCSDIR := justfile_directory() / "rustdocs"
 # This is opinionated, but doesn't matter. Any page has full search.
@@ -231,14 +312,19 @@ clean:
 	cargo clean \
 		-p ark-lib \
 		-p ark-testing \
+		-p bark-bitcoin-ext \
+		-p bark-cli \
+		-p bark-common \
+		-p bark-json \
+		-p bark-rest \
+		-p bark-rest-client \
+		-p bark-runtime \
 		-p bark-server \
 		-p bark-server-log \
 		-p bark-server-rpc \
-		-p bark-bitcoin-ext \
 		-p bark-wallet \
-		-p bark-json \
-		-p bark-rest \
-		-p bark-cli
+		-p bip321 \
+		-p wasm-testing
 
 # run a single clippy lint
 clippy LINT:
@@ -266,18 +352,215 @@ dump-bark-rest-openapi-schema: ensure-build-examples
 	chmod 644 bark-rest/openapi.json
 
 generate-bark-rest-client: dump-bark-rest-openapi-schema
+	#!/usr/bin/env bash
+	# BARK_REST_VERSION is read here (not as a top-level `:=` binding) so it
+	# reflects any bump that ran earlier in the same `just` invocation,
+	# e.g. `release-new-version` → `bump-workspace-versions` → this recipe.
+	set -euo pipefail
+	BARK_REST_VERSION=$(grep '^version = ' bark-rest/Cargo.toml | sed -E 's/^version = "([^"]+)"/\1/')
 	rm -rf {{BARK_REST_CLIENT_DIR}}
 	openapi-generator-cli generate \
 		-i {{BARK_OPENAPI_SCHEMA_PATH}} \
 		-g rust \
 		-o {{BARK_REST_CLIENT_DIR}} \
 		--package-name bark-rest-client \
-		--artifact-version "{{BARK_REST_VERSION}}" \
-		--additional-properties packageVersion="{{BARK_REST_VERSION}}" \
-		--additional-properties reqwestDefaultFeatures="rustls-tls"
+		--artifact-version "$BARK_REST_VERSION" \
+		--additional-properties packageVersion="$BARK_REST_VERSION" \
+		--additional-properties reqwestDefaultFeatures="rustls"
 	cargo add --package bark-rest-client --path bark-json
 	cargo add --package bark-rest-client --path bark-rest --no-default-features
 	rm {{BARK_REST_CLIENT_DIR}}/src/models/*.rs
 	cp bark-rest/helpers/models.rs {{BARK_REST_CLIENT_DIR}}/src/models/mod.rs
 
-generate-static-files: dump-server-sql-schema dump-bark-sql-schema generate-bark-rest-client
+# Append server-rpc's version to ALLOWED_BARK_VERSIONS in
+# server/src/telemetry.rs if not already listed. Idempotent; never
+# removes.
+update-allowed-bark-versions:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	target="server/src/telemetry.rs"
+	rpc_cargo="server-rpc/Cargo.toml"
+	cur=$(sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' "$rpc_cargo" | head -n1)
+	if [[ -z "$cur" ]]; then
+		echo "couldn't find version = \"X.Y.Z\" in $rpc_cargo" >&2
+		exit 1
+	fi
+	existing=$(awk '$0 == "const ALLOWED_BARK_VERSIONS: &[&str] = &[" { on=1; next } \
+	                on && $0 == "];" { on=0 } \
+	                on' "$target" \
+	         | grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' \
+	         | tr -d '"')
+	if [[ -z "$existing" ]]; then
+		echo "couldn't find ALLOWED_BARK_VERSIONS block in $target" >&2
+		exit 1
+	fi
+	if grep -qxF "$cur" <<<"$existing"; then
+		n=$(wc -l <<<"$existing")
+		echo "$cur already present in ALLOWED_BARK_VERSIONS ($n entries); no change"
+		exit 0
+	fi
+	# Sort by (length desc, semver asc) so output is stable and readable.
+	sorted=$(printf '%s\n%s\n' "$existing" "$cur" | sort -u | awk '
+		{ vals[NR] = $0 }
+		END {
+			for (i = 1; i <= NR; i++)
+				for (j = 1; j <= NR - i; j++) {
+					a = vals[j]; b = vals[j+1]
+					la = length(a); lb = length(b)
+					if (la < lb || (la == lb && semver_gt(a, b))) {
+						vals[j] = b; vals[j+1] = a
+					}
+				}
+			for (i = 1; i <= NR; i++) print vals[i]
+		}
+		function semver_gt(a, b,   ax, bx, i) {
+			split(a, ax, "."); split(b, bx, ".")
+			for (i = 1; i <= 3; i++) {
+				if (ax[i]+0 > bx[i]+0) return 1
+				if (ax[i]+0 < bx[i]+0) return 0
+			}
+			return 0
+		}')
+	# 5-per-line, tab-indented.
+	formatted=$(echo "$sorted" | awk '
+		BEGIN { line = ""; n = 0 }
+		{
+			if (n == 0) line = "\t\"" $0 "\","
+			else        line = line " \"" $0 "\","
+			n++
+			if (n == 5) { print line; line = ""; n = 0 }
+		}
+		END { if (n > 0) print line }')
+	tmp=$(mktemp)
+	awk -v block="$formatted" '
+		$0 == "const ALLOWED_BARK_VERSIONS: &[&str] = &[" {
+			print
+			print block
+			skip = 1; next
+		}
+		skip && $0 == "];" { skip = 0; print; next }
+		!skip { print }
+	' "$target" > "$tmp"
+	mv "$tmp" "$target"
+	total=$(wc -l <<<"$sorted")
+	echo "added $cur → $target ($total entries total)"
+
+generate-static-files: dump-server-sql-schema dump-bark-sql-schema generate-bark-rest-client update-allowed-bark-versions
+
+# Bump lockstep-group Cargo.toml versions to NEW_VERSION (idempotent).
+bump-workspace-versions NEW_VERSION:
+	bash contrib/bump-workspace-versions.sh {{NEW_VERSION}}
+
+# Release cut: bump versions, regen derived files, verify build.
+# Changelog, commit, tag, and push are manual.
+release-new-version NEW_VERSION: (bump-workspace-versions NEW_VERSION) generate-static-files checks
+	#!/usr/bin/env bash
+	set -euo pipefail
+	echo ""
+	echo "Workspace bumped, derived state refreshed, and build verified for v{{NEW_VERSION}}."
+	echo ""
+	echo "Next steps (manual):"
+	echo "  1. Review the diff. Verify Cargo.toml bumps hit every lockstep"
+	echo "     crate and no unrelated external deps got dragged along."
+	echo "  2. Merge unreleased CHANGELOG entries into CHANGELOG.md"
+	echo "     (bash contrib/dump-unreleased-changelog.sh --remove to dump + clear)."
+	echo "  3. git commit -am 'Release v{{NEW_VERSION}}'"
+	echo "  4. Push the branch and open a merge request."
+	echo "  5. After the MR is merged, tag the merge commit on master and push:"
+	echo "       git tag bark-{{NEW_VERSION}} <merge-commit>"
+	echo "       git push origin bark-{{NEW_VERSION}}"
+
+# `build-msrv-lib` is invoked separately from the Dockerfile because it needs
+# the .#msrv-lib nix shell rather than .#default.
+[doc("pre-run every CI recipe so the CI base image ships with a warm build cache")]
+ci-warmup: check build check-fuzz check-release check-bark-as-libs test-doc test-bark-wasm-indexed-db build-bark-wasm build-lib-wasm-release check-lib-arithmetic check-use-bark-as-dependency build-unit-tests-ci build-ci
+
+cachix-push:
+	nix develop .#default  --profile /tmp/bark-shell-dev      -c true
+	nix develop .#build    --profile /tmp/bark-shell-build    -c true
+	nix develop .#ci       --profile /tmp/bark-shell-ci       -c true
+	nix develop .#msrv-lib --profile /tmp/bark-shell-msrv-lib -c true
+	cachix push bark /tmp/bark-shell-dev
+	cachix push bark /tmp/bark-shell-build
+	cachix push bark /tmp/bark-shell-ci
+	cachix push bark /tmp/bark-shell-msrv-lib
+
+[doc("build a single nix release package and copy its binaries into build/ suffixed with the target triple")]
+_nix-build-collect package target:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	mkdir -p build
+	out=$(nix build --no-link --print-out-paths ${NIX_BUILD_FLAGS:-} ".#{{package}}-{{target}}")
+	for bin in "$out"/bin/*
+	do
+		name=$(basename "$bin")
+		if [[ "$name" == *.exe ]]; then
+			dest="build/${name%.exe}-{{target}}.exe"
+		else
+			dest="build/$name-{{target}}"
+		fi
+		install -m 755 "$bin" "$dest"
+		echo "$dest"
+	done
+
+# Like _nix-build-collect bark, but embeds a specific bark-web version (any
+# ref on the bark-web repo: a vX.Y.Z tag, a branch, or a commit) instead of
+# the flake.lock pin, through the BARK_WEB_VERSION env var (which requires
+# an impure build). Builds for this machine's target unless given another.
+nix-build-bark-web-version version target=HOST_TARGET:
+	BARK_WEB_VERSION={{version}} NIX_BUILD_FLAGS=--impure \
+		just _nix-build-collect bark {{target}}
+
+nix-build-bark-all:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	for target in \
+		x86_64-unknown-linux-gnu \
+		x86_64-unknown-linux-musl \
+		aarch64-unknown-linux-musl \
+		armv7-unknown-linux-musleabihf \
+		x86_64-apple-darwin \
+		aarch64-apple-darwin \
+		x86_64-pc-windows-gnu
+	do
+		just _nix-build-collect bark "$target"
+	done
+	just _nix-build-checksums
+
+# The linux bark artifacts only, used by the nightly release.
+nix-build-bark-linux:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	for target in \
+		x86_64-unknown-linux-gnu \
+		x86_64-unknown-linux-musl \
+		aarch64-unknown-linux-musl \
+		armv7-unknown-linux-musleabihf
+	do
+		just _nix-build-collect bark "$target"
+	done
+	just _nix-build-checksums
+
+nix-build-server-all:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	for target in \
+		x86_64-unknown-linux-gnu \
+		x86_64-unknown-linux-musl
+	do
+		just _nix-build-collect bark-server "$target"
+	done
+	just _nix-build-checksums
+
+nix-build-all: nix-build-bark-all nix-build-server-all
+
+# Regenerates build/SHA256SUMS over all collected artifacts. Removed first so
+# the glob can't pick up a stale copy and hash the file into itself; LC_ALL=C
+# so the ordering doesn't depend on the locale.
+_nix-build-checksums:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	cd build
+	rm -f SHA256SUMS
+	LC_ALL=C sha256sum * > SHA256SUMS
+	cat SHA256SUMS

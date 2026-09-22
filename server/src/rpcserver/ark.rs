@@ -1,12 +1,13 @@
 
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic;
-use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
 use ark::attestations::DelegatedRoundParticipationAttestation;
 use ark::attestations::OffboardRequestAttestation;
+use ark::attestations::VtxoStatusAttestation;
 use ark::rounds::RoundAttemptAttestation;
 use bitcoin::consensus::serialize;
 use bitcoin::Txid;
@@ -14,7 +15,9 @@ use bitcoin::{Amount, OutPoint};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{rand, PublicKey};
 use tokio::sync::oneshot;
-use tokio_stream::{Stream, StreamExt};
+use futures::StreamExt;
+use tokio_stream::Stream;
+use tonic::codec::CompressionEncoding;
 use tower_http::cors::CorsLayer;
 use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
 use tracing::info;
@@ -23,13 +26,16 @@ use ark::{musig, ProtocolEncoding, Vtxo, VtxoId};
 use ark::arkoor::package::ArkoorPackageCosignRequest;
 use ark::mailbox::MailboxIdentifier;
 use ark::forfeit::HashLockedForfeitBundle;
-use ark::lightning::{Bolt12InvoiceExt, Invoice, Offer, OfferAmountExt, PaymentHash, Preimage};
+use ark::lightning::{
+	offer_request_amount, Bolt12InvoiceExt, Invoice, Offer, PaymentHash, Preimage,
+};
 use ark::tree::signed::{LeafVtxoCosignRequest, UnlockHash, UnlockPreimage};
-use ark::rounds::RoundId;
 use ark::vtxo::Full;
 use ark::vtxo::policy::check_block_height;
 use bitcoin_ext::{BlockDelta, BlockHeight};
-use server_rpc::{self as rpc, protos, TryFromBytes};
+use server_rpc::{self as rpc, protos, RequestExt, TryFromBytes};
+use crate::database::SpendState;
+
 use crate::database::rounds::StoredRoundOutput;
 use crate::round::DelegatedInput;
 use crate::round::SelfSignedInput;
@@ -39,6 +45,7 @@ use crate::rpcserver::{
 	ReceiverExt,
 	StatusContext,
 	ToStatusResult,
+	DEFAULT_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS,
 	MAX_PROTOCOL_VERSION,
 	MIN_PROTOCOL_VERSION,
 	RPC_RICH_ERRORS,
@@ -47,6 +54,26 @@ use crate::round::RoundInput;
 use crate::rpcserver::macros;
 use crate::telemetry;
 
+
+/// Map an internal [`SpendState`] to the client-facing [`protos::VtxoSpendState`].
+///
+/// Returns `None` for server-internal states (pool, forfeit, connector). A user
+/// can never prove ownership of such a vtxo, so the `get_vtxo_status` endpoint
+/// reports those as not found rather than leaking their existence.
+fn client_spend_state(spend_state: SpendState) -> Option<protos::VtxoSpendState> {
+	match spend_state {
+		SpendState::Spendable => Some(protos::VtxoSpendState::Spendable),
+		SpendState::HtlcRecvUnclaimed => Some(protos::VtxoSpendState::HtlcRecvUnclaimed),
+		SpendState::Spent => Some(protos::VtxoSpendState::Spent),
+		SpendState::LnSpent => Some(protos::VtxoSpendState::Spent),
+		SpendState::Unclaimed => Some(protos::VtxoSpendState::Unclaimed),
+		SpendState::Unregistered => Some(protos::VtxoSpendState::Unregistered),
+		SpendState::Pool
+		| SpendState::RoundForfeit
+		| SpendState::OffboardForfeit
+		| SpendState::OffboardConnector => None,
+	}
+}
 
 #[async_trait]
 impl rpc::server::ArkService for Server {
@@ -57,12 +84,33 @@ impl rpc::server::ArkService for Server {
 	) -> Result<tonic::Response<protos::HandshakeResponse>, tonic::Status> {
 		let req = req.into_inner();
 
-		telemetry::count_bark_version(req.bark_version);
+		// Don't refuse unknown versions: attach a PSA nudge instead so
+		// we don't lock out existing users.
+		let class = telemetry::classify_bark_version(req.bark_version.as_deref());
+		telemetry::count_bark_version(class);
+		let version_psa = match class {
+			telemetry::BarkVersionClass::Known(_) => None,
+			telemetry::BarkVersionClass::Missing => Some(
+				"Your bark client did not identify its version to this Ark server. \
+				 You may be running an outdated build; please update your bark client \
+				 or contact support if the problem persists.".to_string()
+			),
+			telemetry::BarkVersionClass::Unknown => Some(
+				"Your bark client version is not recognised by this Ark server. \
+				 You may be running an outdated or unofficial build; please update \
+				 your bark client or contact support if the problem persists.".to_string()
+			),
+		};
+		let psa = match (version_psa, self.config.handshake_psa.clone()) {
+			(None, op) => op,
+			(Some(v), None) => Some(v),
+			(Some(v), Some(op)) => Some(format!("{}\n\n{}", v, op)),
+		};
 
 		let ret = protos::HandshakeResponse {
 			min_protocol_version: MIN_PROTOCOL_VERSION,
 			max_protocol_version: MAX_PROTOCOL_VERSION,
-			psa: self.config.handshake_psa.clone(),
+			psa,
 		};
 		Ok(tonic::Response::new(ret))
 	}
@@ -88,49 +136,6 @@ impl rpc::server::ArkService for Server {
 	}
 
 	#[tracing::instrument(skip(self, req))]
-	async fn get_fresh_rounds(
-		&self,
-		req: tonic::Request<protos::FreshRoundsRequest>,
-	) -> Result<tonic::Response<protos::FreshRounds>, tonic::Status> {
-		let req = req.into_inner();
-
-		let txid = match req.last_round_txid {
-			Some(t) => Some(RoundId::from_str(&t).badarg("invalid last_round_txid")?),
-			None => None,
-		};
-		let lifetime = Duration::from_secs(10 * 60 * self.config.vtxo_lifetime as u64);
-		let ids = self.db.read(async |t| t.get_fresh_round_ids(txid, Some(lifetime)).await).await
-			.context("db error")?;
-
-		let response = protos::FreshRounds {
-			txids: ids.into_iter().map(|t| t.to_byte_array().to_vec()).collect(),
-		};
-
-		Ok(tonic::Response::new(response))
-	}
-
-	#[tracing::instrument(skip(self, req))]
-	async fn get_round(
-		&self,
-		req: tonic::Request<protos::RoundId>,
-	) -> Result<tonic::Response<protos::RoundInfo>, tonic::Status> {
-		let req = req.into_inner();
-
-		let id = RoundId::from_bytes(req.txid.as_slice())?;
-
-		let ret = self.db.read(async |t| t.get_round(id).await).await
-			.context("db error")?
-			.not_found([id], "round with txid {} not found")?;
-
-		let response = protos::RoundInfo {
-			funding_tx: bitcoin::consensus::serialize(&ret.funding_tx),
-			signed_vtxos: ret.signed_tree.serialize(),
-		};
-
-		Ok(tonic::Response::new(response))
-	}
-
-	#[tracing::instrument(skip(self, req))]
 	async fn get_vtxo(
 		&self,
 		req: tonic::Request<protos::GetVtxoRequest>,
@@ -149,6 +154,39 @@ impl rpc::server::ArkService for Server {
 		Ok(tonic::Response::new(response))
 	}
 
+	#[tracing::instrument(skip(self, req))]
+	async fn get_vtxo_status(
+		&self,
+		req: tonic::Request<protos::GetVtxoStatusRequest>,
+	) -> Result<tonic::Response<protos::GetVtxoStatusResponse>, tonic::Status> {
+		let req = req.into_inner();
+
+		let id = VtxoId::from_bytes(req.vtxo_id)?;
+		let attestation = VtxoStatusAttestation::from_bytes(&req.attestation)?;
+
+		let vtxo_state = self.db.read(async |t| t.get_server_vtxo_by_id(id).await).await
+			.to_status()?;
+
+		let spend_state = vtxo_state.spend_state;
+		let user_vtxo = match vtxo_state.vtxo.try_into_user_vtxo() {
+			Ok(v) => v,
+			Err(_) => {
+				macros::not_found!([id], "VTXO not found");
+			},
+		};
+
+		attestation.verify(&user_vtxo)
+			.badarg("invalid VTXO status attestation")?;
+
+		let Some(spend_state) = client_spend_state(spend_state) else {
+			macros::not_found!([id], "VTXO not found");
+		};
+
+		Ok(tonic::Response::new(protos::GetVtxoStatusResponse {
+			spend_state: spend_state as i32,
+		}))
+	}
+
 	// boarding
 
 	#[tracing::instrument(skip(self, req), fields(
@@ -159,7 +197,15 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::BoardCosignRequest>,
 	) -> Result<tonic::Response<protos::BoardCosignResponse>, tonic::Status> {
+		let pver = req.pver()?;
 		let req = req.into_inner();
+
+		if pver < server_rpc::pver::PROTOCOL_VERSION_BOARD_FUNDING_TX
+			&& self.config.require_board_funding_tx
+		{
+			macros::badarg!("Your client version is too old, you need to update \
+				in order to be able to board.");
+		}
 
 		let amount = Amount::from_sat(req.amount);
 		let user_pubkey = PublicKey::from_bytes(&req.user_pubkey)?;
@@ -167,9 +213,14 @@ impl rpc::server::ArkService for Server {
 			.map_err(|e| tonic::Status::invalid_argument(format!("expiry_height: {e}")))?;
 		let utxo = OutPoint::from_bytes(&req.utxo)?;
 		let pub_nonce = musig::PublicNonce::from_bytes(&req.pub_nonce)?;
+		let funding_tx = if self.config.require_board_funding_tx {
+			Some(bitcoin::Transaction::from_bytes(&req.funding_tx)?)
+		} else {
+			None
+		};
 
 		let resp = self.cosign_board(
-			amount, user_pubkey, expiry_height, utxo, pub_nonce,
+			amount, user_pubkey, expiry_height, utxo, funding_tx.as_ref(), pub_nonce,
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(resp.into()))
@@ -211,7 +262,7 @@ impl rpc::server::ArkService for Server {
 			.collect::<Result<Vec<_>, _>>()
 			.map_err(|e| tonic::Status::invalid_argument(format!("invalid vtxo: {}", e)))?;
 
-		self.store_vtxo_transactions(&vtxos).await.to_status()?;
+		Server::register_vtxo_transactions(self, &vtxos).await.to_status()?;
 
 		Ok(tonic::Response::new(protos::Empty {}))
 	}
@@ -225,7 +276,20 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RegisterVtxoTransactionsRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
-		self.register_vtxo_transactions(req).await
+		let req = req.into_inner();
+
+		if req.vtxos.is_empty() {
+			macros::badarg!("no vtxos provided");
+		}
+
+		let vtxos = req.vtxos.iter()
+			.map(|v| <Vtxo<Full>>::deserialize(&v[..]))
+			.collect::<Result<Vec<_>, _>>()
+			.map_err(|e| tonic::Status::invalid_argument(format!("invalid vtxo: {}", e)))?;
+
+		Server::register_vtxo_transactions(self, &vtxos).await.to_status()?;
+
+		Ok(tonic::Response::new(protos::Empty {}))
 	}
 
 	// arkoor
@@ -250,7 +314,13 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::LightningPayHtlcCosignRequest>,
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
+		let pver = req.pver()?;
 		let req = req.into_inner();
+
+		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
+			macros::badarg!("Your client version is too old, you need to update \
+				in order to be able to send Lightning payments.");
+		}
 
 		let cosign_requests = ArkoorPackageCosignRequest::try_from(req.clone())
 			.context("Failed to parse request")?;
@@ -266,7 +336,13 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::InitiateLightningPaymentRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		let pver = req.pver()?;
 		let req = req.into_inner();
+
+		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
+			macros::badarg!("Your client version is too old, you need to update \
+				in order to be able to send Lightning payments.");
+		}
 
 		let htlc_vtxo_ids = req.htlc_vtxo_ids.iter()
 			.map(VtxoId::from_bytes)
@@ -280,7 +356,9 @@ impl rpc::server::ArkService for Server {
 			.transpose()
 			.map_err(|_| tonic::Status::invalid_argument("invalid mailbox_id"))?;
 
-		self.initiate_lightning_payment(invoice, payment_amount, htlc_vtxo_ids, mailbox_id).await.to_status()?;
+		self.initiate_lightning_payment(invoice, payment_amount, htlc_vtxo_ids, mailbox_id)
+			.await
+			.to_status()?;
 		Ok(tonic::Response::new(protos::Empty {}))
 	}
 
@@ -326,15 +404,10 @@ impl rpc::server::ArkService for Server {
 			},
 		};
 
-		let amount = match req.amount_sat {
-			Some(a) => { Amount::from_sat(a) },
-			None if offer.amount().is_some() => offer.amount().unwrap()
-				.to_bitcoin_amount()
-				.badarg("unsupported offer currency")?,
-			None => {
-				macros::badarg!("amount_sat is required for bolt12 offers with no amount specified");
-			},
-		};
+		// NB the client derives the amount it authorizes the same way, and checks the
+		// invoice we return against it, so both sides must agree on this.
+		let amount = offer_request_amount(&offer, req.amount_sat.map(Amount::from_sat))
+			.badarg("cannot determine the amount to request for this offer")?;
 
 		let invoice = self.fetch_bolt12_invoice(offer, amount).await.to_status()?;
 
@@ -350,7 +423,13 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::StartLightningReceiveRequest>,
 	) -> Result<tonic::Response<protos::StartLightningReceiveResponse>, tonic::Status> {
+		let pver = req.pver()?;
 		let req = req.into_inner();
+
+		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
+			macros::badarg!("Your client version is too old, you need to update \
+				in order to be able to receive Lightning payments.");
+		}
 
 		let payment_hash = PaymentHash::from_bytes(req.payment_hash)?;
 		let amount = Amount::from_sat(req.amount_sat);
@@ -363,7 +442,7 @@ impl rpc::server::ArkService for Server {
 		let resp = self.start_lightning_receive(
 			payment_hash,
 			amount,
-			req.min_cltv_delta as BlockDelta,
+			BlockDelta::try_from(req.min_cltv_delta).badarg("invalid min_cltv_delta")?,
 			mailbox_id,
 			req.description,
 		).await.to_status()?;
@@ -389,12 +468,18 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::PrepareLightningReceiveClaimRequest>
 	) -> Result<tonic::Response<protos::PrepareLightningReceiveClaimResponse>, tonic::Status> {
+		let pver = req.pver()?;
 		let req = req.into_inner();
+
+		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
+			macros::badarg!("Your client version is too old, you need to update \
+				in order to be able to receive Lightning payments.");
+		}
 
 		let payment_hash = PaymentHash::from_bytes(req.payment_hash)?;
 
 		let user_pubkey = PublicKey::from_bytes(&req.user_pubkey)?;
-		let htlc_recv_expiry = req.htlc_recv_expiry as BlockHeight;
+		let htlc_recv_expiry = BlockHeight::new(req.htlc_recv_expiry);
 
 		let (sub, htlcs) = self.prepare_lightning_claim(
 			payment_hash, user_pubkey, htlc_recv_expiry, req.lightning_receive_anti_dos,
@@ -411,6 +496,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ClaimLightningReceiveRequest>
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
+		let pver = req.pver()?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.payment_hash)?;
@@ -424,6 +510,7 @@ impl rpc::server::ArkService for Server {
 			payment_hash,
 			payment_preimage,
 			cosign_request,
+			pver,
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(cosign_resp.into()))
@@ -457,17 +544,23 @@ impl rpc::server::ArkService for Server {
 		}))
 	}
 
-	type SubscribeRoundsStream = Box<
-		dyn Stream<Item = Result<protos::RoundEvent, tonic::Status>> + Unpin + Send + 'static
-	>;
+	type SubscribeRoundsStream = Pin<Box<
+		dyn Stream<Item = Result<protos::RoundEvent, tonic::Status>> + Send + 'static
+	>>;
 
+	// Concurrency of open SubscribeRounds streams is bounded upstream by
+	// the reverse proxy in front of captaind. Don't add a server-side
+	// limit here.
 	#[tracing::instrument(skip(self, _req))]
 	async fn subscribe_rounds(
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<Self::SubscribeRoundsStream>, tonic::Status> {
-		let stream = self.rounds.events();
-		Ok(tonic::Response::new(Box::new(stream.map(|e| Ok(e.as_ref().into())))))
+		let mgr = self.rtmgr.clone();
+		let stream = self.rounds.events()
+			.map(|e| Ok(e.as_ref().into()))
+			.take_until(async move { mgr.shutdown_signal().await });
+		Ok(tonic::Response::new(Box::pin(stream)))
 	}
 
 	#[tracing::instrument(skip(self, _req))]
@@ -490,7 +583,13 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::SubmitPaymentRequest>,
 	) -> Result<tonic::Response<protos::SubmitPaymentResponse>, tonic::Status> {
+		let pver = req.pver()?;
 		let req = req.into_inner();
+
+		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
+			macros::badarg!("Your client version is too old, you need to update \
+				in order to be able to participate in rounds.");
+		}
 
 		let inputs =  req.input_vtxos.iter().map(|input| {
 			let vtxo_id = VtxoId::from_bytes(&input.vtxo_id)?;
@@ -516,7 +615,12 @@ impl rpc::server::ArkService for Server {
 		let unlock_hash = UnlockHash::hash(&unlock_preimage);
 
 		let (tx, rx) = oneshot::channel();
-		let inp = RoundInput::RegisterPayment { inputs, vtxo_requests, unlock_preimage };
+		let inp = RoundInput::RegisterPayment {
+			inputs,
+			vtxo_requests,
+			unlock_preimage,
+			client: crate::telemetry::current_client(),
+		};
 
 		self.rounds.round_input_tx.send((inp, tx))
 			.expect("input channel closed");
@@ -534,7 +638,13 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::VtxoSignaturesRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		let pver = req.pver()?;
 		let req = req.into_inner();
+
+		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
+			macros::badarg!("Your client version is too old, you need to update \
+				in order to be able to participate in rounds.");
+		}
 
 		let (tx, rx) = oneshot::channel();
 		let inp = RoundInput::VtxoSignatures {
@@ -560,7 +670,13 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RoundParticipationRequest>,
 	) -> Result<tonic::Response<protos::RoundParticipationResponse>, tonic::Status> {
+		let pver = req.pver()?;
 		let req = req.into_inner();
+
+		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
+			macros::badarg!("Your client version is too old, you need to update \
+				in order to be able to participate in rounds.");
+		}
 
 		let inputs =  req.input_vtxos.iter().map(|input| {
 			let vtxo_id = VtxoId::from_bytes(&input.vtxo_id)?;
@@ -583,8 +699,9 @@ impl rpc::server::ArkService for Server {
 			});
 		}
 
-		let unlock_hash = self.register_non_interactive_round_participation(inputs, outputs).await
-			.to_status()?;
+		let unlock_hash = self.register_delegated_round_participation(
+			inputs, outputs, req.scheduled_height.map(BlockHeight::new),
+		).await.to_status()?;
 
 		Ok(tonic::Response::new(protos::RoundParticipationResponse {
 			unlock_hash: unlock_hash.to_byte_array().to_vec(),
@@ -601,6 +718,7 @@ impl rpc::server::ArkService for Server {
 		let unlock_hash = UnlockHash::from_bytes(&req.unlock_hash)?;
 		let part = self.db.read(async |t| t.get_round_participation_by_unlock_hash(unlock_hash).await).await.to_status()?
 			.not_found([unlock_hash], "round participation not found")?;
+		let input_vtxo_ids = part.inputs.iter().map(|i| i.vtxo_id.to_bytes().to_vec()).collect();
 
 		let res = if let Some(round_id) = part.round_id {
 			//TODO(stevenroose) consider storing the new vtxos in the participation table
@@ -611,10 +729,15 @@ impl rpc::server::ArkService for Server {
 			let round_funding_tx = Some(serialize(&round.funding_tx));
 
 			let mut output_vtxos = Vec::with_capacity(part.outputs.len());
-			let tree = round.signed_tree.into_cached_tree();
-			for output in &part.outputs {
-				let idx = tree.spec.spec.leaf_idx_of_req(&output.vtxo_request)
-					.with_context(|| format!("output req {:?} not in round {}", output.vtxo_request, round.id))?;
+			// NB the round can predate the v1 hashlock clauses, so the tree's
+			// hashlock version has to be detected to build the correct vtxos
+			let tree = round.into_cached_tree().to_status()?;
+			// NB bind every output to its own leaf: identical requests within
+			// a participation correspond to distinct leaves in the tree
+			let leaf_idxs = tree.spec.spec.leaf_idxs_for_participation(
+				unlock_hash, part.outputs.iter().map(|o| &o.vtxo_request),
+			).with_context(|| format!("participation outputs not in round {}", round_id))?;
+			for idx in leaf_idxs {
 				output_vtxos.push(tree.build_vtxo(idx).serialize());
 			}
 
@@ -622,18 +745,19 @@ impl rpc::server::ArkService for Server {
 				protos::RoundParticipationStatusResponse {
 					status: protos::RoundParticipationStatus::RoundPartReleased.into(),
 					unlock_preimage: Some(part.unlock_preimage.leak_ref().to_vec()),
-					round_funding_tx, output_vtxos,
+					input_vtxo_ids, round_funding_tx, output_vtxos,
 				}
 			} else {
 				protos::RoundParticipationStatusResponse {
 					status: protos::RoundParticipationStatus::RoundPartIssued.into(),
 					unlock_preimage: None,
-					round_funding_tx, output_vtxos,
+					input_vtxo_ids, round_funding_tx, output_vtxos,
 				}
 			}
 		} else {
 			protos::RoundParticipationStatusResponse {
 				status: protos::RoundParticipationStatus::RoundPartPending.into(),
+				input_vtxo_ids,
 				round_funding_tx: None,
 				unlock_preimage: None,
 				output_vtxos: vec![],
@@ -648,7 +772,13 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::LeafVtxoCosignRequest>,
 	) -> Result<tonic::Response<protos::LeafVtxoCosignResponse>, tonic::Status> {
+		let pver = req.pver()?;
 		let req = req.into_inner();
+
+		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
+			macros::badarg!("Your client version is too old, you need to update \
+				in order to be able to participate in rounds.");
+		}
 
 		let vtxo_id = VtxoId::from_bytes(req.vtxo_id)?;
 
@@ -664,7 +794,17 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ForfeitNoncesRequest>,
 	) -> Result<tonic::Response<protos::ForfeitNoncesResponse>, tonic::Status> {
+		let pver = req.pver()?;
 		let req = req.into_inner();
+
+		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
+			macros::badarg!("Your client version is too old, you need to update \
+				in order to be able to participate in rounds.");
+		}
+
+		if req.vtxo_ids.len() > rpc::MAX_NB_FORFEIT_NONCE_IDS {
+			macros::badarg!("too many vtxo ids, max is {}", rpc::MAX_NB_FORFEIT_NONCE_IDS);
+		}
 
 		let unlock_hash = UnlockHash::from_bytes(req.unlock_hash)?;
 		let vtxos = req.vtxo_ids.iter().map(|v| VtxoId::from_bytes(v))
@@ -681,7 +821,13 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ForfeitVtxosRequest>,
 	) -> Result<tonic::Response<protos::ForfeitVtxosResponse>, tonic::Status> {
+		let pver = req.pver()?;
 		let req = req.into_inner();
+
+		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
+			macros::badarg!("Your client version is too old, you need to update \
+				in order to be able to participate in rounds.");
+		}
 
 		let forfeits = req.forfeit_bundles.iter()
 			.map(|v| HashLockedForfeitBundle::from_bytes(v))
@@ -699,16 +845,28 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::PrepareOffboardRequest>,
 	) -> Result<tonic::Response<protos::PrepareOffboardResponse>, tonic::Status> {
+		let pver = req.pver()?;
 		let req = req.into_inner();
 
 		let request = req.offboard.badarg("missing offboard field")?.try_into()
 			.badarg("invalid offboard request")?;
+
+		if pver < server_rpc::pver::PROTOCOL_VERSION_OFFBOARD_FIX {
+			if req.input_vtxo_ids.len() > 1 {
+				return Err(tonic::Status::unavailable(
+					"YOU NEED TO UPDATE YOUR WALLET VERSION FOR THIS OPERATION",
+				));
+			}
+		}
+
 		let input_vtxos = req.input_vtxo_ids.iter().map(|v| VtxoId::from_bytes(v))
 			.collect::<Result<Vec<_>, _>>()?;
 		let attestation = req.attestation.iter()
 			.map(|v| OffboardRequestAttestation::from_bytes(v))
 			.collect::<Result<Vec<_>, _>>()?;
-		let resp = self.prepare_offboard(request, input_vtxos, attestation).await.to_status()?;
+		let resp = self.prepare_offboard(
+			request, input_vtxos, attestation,
+		).await.to_status()?;
 
 		Ok(tonic::Response::new(protos::PrepareOffboardResponse {
 			offboard_tx: serialize(&resp.offboard_tx),
@@ -757,13 +915,26 @@ pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 
 	let (_, health_server) = tonic_health::server::health_reporter();
 
+	// send_compressed compresses responses only for clients that advertise
+	// grpc-accept-encoding, so clients that don't are unaffected. This is
+	// where nearly all the savings are. accept_compressed is kept for
+	// forward-compat: no current client compresses its requests, but
+	// supporting it now means a future client that does needs no server change.
 	let routes = tonic::service::Routes::default()
-		.add_service(rpc::server::ArkServiceServer::from_arc(srv.clone()))
-		.add_service(rpc::server::MailboxServiceServer::from_arc(srv.clone()))
+		.add_service(rpc::server::ArkServiceServer::from_arc(srv.clone())
+			.accept_compressed(CompressionEncoding::Zstd)
+			.send_compressed(CompressionEncoding::Zstd))
+		.add_service(rpc::server::MailboxServiceServer::from_arc(srv.clone())
+			.accept_compressed(CompressionEncoding::Zstd)
+			.send_compressed(CompressionEncoding::Zstd))
 		.add_service(health_server);
 
 	tonic::transport::Server::builder()
 		.accept_http1(true)
+		.http2_max_pending_accept_reset_streams(Some(
+			srv.config.rpc.max_pending_accept_reset_streams
+				.unwrap_or(DEFAULT_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS)
+		))
 		.layer(CorsLayer::permissive())
 		.layer(tonic_web::GrpcWebLayer::new())
 		.layer(OtelGrpcLayer::default())
@@ -774,4 +945,27 @@ pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 	info!("Terminated public gRPC service on address {}", addr);
 
 	Ok(())
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	#[test]
+	fn client_spend_state_collapses_server_internal_states() {
+		// Client-relevant states map to a concrete spend state.
+		assert_eq!(client_spend_state(SpendState::Spendable), Some(protos::VtxoSpendState::Spendable));
+		assert_eq!(client_spend_state(SpendState::HtlcRecvUnclaimed), Some(protos::VtxoSpendState::HtlcRecvUnclaimed));
+		assert_eq!(client_spend_state(SpendState::Spent), Some(protos::VtxoSpendState::Spent));
+		assert_eq!(client_spend_state(SpendState::LnSpent), Some(protos::VtxoSpendState::Spent));
+		assert_eq!(client_spend_state(SpendState::Unclaimed), Some(protos::VtxoSpendState::Unclaimed));
+		assert_eq!(client_spend_state(SpendState::Unregistered), Some(protos::VtxoSpendState::Unregistered));
+
+		// Server-internal states (pool, forfeit, connector) collapse to `None`
+		// so the endpoint reports them as not found.
+		assert_eq!(client_spend_state(SpendState::Pool), None);
+		assert_eq!(client_spend_state(SpendState::RoundForfeit), None);
+		assert_eq!(client_spend_state(SpendState::OffboardForfeit), None);
+		assert_eq!(client_spend_state(SpendState::OffboardConnector), None);
+	}
 }

@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use bitcoin::Network;
 
-use bark::{Config, Wallet};
-use bark::lock_manager::memory::MemoryLockManager;
+use bark::{Config, OpenWalletArgs, Wallet, WalletSeed};
 
 async fn example() -> anyhow::Result<()> {
 	use bark::persist::adaptor::StorageAdaptorWrapper;
@@ -17,13 +16,20 @@ async fn example() -> anyhow::Result<()> {
 		..Config::network_default(Network::Signet)
 	};
 	let db = Arc::new(StorageAdaptorWrapper::new_memory());
-	let lock_manager = Box::new(MemoryLockManager::new());
-	let wallet = Wallet::create(&mnemonic, Network::Signet, cfg, db, lock_manager, false).await?;
+	let wallet = Wallet::open(
+		Network::Signet,
+		WalletSeed::new_from_mnemonic(Network::Signet, &mnemonic),
+		cfg,
+		OpenWalletArgs {
+			persister: Some(db),
+			..Default::default()
+		},
+	).await?;
 
 	let address = wallet.new_address().await?;
 	println!("My first Ark address: {}", address);
 
-	let invoice = wallet.bolt11_invoice("10000sat".parse()?, None).await?;
+	let invoice = wallet.bolt11_invoice("10000sat".parse()?, None, None).await?;
 	println!("Send me some sats: {}", invoice);
 
 	// Wait for someone to send the sats...
@@ -34,7 +40,7 @@ async fn example() -> anyhow::Result<()> {
 
 	// Let's give back!
 	let invoice = "lnbc1... get this from someone you like";
-	wallet.pay_lightning_invoice(invoice, None).await?;
+	wallet.pay_lightning_invoice(invoice, None, false).await?;
 
 	Ok(())
 }

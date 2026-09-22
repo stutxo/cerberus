@@ -9,7 +9,7 @@ use bark::payment_request::{
 };
 use bitcoin::secp256k1::{Keypair, rand::thread_rng};
 use bitcoin::Amount;
-use ark_testing::{btc, sat, TestContext};
+use ark_testing::{btc, require_bark_version, sat, TestContext};
 
 fn new_ark_address(testnet: bool) -> ark::Address {
 	let foreign_server = Keypair::new(&SECP, &mut thread_rng()).public_key();
@@ -31,6 +31,8 @@ fn new_ark_address(testnet: bool) -> ark::Address {
 /// strings, invalid-network literals) are constructed manually.
 #[tokio::test]
 async fn parse_payment_request() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("bark/parse_payment_request").await;
 
 	// Server needs a lightning node so bark can create bolt11 invoices.
@@ -45,6 +47,98 @@ async fn parse_payment_request() {
 		.board_and_confirm_and_register(&ctx, sat(100_000)).await.try_into().unwrap();
 
 	let amount = sat(50_000);
+
+	// -- BIP321 with default payment methods (not amount)
+	{
+		let mut wallet1 = uri_builder_bark.client().await;
+		let uri = wallet1.bip321_uri().build().await.unwrap();
+
+		let request = uri_parser_bark.try_parse_payment_request(&uri.to_string()).await.unwrap();
+
+		assert_eq!(request.amount, None);
+		assert_eq!(request.label.as_deref(), None);
+		assert_eq!(request.message.as_deref(), None);
+		assert_eq!(request.options.len(), 1);
+		assert!(request.options.iter().any(|m| m.method.is_ark()), "should have ark method");
+		assert!(!request.options.iter().any(|m| m.method.is_bitcoin()), "should not have onchain method");
+		assert!(!request.options.iter().any(|m| m.method.is_lightning()), "should not have lightning method");
+		assert!(
+			request.options.iter().all(|m| m.errors.is_empty()),
+			"all methods should be valid",
+		);
+	}
+
+	// -- BIP321 with default payment methods (with amount)
+	{
+		let mut wallet1 = uri_builder_bark.client().await;
+		let uri = wallet1.bip321_uri()
+			.amount(amount)
+			.build().await.unwrap();
+
+		let request = uri_parser_bark.try_parse_payment_request(&uri.to_string()).await.unwrap();
+
+		assert_eq!(request.amount, Some(amount));
+		assert_eq!(request.label.as_deref(), None);
+		assert_eq!(request.message.as_deref(), None);
+		assert_eq!(request.options.len(), 2);
+		assert!(request.options.iter().any(|m| m.method.is_ark()), "should have ark method");
+		assert!(request.options.iter().any(|m| m.method.is_lightning()), "should have lightning method");
+		assert!(!request.options.iter().any(|m| m.method.is_bitcoin()), "should not have onchain method");
+		assert!(
+			request.options.iter().all(|m| m.errors.is_empty()),
+			"all methods should be valid",
+		);
+	}
+
+	// -- BIP 321 with ark + lightning + onchain --
+	{
+		let mut wallet1 = uri_builder_bark.client().await;
+		let mut onchain1 = uri_builder_bark.onchain_client().await;
+		let uri = wallet1.bip321_uri()
+			.amount(amount)
+			.onchain_wallet(&mut onchain1)
+			.label("test-label".to_string())
+			.message("test-message".to_string())
+			.build().await.unwrap();
+
+		let request = uri_parser_bark.try_parse_payment_request(&uri.to_string()).await.unwrap();
+
+		assert_eq!(request.amount, Some(amount));
+		assert_eq!(request.label.as_deref(), Some("test-label"));
+		assert_eq!(request.message.as_deref(), Some("test-message"));
+		assert_eq!(request.options.len(), 3);
+		assert!(request.options.iter().any(|m| m.method.is_bitcoin()), "should have onchain method");
+		assert!(request.options.iter().any(|m| m.method.is_ark()), "should have ark method");
+		assert!(request.options.iter().any(|m| m.method.is_lightning()), "should have lightning method");
+		assert!(
+			request.options.iter().all(|m| m.errors.is_empty()),
+			"all methods should be valid",
+		);
+	}
+
+	// -- BIP 321 with ark only --
+	{
+		let mut wallet1 = uri_builder_bark.client().await;
+		let uri = wallet1.bip321_uri()
+			.amount(amount)
+			.disable_all()
+			.ark(true)
+			.build().await.unwrap();
+
+		let request = uri_parser_bark.try_parse_payment_request(&uri.to_string()).await.unwrap();
+
+		assert!(request.options[0].method.is_ark(), "{:?}", request.options);
+		assert!(request.options[0].errors.is_empty());
+
+		let fees = uri_parser_bark.estimate_payment_fees(request, None).await;
+		assert_eq!(fees.len(), 1);
+		assert_eq!(fees[0].1, FeeEstimate {
+			gross_amount: amount,
+			fee: Amount::ZERO,
+			net_amount: amount,
+			vtxos_spent: vec![vtxo],
+		});
+	}
 
 	// -- BIP 321 with invalid ark address (foreign server, manual URI) --
 	{
@@ -79,6 +173,50 @@ async fn parse_payment_request() {
 			.expect("ark method should be present");
 		assert_eq!(ark_method.method, PaymentMethod::Ark(foreign_ark_addr));
 		assert_eq!(ark_method.errors, vec![PaymentMethodParsingError::InvalidArkAddress(ArkoorAddressError::ServerMismatch)]);
+	}
+
+	// -- BIP 321 with an Arkade address in the ark param (manual) --
+	{
+		// Version-0 (Arkade) address. Bark cannot pay these, so the URI still
+		// parses but the option is surfaced as an unsupported `Custom` method
+		// flagged with an invalid-ark-address error.
+		let arkade_addr = "ark1qzpq904am6clw3pgqwyh4p02708fy4xs0hcpwt7rwfdttuxsjamecr7zmxcnglmw0pqg99mp96dn5duae0l7cr7lm0gt59nhh4psml45xrdk57";
+		let uri = format!("bitcoin:?ark={}", arkade_addr);
+
+		let request = uri_parser_bark.try_parse_payment_request(&uri).await.unwrap();
+
+		assert_eq!(request.options.len(), 1);
+		assert_eq!(request.options[0].method, PaymentMethod::Custom(arkade_addr.to_string()));
+		assert_eq!(
+			request.options[0].errors,
+			vec![PaymentMethodParsingError::InvalidArkAddress(ArkoorAddressError::ServerMismatch)],
+		);
+	}
+
+	// -- BIP 321 with amount only (onchain) --
+	{
+		let mut wallet1 = uri_builder_bark.client().await;
+		let mut onchain1 = uri_builder_bark.onchain_client().await;
+		let uri = wallet1.bip321_uri()
+			.amount(amount)
+			.disable_all()
+			.onchain_wallet(&mut onchain1)
+			.build().await.unwrap();
+		let request = uri_parser_bark.try_parse_payment_request(&uri.to_string()).await.unwrap();
+
+		assert_eq!(request.amount, Some(amount));
+		assert_eq!(request.options.len(), 1);
+		assert!(request.options[0].method.is_bitcoin());
+		assert!(request.options[0].errors.is_empty(), "valid address should have no errors");
+
+		let fees = uri_parser_bark.estimate_payment_fees(request, None).await;
+		assert_eq!(fees.len(), 1);
+		assert_eq!(fees[0].1, FeeEstimate {
+			gross_amount: amount + Amount::from_sat(938),
+			fee: Amount::from_sat(938),
+			net_amount: amount,
+			vtxos_spent: vec![vtxo],
+		});
 	}
 
 	// -- Bare lightning invoice (built by wallet_1, parsed by wallet_2) --

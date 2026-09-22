@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use bitcoin::{Amount, FeeRate, Txid};
+use bitcoin::Txid;
 
 use bitcoin_ext::{BlockHeight, BlockRef};
 
@@ -21,16 +21,8 @@ pub enum ExitTxStatus {
 	AwaitingInputConfirmation {
 		txids: HashSet<Txid>
 	},
-	NeedsSignedPackage,
-	NeedsReplacementPackage {
-		min_fee_rate: FeeRate,
-		min_fee: Amount,
-	},
-	NeedsBroadcasting {
-		child_txid: Txid,
-		origin: ExitTxOrigin,
-	},
-	BroadcastWithCpfp {
+	AwaitingCpfpBroadcast,
+	AwaitingConfirmation {
 		child_txid: Txid,
 		origin: ExitTxOrigin,
 	},
@@ -44,8 +36,7 @@ pub enum ExitTxStatus {
 impl ExitTxStatus {
 	pub fn child_txid(&self) -> Option<&Txid> {
 		match self {
-			ExitTxStatus::NeedsBroadcasting { child_txid, .. } => Some(child_txid),
-			ExitTxStatus::BroadcastWithCpfp { child_txid, .. } => Some(child_txid),
+			ExitTxStatus::AwaitingConfirmation { child_txid, .. } => Some(child_txid),
 			ExitTxStatus::Confirmed { child_txid, .. } => Some(child_txid),
 			_ => None,
 		}
@@ -71,13 +62,7 @@ pub enum ExitTxOrigin {
 	Wallet {
 		confirmed_in: Option<BlockRef>
 	},
-	Mempool {
-		/// This is the effective fee rate of the transaction (including CPFP ancestors)
-		#[serde(rename = "fee_rate_kwu")]
-		fee_rate: FeeRate,
-		/// This includes the fees of the CPFP ancestors
-		total_fee: Amount,
-	},
+	Mempool,
 	Block {
 		confirmed_in: BlockRef
 	},
@@ -87,8 +72,20 @@ impl ExitTxOrigin {
 	pub fn confirmed_in(&self) -> Option<BlockRef> {
 		match self {
 			ExitTxOrigin::Wallet { confirmed_in } => *confirmed_in,
-			ExitTxOrigin::Mempool { .. } => None,
+			ExitTxOrigin::Mempool => None,
 			ExitTxOrigin::Block { confirmed_in } => Some(*confirmed_in),
+		}
+	}
+
+	/// Returns a copy of this origin reflecting the given confirmation state, preserving the
+	/// origin kind where it makes sense. A `Wallet` origin keeps its kind (we still know it's
+	/// ours) and updates its `confirmed_in`; mempool/block origins become `Block` once confirmed
+	/// and `Mempool` otherwise.
+	pub fn with_confirmed_in(self, confirmed_in: Option<BlockRef>) -> ExitTxOrigin {
+		match (self, confirmed_in) {
+			(ExitTxOrigin::Wallet { .. }, _) => ExitTxOrigin::Wallet { confirmed_in },
+			(_, Some(confirmed_in)) => ExitTxOrigin::Block { confirmed_in },
+			(_, None) => ExitTxOrigin::Mempool,
 		}
 	}
 }
@@ -138,6 +135,22 @@ pub struct ExitClaimedState {
 	pub block: BlockRef,
 }
 
+/// Terminal state reached when the exit cannot proceed because the VTXO has already been
+/// consumed by something other than this exit (e.g. the server forfeited it in a round).
+/// No exit transactions can be broadcast at this point; the caller should cancel the
+/// associated movement and remove the exit from active tracking.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExitVtxoAlreadySpentState {
+	pub tip_height: BlockHeight,
+}
+
+/// Resumable state for the current exit attempt: the user explicitly canceled the exit while
+/// it was still in its abortable window (before any exit transaction was broadcast).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExitCanceledState {
+	pub tip_height: BlockHeight,
+}
+
 impl Into<ExitState> for ExitStartState {
 	fn into(self) -> ExitState {
 		ExitState::Start(self)
@@ -171,5 +184,17 @@ impl Into<ExitState> for ExitClaimInProgressState {
 impl Into<ExitState> for ExitClaimedState {
 	fn into(self) -> ExitState {
 		ExitState::Claimed(self)
+	}
+}
+
+impl Into<ExitState> for ExitVtxoAlreadySpentState {
+	fn into(self) -> ExitState {
+		ExitState::VtxoAlreadySpent(self)
+	}
+}
+
+impl Into<ExitState> for ExitCanceledState {
+	fn into(self) -> ExitState {
+		ExitState::Canceled(self)
 	}
 }

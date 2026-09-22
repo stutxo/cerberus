@@ -5,6 +5,13 @@
 //! - created and ready to spend on Ark: [VtxoStateKind::Spendable]
 //! - owned but not usable because it is locked by subsystem: [VtxoStateKind::Locked]
 //! - consumed (no longer part of the wallet's balance): [VtxoStateKind::Spent]
+//! - taken on-chain via a unilateral exit: [VtxoStateKind::Exited]. Distinct from
+//!   [VtxoStateKind::Spent] so callers can tell whether a VTXO disappeared from the
+//!   wallet because the user forfeited it (round, send) or because the user moved
+//!   it onchain. The server refuses VTXOs once every exit transaction for a VTXO has
+//!   been broadcast, even before the corresponding on-chain UTXO has been claimed, so
+//!   the VTXO will enter [VtxoStateKind::Exited] as soon as we expect a VTXO to become
+//!   unusable offchain.
 //!
 //! Two layers of state are provided:
 //! - [VtxoStateKind]: a compact, serialization-friendly discriminator intended for storage, logs,
@@ -21,11 +28,40 @@ use bitcoin::Weight;
 
 use ark::Vtxo;
 use ark::vtxo::{Bare, Full, VtxoRef};
+
+use crate::actions::WalletActionId;
 use crate::movement::MovementId;
+
+/// What kind of entity holds a [VtxoState::Locked] reservation.
+///
+/// The wallet's invariant is "every vtxo lock is owned by exactly one
+/// operation." For subsystems modelled as a [crate::actions::WalletAction] (today: the
+/// lightning send), that's an `Action(id)`. For subsystems that still
+/// run pre-action machinery (round, offboard, board, lightning receive)
+/// the holder is the operation's movement, captured as
+/// `Movement(MovementId)`. As those subsystems get converted to actions,
+/// new variants land here and the migration from `Movement` happens
+/// per-subsystem.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum VtxoLockHolder {
+	/// A [crate::actions::WalletAction] checkpointed in `bark_wallet_action_checkpoint`.
+	Action { id: WalletActionId },
+	/// A pre-action subsystem (round, offboard, board, lightning
+	/// receive). The movement is used as a stable handle.
+	Movement { id: MovementId },
+}
+
+impl From<MovementId> for VtxoLockHolder {
+	fn from(id: MovementId) -> Self {
+		VtxoLockHolder::Movement { id }
+	}
+}
 
 const SPENDABLE: &'static str = "Spendable";
 const LOCKED: &'static str = "Locked";
 const SPENT: &'static str = "Spent";
+const EXITED: &'static str = "Exited";
 
 /// A compact, serialization-friendly representation of a VTXO's state.
 ///
@@ -38,6 +74,12 @@ pub enum VtxoStateKind {
 	Locked,
 	/// The [Vtxo] has been consumed and is no longer part of the wallet's balance.
 	Spent,
+	/// The [Vtxo] has been moved on-chain via a unilateral exit. Like
+	/// [VtxoStateKind::Spent], an `Exited` vtxo is no longer part of the wallet's balance
+	/// and the server will refuse to interact with it; unlike `Spent`, the disappearance
+	/// is the result of the user taking the funds onchain rather than forfeiting them in
+	/// the protocol.
+	Exited,
 }
 
 impl VtxoStateKind {
@@ -47,6 +89,7 @@ impl VtxoStateKind {
 			VtxoStateKind::Spendable => SPENDABLE,
 			VtxoStateKind::Locked => LOCKED,
 			VtxoStateKind::Spent => SPENT,
+			VtxoStateKind::Exited => EXITED,
 		}
 	}
 
@@ -55,6 +98,7 @@ impl VtxoStateKind {
 			VtxoStateKind::Spendable => 0,
 			VtxoStateKind::Locked { .. } => 1,
 			VtxoStateKind::Spent => 2,
+			VtxoStateKind::Exited => 3,
 		}
 	}
 
@@ -63,6 +107,7 @@ impl VtxoStateKind {
 		VtxoStateKind::Spendable,
 		VtxoStateKind::Locked,
 		VtxoStateKind::Spent,
+		VtxoStateKind::Exited,
 	];
 
 	/// List of the different states considered unspent
@@ -90,13 +135,20 @@ impl fmt::Debug for VtxoStateKind {
 pub enum VtxoState {
 	/// The [Vtxo] is available and can be spent in a future round.
 	Spendable,
-	/// The [Vtxo] is currently locked in an action.
+	/// The [Vtxo] is currently locked by an operation.
+	///
+	/// `holder` is `None` for the narrow window between creating a
+	/// fresh locked vtxo and pinning it to a specific operation (e.g.
+	/// during the offboard's preparatory arkoor). Production code
+	/// should set the holder explicitly whenever it knows the owner.
 	Locked {
-		/// The ID of the associated [Movement](crate::movement::Movement) that locked this VTXO.
-		movement_id: Option<MovementId>,
+		holder: Option<VtxoLockHolder>,
 	},
 	/// The [Vtxo] has been consumed.
 	Spent,
+	/// The [Vtxo] is in (or has completed) a unilateral exit. See
+	/// [VtxoStateKind::Exited] for the distinction from [VtxoState::Spent].
+	Exited,
 }
 
 impl VtxoState {
@@ -106,6 +158,7 @@ impl VtxoState {
 			VtxoState::Spendable => VtxoStateKind::Spendable,
 			VtxoState::Locked { .. } => VtxoStateKind::Locked,
 			VtxoState::Spent => VtxoStateKind::Spent,
+			VtxoState::Exited => VtxoStateKind::Exited,
 		}
 	}
 }
@@ -114,7 +167,7 @@ impl VtxoState {
 /// genesis-derived summaries that the wallet would otherwise have to load the full
 /// exit chain for.
 ///
-/// The wallet stores [Vtxo<Full>] on disk but listings, balance computations, coin
+/// The wallet stores `Vtxo<Full>` on disk but listings, balance computations, coin
 /// selection, and refresh-strategy checks all run against this bare representation
 /// to avoid the per-VTXO memory cost (tens of KB at high exit depths). When an
 /// operation actually needs the exit chain — unilateral exit, server registration,
@@ -138,6 +191,15 @@ pub struct WalletVtxo {
 	///
 	/// Lets the refresh strategy answer "uneconomical to exit" without loading the genesis.
 	pub exit_tx_weight: Weight,
+
+	/// Whether this VTXO's recovery state has been asserted with the server:
+	/// its ID posted to the recovery mailbox and its fully-signed transaction
+	/// chain registered. The sync-time catch-up skips VTXOs with this
+	/// flag set. Nothing clears the flag, so it only moves from `false` to
+	/// `true`; if a server-side recovery issue is ever discovered, a
+	/// migration can reset it to re-upload every VTXO.
+	#[serde(default)]
+	pub registered: bool,
 }
 
 impl VtxoRef for WalletVtxo {
@@ -182,11 +244,12 @@ mod test {
 			VtxoStateKind::Spendable,
 			VtxoStateKind::Spent,
 			VtxoStateKind::Locked,
+			VtxoStateKind::Exited,
 		];
 
 		assert_eq!(
 			serde_json::to_string(&states).unwrap(),
-			serde_json::to_string(&[SPENDABLE, SPENT, LOCKED]).unwrap(),
+			serde_json::to_string(&[SPENDABLE, SPENT, LOCKED, EXITED]).unwrap(),
 		);
 
 		// If a compiler error occurs,
@@ -195,6 +258,7 @@ mod test {
 			VtxoState::Spendable => {},
 			VtxoState::Spent => {},
 			VtxoState::Locked { .. } => {},
+			VtxoState::Exited => {},
 		}
 	}
 }

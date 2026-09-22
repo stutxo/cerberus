@@ -1,14 +1,35 @@
 use std::pin::Pin;
 use bitcoin::hashes::Hash;
+use bitcoin_ext::AmountExt;
 use futures::Stream;
+use futures::StreamExt;
+use server_rpc::{MAX_NB_MAILBOX_ARKOOR_VTXOS, MAX_NB_MAILBOX_RECOVERY_IDS};
 use tracing::{error, warn};
 use ark::{ProtocolEncoding, Vtxo, VtxoId};
+use ark::vtxo::Full;
+use ark::vtxo::policy::VtxoPolicyKind;
 use ark::mailbox::{BlindedMailboxIdentifier, MailboxAuthorization, MailboxIdentifier, MailboxType};
 use server_rpc::{self as rpc, protos, TryFromBytes};
 
 use crate::database::{Checkpoint, MailboxEntry, MailboxPayload};
 use crate::rpcserver::{StatusContext, ToStatus, ToStatusResult};
 use crate::rpcserver::macros::badarg;
+
+/// Bail with `invalid_argument` if the authorization is expired, logging the
+/// timing details so we can attribute failures to clock skew.
+fn check_auth_not_expired(auth: &MailboxAuthorization) -> Result<(), tonic::Status> {
+	if auth.is_expired() {
+		let now = chrono::Local::now();
+		let expiry = auth.expiry();
+		slog!(MailboxAuthorizationExpired,
+			expiry,
+			now,
+			late_by_secs: (now - expiry).num_seconds(),
+		);
+		return crate::error::badarg!("mailbox authorization expired").to_status();
+	}
+	Ok(())
+}
 
 #[allow(deprecated)]
 fn new_mailbox_msg(entry: MailboxEntry) -> protos::mailbox_server::MailboxMessage {
@@ -35,11 +56,12 @@ fn new_mailbox_msg(entry: MailboxEntry) -> protos::mailbox_server::MailboxMessag
 				checkpoint: entry.checkpoint.into(),
 			}
 		},
-		MailboxPayload::LightningReceive { payment_hash } => {
+		MailboxPayload::LightningReceive { payment_hash, amount } => {
 			protos::mailbox_server::MailboxMessage {
 				message: Some(protos::mailbox_server::mailbox_message::Message::IncomingLightningPayment(
 					protos::mailbox_server::IncomingLightningPaymentMessage {
 						payment_hash: payment_hash.to_vec(),
+						amount_msat: amount.to_msat(),
 					}
 				)),
 				checkpoint: entry.checkpoint.into(),
@@ -78,11 +100,31 @@ impl rpc::server::MailboxService for crate::Server {
 	) -> Result<tonic::Response<protos::core::Empty>, tonic::Status> {
 		let req = req.into_inner();
 
+		if req.vtxos.len() > MAX_NB_MAILBOX_ARKOOR_VTXOS {
+			self::badarg!("too many vtxos, max is {}", MAX_NB_MAILBOX_ARKOOR_VTXOS);
+		}
+
 		let vtxos = req.vtxos.into_iter()
 			.map(|v| Vtxo::from_bytes(v))
-			.collect::<Result<Vec<_>, _>>()?;
+			.collect::<Result<Vec<Vtxo<Full>>, _>>()?;
 		if vtxos.is_empty() {
 			self::badarg!("no vtxos provided");
+		}
+
+		// Only final, self-custodial payment vtxos belong in an arkoor mailbox.
+		// The legit arkoor-send and lightning-receive delivery paths only ever
+		// post Pubkey vtxos. An HTLC (or any other server-contract) vtxo dressed
+		// up as a payment lets a malicious sender hand a recipient a coin they
+		// can never spend (the server refuses HTLC vtxos as spend inputs) while
+		// the sender unwinds the value over Lightning, so refuse it here.
+		for vtxo in &vtxos {
+			let kind = vtxo.policy().policy_type();
+			if kind != VtxoPolicyKind::Pubkey {
+				self::badarg!("vtxo {} is not a final payment vtxo (policy: {}); \
+					only pubkey vtxos may be delivered to an arkoor mailbox",
+					vtxo.id(), kind,
+				);
+			}
 		}
 
 		let blinded_mailbox_id = BlindedMailboxIdentifier::from_bytes(&req.blinded_id.as_slice())?;
@@ -92,18 +134,44 @@ impl rpc::server::MailboxService for crate::Server {
 			self::badarg!("all vtxos should share vtxo pubkey when mailbox is provided");
 		}
 
-		let mailbox_id = self.unblind_mailbox_id(blinded_mailbox_id, vtxo_pubkey);
+		// The blinded id is peer-controlled. An attacker that submits a
+		// blinded point equal to the ECDH tweak forces the sum to the
+		// point at infinity, which libsecp256k1 rejects. Reject as an
+		// invalid argument instead of panicking the request task.
+		let unblind = self.unblind_mailbox_id(blinded_mailbox_id, vtxo_pubkey);
+		let mailbox_id = if let Ok(id) = unblind {
+			id
+		} else {
+			self::badarg!("invalid blinded mailbox id");
+		};
+
+		// This endpoint is unauthenticated (senders aren't the recipient), so
+		// only accept vtxos the server itself cosigned: unknown ids are
+		// rejected before they can take up mailbox space. The pubkey check
+		// stops a known id from being posted with doctored content that would
+		// route it into a mailbox its owner doesn't watch.
+		let vtxo_ids = vtxos.iter().map(|v| v.id()).collect::<Vec<_>>();
+		let stored = self.db.read(async |t| t.get_user_vtxos_by_id(&vtxo_ids).await)
+			.await.to_status()?;
+		for stored in &stored {
+			if stored.vtxo.user_pubkey() != vtxo_pubkey {
+				self::badarg!("vtxo {} doesn't belong to the provided vtxo pubkey", stored.vtxo_id);
+			}
+		}
 
 		let checkpoint = self.db.write(async |t| {
-			let cp = t.store_vtxos_in_mailbox(
+			t.store_vtxos_in_mailbox(
 				MailboxType::ArkoorReceive,
 				mailbox_id,
 				vtxos.as_slice(),
-			).await?.context("nothing was stored")?;
-			anyhow::Ok(cp)
+			).await
 		}).await.to_status()?;
 
-		self.mailbox_manager.notify(mailbox_id, checkpoint);
+		// `None` means every posted vtxo was already in the mailbox. A duplicate
+		// post is a no-op, so there's no new checkpoint to notify subscribers of.
+		if let Some(checkpoint) = checkpoint {
+			self.mailbox_manager.notify(mailbox_id, checkpoint);
+		}
 
 		Ok(tonic::Response::new(protos::core::Empty{}))
 	}
@@ -117,30 +185,26 @@ impl rpc::server::MailboxService for crate::Server {
 	) -> Result<tonic::Response<protos::mailbox_server::MailboxMessages>, tonic::Status> {
 		let req = req.into_inner();
 
-		let unblinded_id = MailboxIdentifier::deserialize(req.unblinded_id.as_slice())
-			.badarg("invalid unblinded mailbox id")?;
+		let mailbox_id = MailboxIdentifier::deserialize(req.mailbox_id.as_slice())
+			.badarg("invalid mailbox id")?;
 		let auth_bytes = req.authorization.badarg("mailbox authorization required")?;
 		let auth = MailboxAuthorization::deserialize(auth_bytes.as_slice())
 			.badarg("invalid mailbox authorization")?;
-		if auth.mailbox() != unblinded_id {
+		if auth.mailbox() != mailbox_id {
 			self::badarg!("authorization doesn't match mailbox id");
 		}
-		if auth.is_expired() {
-			self::badarg!("mailbox authorization expired");
-		}
+		check_auth_not_expired(&auth)?;
 		if !auth.verify() {
 			self::badarg!("invalid mailbox authorization signature");
 		}
 		let limit = self.config.max_read_mailbox_items;
 		let entries_by_checkpoint = self.db.read(async |t| {
-			t.get_mailbox_messages(unblinded_id, req.checkpoint, limit).await
+			t.get_mailbox_messages(mailbox_id, req.checkpoint, limit).await
 		}).await.to_status()?;
 
 		let response = protos::mailbox_server::MailboxMessages {
 			have_more: entries_by_checkpoint.len() >= limit,
-			messages: entries_by_checkpoint.into_iter().map(|entry| {
-				new_mailbox_msg(entry)
-			}).collect(),
+			messages: entries_by_checkpoint.into_iter().map(new_mailbox_msg).collect(),
 		};
 
 		Ok(tonic::Response::new(response))
@@ -150,6 +214,9 @@ impl rpc::server::MailboxService for crate::Server {
 		dyn Stream<Item = Result<protos::mailbox_server::MailboxMessage, tonic::Status>> + Send + 'static
 	>>;
 
+	// Concurrency of open SubscribeMailbox streams is bounded upstream by
+	// the reverse proxy in front of captaind. Don't add a server-side
+	// limit here.
 	#[tracing::instrument(skip(self, req), fields(
 		checkpoint = req.get_ref().checkpoint
 	))]
@@ -159,17 +226,15 @@ impl rpc::server::MailboxService for crate::Server {
 	) -> Result<tonic::Response<Self::SubscribeMailboxStream>, tonic::Status> {
 		let req = req.into_inner();
 
-		let mailbox_id = MailboxIdentifier::deserialize(req.unblinded_id.as_slice())
-			.badarg("invalid unblinded mailbox id")?;
+		let mailbox_id = MailboxIdentifier::deserialize(req.mailbox_id.as_slice())
+			.badarg("invalid mailbox id")?;
 		let auth_bytes = req.authorization.badarg("mailbox authorization required")?;
 		let auth = MailboxAuthorization::deserialize(auth_bytes.as_slice())
 			.badarg("invalid mailbox authorization")?;
 		if auth.mailbox() != mailbox_id {
 			self::badarg!("authorization doesn't match mailbox id");
 		}
-		if auth.is_expired() {
-			self::badarg!("mailbox authorization expired");
-		}
+		check_auth_not_expired(&auth)?;
 		if !auth.verify() {
 			self::badarg!("invalid mailbox authorization signature");
 		}
@@ -178,15 +243,17 @@ impl rpc::server::MailboxService for crate::Server {
 		let starting_checkpoint = Checkpoint::from(req.checkpoint.max(0));
 		let ret_limit = self.config.max_read_mailbox_items;
 
-		// Start listening for updates on the tip of the mailbox
-		// I mark the first value as changed
-		// This ensures `mailbox_tip_rx` will return immediately and
-		// start fetching historical records
+		// Start listening for updates on the tip of the mailbox.
+		// Marking the first value as changed makes `changed()` return
+		// immediately so the loop starts with a catch-up fetch.
 		let mut mailbox_tip_rx = self.mailbox_manager.subscribe(mailbox_id, 0);
 		mailbox_tip_rx.mark_changed();
 
 		let stream = async_stream::try_stream! {
 			let mut processed_cp = starting_checkpoint;
+			// NB: Always run the first fetch against the database; only use the
+			// watch value to skip wakeups that carry nothing new.
+			let mut first_fetch = true;
 
 			loop {
 				if mailbox_tip_rx.changed().await.is_err() {
@@ -195,9 +262,10 @@ impl rpc::server::MailboxService for crate::Server {
 				}
 
 				let new_cp = *mailbox_tip_rx.borrow_and_update();
-				if new_cp <= processed_cp {
+				if !first_fetch && new_cp <= processed_cp {
 					continue;
 				}
+				first_fetch = false;
 
 				'fetching:
 				loop {
@@ -223,6 +291,9 @@ impl rpc::server::MailboxService for crate::Server {
 			}
 		};
 
+		let mgr = self.rtmgr.clone();
+		let stream = stream.take_until(async move { mgr.shutdown_signal().await });
+
 		Ok(tonic::Response::new(Box::pin(stream)))
 	}
 
@@ -233,15 +304,33 @@ impl rpc::server::MailboxService for crate::Server {
 	) -> Result<tonic::Response<protos::core::Empty>, tonic::Status> {
 		let req = req.into_inner();
 
+		if req.vtxo_ids.len() > MAX_NB_MAILBOX_RECOVERY_IDS {
+			self::badarg!("too many VTXOs, max is {}", MAX_NB_MAILBOX_RECOVERY_IDS);
+		}
+
 		let vtxo_ids = req.vtxo_ids.into_iter()
 			.map(|v| VtxoId::from_bytes(v))
 			.collect::<Result<Vec<_>, _>>()?;
 		if vtxo_ids.is_empty() {
-			self::badarg!("no vtxo ids provided");
+			self::badarg!("no VTXO IDs provided");
 		}
 
-		let mailbox_id = MailboxIdentifier::deserialize(req.unblinded_id.as_slice())
-			.badarg("invalid unblinded mailbox id")?;
+		let mailbox_id = MailboxIdentifier::deserialize(req.mailbox_id.as_slice())
+			.badarg("invalid mailbox id")?;
+
+		// Optional for backward compat; verified like the read path when present.
+		// TODO: make mandatory after 0.3.1, once all clients send it.
+		if let Some(auth_bytes) = req.authorization {
+			let auth = MailboxAuthorization::deserialize(auth_bytes.as_slice())
+				.badarg("invalid mailbox authorization")?;
+			if auth.mailbox() != mailbox_id {
+				self::badarg!("authorization doesn't match mailbox id");
+			}
+			check_auth_not_expired(&auth)?;
+			if !auth.verify() {
+				self::badarg!("invalid mailbox authorization signature");
+			}
+		}
 
 		let checkpoint = self.db.write(async |t| {
 			t.store_vtxo_ids_in_mailbox(

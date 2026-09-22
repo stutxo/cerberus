@@ -4,7 +4,7 @@
 //! Same shape as [`super::pid_flock::FlockPidLockManager`] — one
 //! OS-level lock on `<datadir>/LOCK` held for the manager's lifetime,
 //! all per-key locking delegated to an internal
-//! [`MemoryLockManager`](super::memory::MemoryLockManager). The only
+//! [`MemoryLockManager`]. The only
 //! difference is the OS primitive: this variant uses POSIX
 //! `fcntl(F_SETLK)` instead of `flock(2)`.
 //!
@@ -176,7 +176,8 @@ impl std::fmt::Debug for FcntlPidLockManager {
 	}
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl LockManager for FcntlPidLockManager {
 	async fn try_lock(&self, key: &str) -> Option<Box<dyn LockGuard>> {
 		self.in_process.try_lock(key).await

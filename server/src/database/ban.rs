@@ -4,13 +4,11 @@ use tokio_postgres::GenericClient;
 use tokio_postgres::types::Type;
 
 use ark::VtxoId;
-use ark::ServerVtxoPolicy;
-use ark::vtxo::Bare;
 
 use bitcoin_ext::BlockHeight;
 
 use super::Tx;
-use super::model::VtxoState;
+use super::model::BannedVtxo;
 
 /// Ban a vtxo until the given block height
 pub async fn ban_vtxo<T: GenericClient>(
@@ -25,7 +23,7 @@ pub async fn ban_vtxo<T: GenericClient>(
 
 	let rows = client.execute(&stmt, &[
 		&vtxo_id.to_string(),
-		&(until_height as i32),
+		&(until_height.to_u32() as i32),
 	]).await.context("failed to ban vtxo")?;
 
 	ensure!(rows > 0, "vtxo {} not found", vtxo_id);
@@ -54,21 +52,18 @@ pub async fn unban_vtxo<T: GenericClient>(
 pub async fn list_banned_vtxos<T: GenericClient>(
 	client: &T,
 	chain_tip: BlockHeight,
-) -> anyhow::Result<Vec<VtxoState<Bare, ServerVtxoPolicy>>> {
+) -> anyhow::Result<Vec<BannedVtxo>> {
 	let stmt = client.prepare_typed("
-		SELECT id, vtxo_id, expiry, exit_delta, policy_type, policy,
-			server_pubkey, amount, anchor_point,
-			oor_spent_txid, spent_in_round, offboarded_in,
-			banned_until_height, spend_state::TEXT AS spend_state, created_at, updated_at
+		SELECT vtxo_id, banned_until_height
 		FROM vtxo
 		WHERE banned_until_height IS NOT NULL AND banned_until_height > $1
 	", &[Type::INT4]).await?;
 
-	let rows = client.query(&stmt, &[&(chain_tip as i32)]).await
+	let rows = client.query(&stmt, &[&(chain_tip.to_u32() as i32)]).await
 		.context("failed to list banned vtxos")?;
 
 	rows.into_iter()
-		.map(|row| VtxoState::try_from(row))
+		.map(|row| BannedVtxo::try_from(row))
 		.collect()
 }
 
@@ -84,7 +79,7 @@ impl<'t> Tx<'t> {
 	}
 
 	/// List all vtxos that are currently banned at the given chain tip.
-	pub async fn list_banned_vtxos(&self, chain_tip: BlockHeight) -> anyhow::Result<Vec<VtxoState<Bare, ServerVtxoPolicy>>> {
+	pub async fn list_banned_vtxos(&self, chain_tip: BlockHeight) -> anyhow::Result<Vec<BannedVtxo>> {
 		list_banned_vtxos(&**self, chain_tip).await
 	}
 }

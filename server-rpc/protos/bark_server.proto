@@ -6,17 +6,15 @@ package bark_server;
 import "core.proto";
 
 // Public ark service for arkd.
+//
+// Terms of service may apply, check your server's `ArkInfo.tos_link`.
 service ArkService {
 	rpc Handshake(HandshakeRequest) returns (HandshakeResponse) {}
 	rpc GetArkInfo(core.Empty) returns (ArkInfo) {}
 	rpc GetOffboardFeeRate(core.Empty) returns (OffboardFeeRateResponse) {}
 
-	// Get new round since the given round id
-	//
-	// If no round given, gives all rounds in the past 1.5 x the VTXO lifetime.
-	rpc GetFreshRounds(FreshRoundsRequest) returns (FreshRounds) {}
-	rpc GetRound(RoundId) returns (RoundInfo) {}
 	rpc GetVtxo(GetVtxoRequest) returns (GetVtxoResponse) {}
+	rpc GetVtxoStatus(GetVtxoStatusRequest) returns (GetVtxoStatusResponse) {}
 
 	// * BOARDING *
 
@@ -70,7 +68,7 @@ service ArkService {
 	rpc SubmitPayment(SubmitPaymentRequest) returns (SubmitPaymentResponse) {}
 	rpc ProvideVtxoSignatures(VtxoSignaturesRequest) returns (core.Empty) {}
 
-	// Submit a non-interactive round participation
+	// Submit a delegated round participation
 	rpc SubmitRoundParticipation(RoundParticipationRequest) returns (RoundParticipationResponse) {}
 	rpc RoundParticipationStatus(RoundParticipationStatusRequest) returns (RoundParticipationStatusResponse) {}
 	rpc RequestLeafVtxoCosign(LeafVtxoCosignRequest) returns (LeafVtxoCosignResponse) {}
@@ -96,7 +94,9 @@ message ArkInfo {
 	uint32 round_interval_secs = 3;
 	uint32 nb_round_nonces = 4;
 	uint32 vtxo_exit_delta = 5;
-	uint32 vtxo_expiry_delta = 6;
+	// Deprecated: renamed to vtxo_lifetime. This field is kept and populated
+	// with the same value for wire compatibility with older clients.
+	uint32 vtxo_expiry_delta = 6 [deprecated = true];
 	uint32 htlc_send_expiry_delta = 7;
 	uint32 htlc_expiry_delta = 8;
 	optional uint64 max_vtxo_amount = 9;
@@ -112,7 +112,17 @@ message ArkInfo {
 	FeeSchedule fees = 18;
 	uint32 max_vtxo_exit_depth = 19;
 
-	// last index: 19
+	uint32 max_offboard_inputs = 20;
+
+	// The number of blocks a VTXO lives before it expires. Replaces the
+	// deprecated vtxo_expiry_delta field above; older servers only set that
+	// one, so clients should fall back to it when this field is 0.
+	uint32 vtxo_lifetime = 21;
+
+	// Link to the server's terms of service, if any.
+	optional string tos_link = 22;
+
+	// last index: 22
 }
 
 message OffboardFeeRateResponse {
@@ -160,29 +170,42 @@ message LightningSendFees {
 	repeated PpmExpiryFeeEntry ppm_expiry_table = 3;
 }
 
-message FreshRoundsRequest {
-	optional string last_round_txid = 1;
-}
-
-message FreshRounds {
-	repeated bytes txids = 1;
-}
-
-message RoundId {
-	bytes txid = 1;
-}
-
-message RoundInfo {
-	bytes funding_tx = 1;
-	bytes signed_vtxos = 2;
-}
-
 message GetVtxoRequest {
 	bytes vtxo_id = 1;
 }
 
 message GetVtxoResponse {
 	bytes vtxo = 1;
+}
+
+// Client-relevant spend state for a user-owned VTXO.
+//
+// Server-internal states (pool, forfeit, connector) are never returned;
+// in-flight Lightning-receive HTLCs are reported as HTLC_RECV_UNCLAIMED because
+// the client must reveal the preimage to claim them before they become spendable.
+enum VtxoSpendState {
+	VTXO_SPEND_STATE_UNSPECIFIED = 0;
+	// The VTXO is available for spending.
+	VTXO_SPEND_STATE_SPENDABLE = 1;
+	// The VTXO has been spent (via round, OOR, or offboard).
+	VTXO_SPEND_STATE_SPENT = 2;
+	// The VTXO originates from a round but the server has not released the
+	// unlock preimage yet.
+	VTXO_SPEND_STATE_UNCLAIMED = 3;
+	// The VTXO's signed transaction chain has not been uploaded yet.
+	VTXO_SPEND_STATE_UNREGISTERED = 4;
+	// The VTXO's preimage haven't been revealed yet
+	VTXO_SPEND_STATE_HTLC_RECV_UNCLAIMED = 5;
+}
+
+message GetVtxoStatusRequest {
+	bytes vtxo_id = 1;
+	// Serialized VtxoStatusAttestation proving the user controls the VTXO.
+	bytes attestation = 2;
+}
+
+message GetVtxoStatusResponse {
+	VtxoSpendState spend_state = 1;
 }
 
 
@@ -194,6 +217,7 @@ message BoardCosignRequest {
 	uint32 expiry_height = 3;
 	bytes user_pubkey = 4;
 	bytes pub_nonce = 5;
+	bytes funding_tx = 6;
 }
 
 message BoardCosignResponse {
@@ -478,6 +502,10 @@ message RoundParticipationRequest {
 	// Optional unblinded mailbox identifier for VTXO delivery.
 	// The server will post the created VTXO to this mailbox after the round completes.
 	optional bytes unblinded_mailbox_id = 4;
+	// Block height at which the refresh should happen: fees are calculated at
+	// this height and no round includes the participation before it.
+	// If omitted, the refresh happens in the next round.
+	optional uint32 scheduled_height = 5;
 }
 
 message RoundParticipationResponse {
@@ -501,6 +529,9 @@ message RoundParticipationStatusResponse {
 	// the actual status
 	RoundParticipationStatus status = 1;
 
+    // vtxo ids of the input vtxos
+    repeated bytes input_vtxo_ids = 5;
+
 	// signed round funding tx
 	// (provided if status != ROUND_PART_PENDING)
 	optional bytes round_funding_tx = 2;
@@ -512,6 +543,8 @@ message RoundParticipationStatusResponse {
 	// unlock preimage to unlock new vtxos
 	// (provided if status == ROUND_PART_RELEASED)
 	optional bytes unlock_preimage = 4;
+
+	// last index: 5
 }
 
 message LeafVtxoCosignRequest {
@@ -567,6 +600,47 @@ service BanAdminService {
 	rpc BanVtxo(BanVtxoRequest) returns (core.Empty) {}
 	rpc UnbanVtxo(UnbanVtxoRequest) returns (core.Empty) {}
 	rpc ListBannedVtxos(core.Empty) returns (ListBannedVtxosResponse) {}
+}
+
+service NurseryAdminService {
+	// Report of the txs the nursery is following up on. By default only
+	// unconfirmed, non-abandoned txs are returned; the request flags add
+	// the rest.
+	rpc ListNurseryTxs(ListNurseryTxsRequest) returns (ListNurseryTxsResponse) {}
+	// Abandon a nursery tx that can no longer make it onchain.
+	//
+	// The nursery stops following up on the tx and stops emitting the
+	// missed-target warning for it.
+	rpc Abandon(AbandonRequest) returns (core.Empty) {}
+}
+
+message ListNurseryTxsRequest {
+	bool include_confirmed = 1;
+	bool include_abandoned = 2;
+}
+
+message NurseryTxInfo {
+	string txid = 1;
+	// round | offboard | vtxopool | internal
+	string kind = 2;
+	// Whether the tx is currently in the node's mempool.
+	bool in_mempool = 3;
+	uint32 confirm_target_height = 4;
+	optional uint32 confirmed_at_height = 5;
+	// Unix timestamps in seconds.
+	uint64 created_at = 6;
+	optional uint64 abandoned_at = 7;
+	// Chunk feerate bitcoind reports for the tx, in sat/kwu. Unset if the
+	// tx is not in the mempool or the lookup failed.
+	optional uint64 chunk_fee_rate_kwu = 8;
+}
+
+message ListNurseryTxsResponse {
+	repeated NurseryTxInfo txs = 1;
+}
+
+message AbandonRequest {
+	string txid = 1;
 }
 
 message BanVtxoRequest {

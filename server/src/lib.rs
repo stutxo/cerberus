@@ -14,7 +14,6 @@ pub mod filters;
 pub mod mailbox_manager;
 pub mod fee_estimator;
 pub mod rpcserver;
-pub mod secret;
 pub mod vtxopool;
 pub mod wallet;
 pub mod watchman;
@@ -22,20 +21,24 @@ pub mod watchman;
 pub(crate) mod flux;
 pub mod system;
 
+pub(crate) mod bitcoin_blocklist;
 pub mod bitcoind;
 mod intman;
 pub mod ln;
+pub mod nursery;
 mod offboards;
 mod round;
 pub mod telemetry;
-mod txindex;
 pub mod utils;
 
 
+use crate::bitcoin_blocklist::BitcoinAddressBlocklist;
 use crate::database::BlockTable;
+use crate::database::htlc_vtxo::{self, HtlcDirection};
 use crate::database::tree::VtxoTreeUpdate;
 pub use crate::intman::{CAPTAIND_API_KEY, CAPTAIND_CLI_API_KEY};
 pub use crate::config::Config;
+pub use bark_common::{fs_perms, secret};
 
 use std::collections::HashSet;
 use std::fs;
@@ -49,40 +52,40 @@ use anyhow::Context;
 use bitcoin::{bip32, Address, Amount, OutPoint, Transaction, Txid};
 use bitcoin::secp256k1::{self, rand, Keypair, PublicKey};
 use futures::Stream;
+use server_rpc::MAX_NB_BOARD_FUNDING_INPUTS;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::{info, trace, warn};
 
-use ark::{Vtxo, VtxoId, VtxoRequest};
-use ark::vtxo::{Full, VtxoRef};
+use ark::{Vtxo, VtxoId, VtxoPolicy, VtxoRequest};
+use ark::vtxo::Full;
 use ark::board::BoardBuilder;
 use ark::fees::validate_and_subtract_fee;
-use ark::mailbox::{BlindedMailboxIdentifier, MailboxIdentifier};
+use ark::mailbox::{BlindedMailboxIdentifier, MailboxBlindingError, MailboxIdentifier};
 use ark::musig::{self, PublicNonce};
 use ark::rounds::{RoundEvent, RoundId};
 use ark::tree::signed::{LeafVtxoCosignRequest, LeafVtxoCosignResponse, UnlockPreimage};
 use ark::tree::signed::builder::{SignedTreeBuilder, SignedTreeCosignResponse};
-use bitcoin_ext::{BlockHeight, BlockRef, TxStatus, P2TR_DUST};
-use bitcoin_ext::bdk::WalletExt;
+use bitcoin_ext::{BlockHeight, BlockRef, P2TR_DUST};
+use bitcoin_ext::rpc::BitcoinAsyncRpcExt;
 use bitcoind_async_client::Client as BitcoindClient;
 use bitcoind_async_client::traits::Reader;
 
 use crate::bitcoind as bcd;
 use crate::sync::{ChainEventListener, SyncManager};
 use crate::error::ContextExt;
-use crate::watchman::VtxoExitFrontier;
 use crate::flux::VtxosInFlux;
-use crate::ln::cln::ClnManager;
+use crate::ln::guard::PaymentGuards;
+use crate::ln::node_manager::LightningManager;
 use crate::ln::settler::HtlcSettler;
 use crate::mailbox_manager::MailboxManager;
 use crate::fee_estimator::FeeEstimator;
 use crate::round::RoundInput;
 use crate::round::forfeit::HarkForfeitNonces;
+use crate::nursery::TxNursery;
 use crate::secret::Secret;
 use crate::system::RuntimeManager;
-use crate::txindex::TxIndex;
-use crate::txindex::broadcast::TxNursery;
 use crate::utils::{InstrumentedLock, TimedEntryMap};
 use crate::vtxopool::VtxoPool;
 use crate::wallet::{PersistedWallet, WalletKind, MNEMONIC_FILE};
@@ -100,6 +103,21 @@ const MAILBOX_KEY_PATH: &str = "m/2'/1'";
 
 /// The HD keypath used to generate ephemeral keys
 const EPHEMERAL_KEY_PATH: &str = "m/30'";
+
+/// Check an amount against a per-feature maximum amount config.
+///
+/// Unset means no limit. Zero disables the feature.
+pub(crate) fn check_max_amount(
+	feature: &str,
+	amount: Amount,
+	max: Option<Amount>,
+) -> anyhow::Result<()> {
+	match max {
+		Some(max) if max == Amount::ZERO => badarg!("{feature} is temporarily disabled"),
+		Some(max) if amount > max => badarg!("{feature} amount exceeds limit of {max}"),
+		_ => Ok(()),
+	}
+}
 
 
 /// Return type for the round event RPC stream.
@@ -181,7 +199,6 @@ pub struct Server {
 	/// The keypair used to generate ephemeral keys using tweaks
 	ephemeral_master_key: Secret<Keypair>,
 	rounds_wallet: InstrumentedLock<PersistedWallet>,
-	watchman_wallet: Option<InstrumentedLock<PersistedWallet>>,
 	bitcoind: BitcoindClient,
 	// NB needs to be Arc so tasks started before Server is constructed can share it
 	sync_manager: Arc<SyncManager>,
@@ -193,12 +210,16 @@ pub struct Server {
 	/// All vtxos that are currently being processed in any way.
 	/// (Plus a small buffer to optimize allocations.)
 	vtxos_in_flux: VtxosInFlux,
-	cln: ClnManager,
+	/// The payment hash locks. Each lightning call that decides on a payment
+	/// holds the lock of its payment hash for the whole call.
+	payment_guards: PaymentGuards,
+	lightning_manager: LightningManager,
 	htlc_settler: Arc<HtlcSettler>,
 	vtxopool: VtxoPool,
-	watchman_handle: Option<watchman::WatchmanHandle>,
-	pending_offboards: parking_lot::Mutex<TimedEntryMap<Txid, Option<offboards::PendingOffboard>>>,
+	pending_offboards: parking_lot::Mutex<TimedEntryMap<Txid, offboards::OffboardSession>>,
 	fee_estimator: Arc<FeeEstimator>,
+	/// scriptPubkeys in the bitcoin address blocklist
+	bitcoin_address_blocklist: Option<BitcoinAddressBlocklist>,
 }
 
 impl Server {
@@ -223,6 +244,7 @@ impl Server {
 
 		// create dir if not exit, but check that it's empty
 		fs::create_dir_all(&cfg.data_dir).context("can't create dir")?;
+		fs_perms::harden(&cfg.data_dir, 0o700)?;
 
 		let db = database::Db::create(&cfg.postgres).await?;
 
@@ -230,8 +252,9 @@ impl Server {
 		let seed = {
 			let mnemonic = bip39::Mnemonic::generate(12).expect("12 is valid");
 
-			fs::write(cfg.data_dir.join(MNEMONIC_FILE), mnemonic.to_string().as_bytes())
-				.context("failed to store mnemonic")?;
+			fs_perms::create_new_owner_only(
+				&cfg.data_dir.join(MNEMONIC_FILE), mnemonic.to_string().as_bytes(),
+			).context("failed to store mnemonic")?;
 
 			mnemonic.to_seed("")
 		};
@@ -240,7 +263,7 @@ impl Server {
 		// Store initial wallet states to avoid full chain sync.
 		for wallet in [WalletKind::Rounds, WalletKind::Watchman] {
 			let _wallet = PersistedWallet::load_derive_from_master_xpriv(
-				db.clone(), cfg.network, &master_xpriv, wallet, deep_tip,
+				db.clone(), bitcoind.clone(), cfg.network, &master_xpriv, wallet, deep_tip,
 				cfg.min_trusted_confs,
 			);
 		}
@@ -256,7 +279,7 @@ impl Server {
 		self.mailbox_pubkey
 	}
 
-	#[allow(deprecated)] // offboard_feerate kept for old clients
+	#[allow(deprecated)] // vtxo_expiry_delta and offboard_feerate kept for old clients
 	pub fn ark_info(&self) -> ark::ArkInfo {
 		ark::ArkInfo {
 			network: self.config.network,
@@ -265,6 +288,7 @@ impl Server {
 			round_interval: self.config.round_interval,
 			nb_round_nonces: self.config.nb_round_nonces,
 			vtxo_exit_delta: self.config.vtxo_exit_delta,
+			vtxo_lifetime: self.config.vtxo_lifetime,
 			vtxo_expiry_delta: self.config.vtxo_lifetime,
 			htlc_send_expiry_delta: self.config.htlc_send_expiry_delta,
 			htlc_expiry_delta: self.config.htlc_expiry_delta,
@@ -273,14 +297,23 @@ impl Server {
 			max_user_invoice_cltv_delta: self.config.max_user_invoice_cltv_delta,
 			min_board_amount: self.config.min_board_amount,
 			offboard_feerate: self.offboard_feerate(),
+			max_offboard_inputs: 100,
 			ln_receive_anti_dos_required: self.config.ln_receive_anti_dos_required,
 			fees: self.config.fees.clone(),
 			max_vtxo_exit_depth: self.config.max_vtxo_exit_depth,
+			tos_link: self.config.tos_link.clone(),
 		}
 	}
 
 	pub fn database(&self) -> &database::Db {
 		&self.db
+	}
+
+	/// Whether a hold-capable lightning node is currently registered as online.
+	/// LightningManager connects asynchronously, so this may return false right
+	/// after [`Self::start`] returns even if a node is configured.
+	pub fn has_hold_node(&self) -> bool {
+		self.lightning_manager.has_hold_active_node()
 	}
 
 	/// Start the server.
@@ -321,17 +354,28 @@ impl Server {
 		let bitcoind = bcd::build_client(&cfg.bitcoind.url, cfg.bitcoind.auth())?;
 		bcd::require_network(&bitcoind, cfg.network).await?;
 		bcd::require_version(&bitcoind).await?;
-		bcd::require_txindex(&bitcoind).await?;
+		bitcoind.require_txindex().await?;
+
+		let bitcoin_address_blocklist = if let Some(ref path) = cfg.bitcoin_address_blocklist {
+			Some(BitcoinAddressBlocklist::new(cfg.network, bitcoind.clone(), path).await
+				.context("error parsing bitcoin address blocklist")?)
+		} else {
+			None
+		};
 
 		let deep_tip = bcd::deep_tip(&bitcoind).await
 			.context("failed to query node for deep tip")?;
 		let wallet_xpriv = master_xpriv.derive_priv(
 			&crate::SECP, &[WalletKind::Rounds.child_number()],
 		).expect("can't error");
-		let rounds_wallet = PersistedWallet::load_from_xpriv(
-			db.clone(), cfg.network, &wallet_xpriv, WalletKind::Rounds, deep_tip,
+		let mut rounds_wallet = PersistedWallet::load_from_xpriv(
+			db.clone(), bitcoind.clone(), cfg.network, &wallet_xpriv, WalletKind::Rounds, deep_tip,
 			cfg.min_trusted_confs,
 		).await.context("error loading rounds wallet")?;
+		if let Some(list) = bitcoin_address_blocklist.clone() {
+			rounds_wallet.set_address_blocklist(list);
+		}
+		telemetry::set_wallet_balance(WalletKind::Rounds, rounds_wallet.balance());
 		let rounds_wallet = InstrumentedLock::new("rounds_wallet", rounds_wallet);
 
 		let ephemeral_master_key = {
@@ -348,20 +392,7 @@ impl Server {
 		let _startup_worker = rtmgr.spawn("Bootstrapping");
 		rtmgr.run_shutdown_signal_listener(Duration::from_secs(60));
 
-		let txindex = TxIndex::start(
-			deep_tip,
-			rtmgr.clone(),
-			bitcoind.clone(),
-			cfg.txindex_check_interval,
-			db.clone(),
-		);
-
-		let tx_nursery = TxNursery::start(
-			rtmgr.clone(),
-			txindex.clone(),
-			bitcoind.clone(),
-			cfg.transaction_rebroadcast_interval,
-		);
+		let tx_nursery = TxNursery::new(db.clone(), bitcoind.clone());
 
 		let fee_estimator = fee_estimator::start(
 			rtmgr.clone(),
@@ -375,23 +406,9 @@ impl Server {
 
 		let mut listeners: Vec<Box<dyn ChainEventListener>> = vec![];
 		listeners.push(Box::new(rounds_wallet.clone()));
-		let watchman_deps = if let Some(watchman_cfg) = cfg.watchman.enabled() {
-			let watchman_wallet = PersistedWallet::load_derive_from_master_xpriv(
-				db.clone(), cfg.network, &master_xpriv, WalletKind::Watchman, deep_tip,
-				cfg.min_trusted_confs,
-			).await.context("error loading watchman wallet")?;
-			let watchman_wallet = InstrumentedLock::new("watchman_wallet", watchman_wallet);
-			listeners.push(Box::new(watchman_wallet.clone()));
-
-			let frontier = VtxoExitFrontier::init(db.clone(), htlc_settler.clone()).await?;
-			let frontier = Arc::new(tokio::sync::RwLock::new(frontier));
-			listeners.push(Box::new(frontier.clone()));
-
-			Some((watchman_cfg.clone(), watchman_wallet, frontier))
-		} else {
-			None
-		};
-		let watchman_wallet = watchman_deps.as_ref().map(|(_, w, _)| w.clone());
+		// Captaind is the only process broadcasting via the nursery, so it
+		// also runs the follow-up.
+		listeners.push(Box::new(tx_nursery.clone()));
 
 		let sync_manager = Arc::new(SyncManager::start(
 			rtmgr.clone(),
@@ -403,47 +420,27 @@ impl Server {
 			BlockTable::Captaind,
 		).await.context("Failed to start SyncManager")?);
 
-		// Start Watchman VTXO processor if enabled
-		let watchman_handle = if let Some((watchman_cfg, watchman_wallet, frontier)) = watchman_deps {
-			let signer = watchman::WatchmanSigner::new(
-				Secret::new(Keypair::from_secret_key(&SECP, &server_key.secret_key())),
-				Secret::new(ephemeral_master_key),
-				db.clone(),
-			);
-			let drain_address = rounds_wallet.lock().await.peek_next_address().address;
-			let sync_height_watcher = sync_manager.sync_height_watcher();
-
-			let watchman = watchman::Watchman::new(
-				watchman_cfg,
-				signer,
-				bitcoind.clone(),
-				db.clone(),
-				BlockTable::Captaind,
-				fee_estimator.clone(),
-				drain_address,
-				watchman_wallet,
-				frontier,
-				sync_height_watcher,
-			);
-
-			Some(watchman.start(rtmgr.clone()))
-		} else {
-			None
-		};
-
 		let mailbox_manager = Arc::new(MailboxManager::new());
 
-		let cln = ClnManager::start(
+		let cln = LightningManager::start(
 			rtmgr.clone(),
 			&cfg,
 			db.clone(),
 			sync_manager.clone(),
 			mailbox_manager.clone(),
 			htlc_settler.clone(),
-		).await.context("failed to start ClnManager")?;
+		).await.context("failed to start LightningManager")?;
 
 		let vtxopool = VtxoPool::new(cfg.vtxopool.clone(), &db).await
 			.context("failed to initiate vtxopool")?;
+
+		if let Some(ref list) = bitcoin_address_blocklist {
+			list.start_auto_update_thread(
+			rtmgr.clone(),
+			cfg.bitcoin_address_blocklist_refresh_interval
+				.unwrap_or(crate::bitcoin_blocklist::DEFAULT_REFRESH_INTERVAL),
+		);
+		}
 
 		let (round_event_tx, _rx) = broadcast::channel(8);
 		let (round_input_tx, round_input_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -451,7 +448,6 @@ impl Server {
 
 		let srv = Server {
 			rounds_wallet,
-			watchman_wallet,
 			rounds: RoundHandle {
 				round_event_tx,
 				last_round_event: parking_lot::Mutex::new(None),
@@ -463,6 +459,7 @@ impl Server {
 			},
 			forfeit_nonces: parking_lot::Mutex::new(TimedEntryMap::new()),
 			vtxos_in_flux: VtxosInFlux::new(),
+			payment_guards: PaymentGuards::new(),
 			config: cfg.clone(),
 			db,
 			server_pubkey: server_key.public_key(),
@@ -475,12 +472,12 @@ impl Server {
 			sync_manager,
 			rtmgr,
 			tx_nursery: tx_nursery.clone(),
-			cln,
+			lightning_manager: cln,
 			htlc_settler,
 			vtxopool,
-			watchman_handle,
 			pending_offboards: parking_lot::Mutex::new(TimedEntryMap::new()),
 			fee_estimator,
+			bitcoin_address_blocklist,
 		};
 
 		let srv = Arc::new(srv);
@@ -496,7 +493,7 @@ impl Server {
 				0
 			});
 		let settlement_stream = srv.htlc_settler.subscribe(resume_cp);
-		srv.cln.spawn_hold_settler(srv.clone(), settlement_stream);
+		srv.lightning_manager.spawn_hold_settler(srv.clone(), settlement_stream);
 
 		srv.clone().start_offboard_retry_task().await;
 
@@ -512,7 +509,7 @@ impl Server {
 		});
 
 		// VtxoPool
-		srv.vtxopool.start(srv.clone());
+		srv.vtxopool.start(srv.clone(), srv.sync_manager.sync_height_watcher());
 
 		// RPC
 
@@ -587,58 +584,16 @@ impl Server {
 		self.sync_manager.chain_tip()
 	}
 
-	/// Rebalance coins between the rounds and watchman wallets.
-	///
-	/// If the watchman wallet balance is below `watchman_min_balance`,
-	/// sends bitcoin from the rounds wallet to top it up.
-	///
-	/// Wallet syncing is handled by the SyncManager via the ChainEventListener.
-	#[tracing::instrument(skip(self))]
-	pub async fn rebalance_wallets(&self) -> anyhow::Result<()> {
-		let Some(ref watchman_wallet) = self.watchman_wallet else {
-			return Ok(());
-		};
-
-		let watchman_status = watchman_wallet.lock().await.status();
-		if watchman_status.total_balance >= self.config.watchman_min_balance {
-			return Ok(());
-		}
-
-		let amount = self.config.watchman_min_balance * 2;
-		let rounds_balance = self.rounds_wallet.lock().await.status().total_balance;
-		if rounds_balance < amount {
-			warn!("Rounds wallet doesn't have sufficient bitcoin to top up watchman.");
-			return Ok(());
-		}
-
-		let mut wallet = self.rounds_wallet.lock().await;
-		let addr = watchman_status.address.assume_checked();
-		let feerate = self.fee_estimator.regular();
-		info!("Sending {amount} to watchman wallet address {addr}...");
-		let tx = match wallet.send(addr.script_pubkey(), amount, feerate).await {
-			Ok(tx) => tx,
-			Err(e) => {
-				warn!("Error sending from round to watchman wallet: {:?}", e);
-				return Err(e).context("error sending tx from round to watchman wallet");
-			},
-		};
-		drop(wallet);
-
-		let tx = self.tx_nursery.broadcast_tx(tx).await
-			.context("Failed to broadcast transaction")?;
-
-		// wait until it's actually broadcast
-		tokio::time::timeout(Duration::from_millis(5_000), async {
-			loop {
-				if tx.status().seen() {
-					break;
-				}
-				tokio::time::sleep(Duration::from_millis(500)).await;
-			}
-		}).await.context("waiting for tx broadcast timed out")?;
-
-		Ok(())
+	pub fn chain_tip_watcher(&self) -> tokio::sync::watch::Receiver<BlockRef> {
+		self.sync_manager.chain_tip_watcher()
 	}
+
+	/// The height by which a tx broadcast via the nursery right now is
+	/// expected to confirm.
+	fn nursery_confirm_target(&self) -> BlockHeight {
+		self.chain_tip().height + self.config.nursery_confirm_target_blocks
+	}
+
 
 	pub async fn new_onchain_address(&self) -> anyhow::Result<Address> {
 		let mut wallet = self.rounds_wallet.lock().await;
@@ -660,8 +615,11 @@ impl Server {
 		user_pubkey: PublicKey,
 		expiry_height: BlockHeight,
 		utxo: OutPoint,
+		funding_tx: Option<&Transaction>,
 		user_pub_nonce: PublicNonce,
 	) -> anyhow::Result<ark::board::BoardCosignResponse> {
+		check_max_amount("board", amount, self.config.max_board_amount)?;
+
 		let min_amount = self.config.min_board_amount.max(P2TR_DUST);
 
 		if amount < min_amount {
@@ -670,26 +628,87 @@ impl Server {
 
 		if let Some(max) = self.config.max_vtxo_amount {
 			if amount > max {
-				return badarg!("board amount exceeds limit of {max}");
+				return badarg!("board amount exceeds maximum vtxo amount of {max}");
 			}
 		}
 
 		// Validate board fees
-		let fee = self.config.fees.board.calculate(amount).context("fee overflowed")?;
+		let fee = self.config.fees.board.calculate(amount)
+			.context("fee overflowed")?;
 		validate_and_subtract_fee(amount, fee)
 			.badarg("Board amount cannot support required fee")?;
 
 		//TODO(stevenroose) make this more robust
 		let tip = self.chain_tip();
 		if expiry_height < tip.height {
-			bail!("VTXO already expired: {} (tip = {})", expiry_height, tip.height);
+			return badarg!("VTXO already expired: {} (tip = {})", expiry_height, tip.height);
 		}
 		const LIFETIME_BUFFER: u16 = 3;
-		let requested_lifetime = expiry_height - tip.height;
-		if requested_lifetime as u16 > self.config.vtxo_lifetime + LIFETIME_BUFFER {
-			bail!("requested VTXO lifetime {} is too high (server VTXO lifetime is {})",
+		// NB compare in u32: a `requested_lifetime as u16` cast truncates, letting a
+		// client request a lifetime of `n * 65536 + small` that wraps under the cap
+		// and gets a VTXO whose expiry the server can't cheaply sweep.
+		let requested_lifetime = expiry_height.checked_blocks_since(tip.height)
+			.expect("expiry checked against tip above");
+		let max_lifetime = self.config.vtxo_lifetime.to_u32() + LIFETIME_BUFFER as u32;
+		if requested_lifetime > max_lifetime {
+			return badarg!("requested VTXO lifetime {} is too high (server VTXO lifetime is {})",
 				requested_lifetime, self.config.vtxo_lifetime,
 			);
+		}
+
+		if self.config.require_board_funding_tx {
+			let funding_tx = funding_tx.context("missing funding_tx")?;
+
+			if funding_tx.input.len() > MAX_NB_BOARD_FUNDING_INPUTS {
+				return badarg!("invalid funding tx: too many inputs (max is {})",
+					MAX_NB_BOARD_FUNDING_INPUTS,
+				);
+			}
+
+			// validate utxo against funding tx
+			if utxo.vout as usize >= funding_tx.output.len() {
+				return badarg!("board outpoint does not match funding tx (vout)");
+			}
+			if utxo.txid != funding_tx.compute_txid() {
+				return badarg!("board outpoint does not match funding tx (txid)");
+			}
+
+			// validate funding tx is real
+			// check that any of the inputs is a vtxo
+			self.db.read(async |tx| {
+				// check the funding tx itself first, obviously can't exist
+				if tx.get_virtual_transaction_by_txid(utxo.txid).await?.is_some() {
+					return badarg!("invalid funding tx: known as virtual tx: {}", utxo.txid);
+				}
+				for inp in &funding_tx.input {
+					let vtxo_id = inp.previous_output.into();
+					if tx.try_get_bare_vtxo_by_id(vtxo_id).await?.is_some() {
+						return badarg!("invalid funding tx: input is a VTXO: {}", vtxo_id);
+					}
+				}
+				Ok(())
+			}).await?;
+			// check that all the inputs is known
+			for inp in &funding_tx.input {
+				let txid = inp.previous_output.txid;
+				let status = bcd::tx_status(&self.bitcoind, txid).await?;
+				if !status.is_known() {
+					return badarg!("invalid funding tx: unknown input tx {}", txid);
+				}
+			}
+
+			if let Some(ref list) = self.bitcoin_address_blocklist {
+				let res = list.check_tx(&funding_tx).await;
+				if !res.is_ok() {
+					if let Some(addr) = res.violating_address() {
+						let amount = funding_tx.output[utxo.vout as usize].value;
+						slog!(BoardAttemptBlockedAddress, vtxo: None, amount: amount,
+							address: addr.as_unchecked().clone(),
+						);
+					}
+					res.into_user_result().context("address blocklist check failed")?;
+				}
+			}
 		}
 
 		let builder = BoardBuilder::new_for_cosign(
@@ -731,7 +750,7 @@ impl Server {
 			self.bitcoind.call_raw(
 				"getblockheader", &[bcd::json_arg(confirmed_hash)?, true.into()],
 			).await?;
-		let confirmed_height = confirmed_header.height as BlockHeight;
+		let confirmed_height = BlockHeight::new(confirmed_header.height as u32);
 
 		let confirmations = tx_info.confirmations.unwrap_or(0) as usize;
 		if confirmations < self.config.required_board_confirmations {
@@ -745,9 +764,22 @@ impl Server {
 		let funding_tx = bitcoin::consensus::deserialize::<Transaction>(&tx_info.hex)
 			.context("failed to deserialize funding transaction")?;
 
+		if let Some(ref list) = self.bitcoin_address_blocklist {
+			let res = list.check_tx(&funding_tx).await;
+			if !res.is_ok() {
+				if let Some(addr) = res.violating_address() {
+					slog!(BoardAttemptBlockedAddress, vtxo: Some(vtxo.id()), amount: vtxo.amount(),
+						address: addr.as_unchecked().clone(),
+					);
+				}
+				res.into_user_result().context("address blocklist check failed")?;
+			}
+		}
+
 		// bitcoind rpc documents that if a mempool tx spends a utxo in the utxoset,
 		// if will not appear in gettxout when include_mempool is set to true
-		let is_spent = bcd::get_tx_out(&self.bitcoind, &funding_txid, funding_vout, Some(true)).await
+		let is_spent = self.bitcoind
+			.try_get_tx_out(OutPoint::new(funding_txid, funding_vout), true).await
 			.context("failed to check board utxo spend status")?
 			.is_none();
 		if is_spent {
@@ -763,16 +795,21 @@ impl Server {
 		let builder = BoardBuilder::new_from_vtxo(&vtxo, &funding_tx, self.server_pubkey)
 			.badarg("vtxo is not a board")?;
 
+		// insert_spendable_vtxos uses ON CONFLICT DO NOTHING, so an idempotent
+		// retry inserts zero rows. We gate the board metric on the actual
+		// inserted-row count returned by execute_vtxo_tree_update, which makes
+		// the fresh-vs-retry decision atomic with the write rather than
+		// depending on a separate racy pre-read.
 		let update = VtxoTreeUpdate::new()
 			.upsert_funding_tx(&funding_tx)
 			.upsert_unsigned_tx([builder.exit_txid()])
-			.insert_spendable_vtxos(builder.build_internal_unsigned_vtxos())
+			.insert_spendable_vtxos(builder.build_server_vtxos())
 			.mark_vtxos_oor_spent(builder.spend_info());
-		self.db.write(async |t| {
-			t.execute_vtxo_tree_update(update).await?;
+		let inserted = self.db.write(async |t| {
+			let inserted = t.execute_vtxo_tree_update(update).await?;
 			t.add_funding_vtxos_to_frontier(funding_txid, Some(confirmed_height)).await
 				.context("failed to add board vtxos to frontier")?;
-			Ok(())
+			Ok(inserted)
 		}).await?;
 
 		slog!(RegisteredBoard,
@@ -781,25 +818,57 @@ impl Server {
 			amount: vtxo.amount(),
 		);
 
+		if inserted > 0 {
+			crate::telemetry::add_board(vtxo.amount().to_sat());
+			// Fee = what the user cosigned - vtxo amount, so schedule
+			// drift between cosign and register can't misreport.
+			let funding_value = funding_tx.output[funding_vout as usize].value;
+			let user_fee_sat = funding_value.to_sat().saturating_sub(vtxo.amount().to_sat());
+			telemetry::record_ark_fee(telemetry::ArkFeeOp::Board, user_fee_sat, None);
+		}
+
 		Ok(())
 	}
 
-	/// Validates and stores the signed transaction chains for the given VTXOs.
+	/// Registers the given VTXOs: validates and stores their signed
+	/// transaction chains and flips them from `unregistered` to `spendable`.
 	///
 	/// For each VTXO:
 	/// - Checks it exists in the database
 	/// - Checks it is fully signed
 	/// - Validates signatures against the chain anchor transaction
-	/// - Extracts transactions and updates virtual_transaction table
-	pub async fn store_vtxo_transactions(
+	/// - Extracts transactions for the virtual_transaction table
+	///
+	/// Registration is the moment an htlc-send vtxo starts to exist (the
+	/// server now holds a claim on the funds), so this also writes the
+	/// htlc_vtxo row for htlc-send vtxos, in the same transaction.
+	pub async fn register_vtxo_transactions(
 		&self,
 		vtxos: impl IntoIterator<Item = impl AsRef<Vtxo<Full>>>,
 	) -> anyhow::Result<()> {
+		let mut seen_ids: HashSet<VtxoId> = HashSet::new();
+		let vtxos = vtxos.into_iter()
+			.map(|v| v.as_ref().clone())
+			.filter(|v| seen_ids.insert(v.id()))
+			.collect::<Vec<_>>();
+
+		// An htlc-send vtxo only exists once its signed chain is
+		// registered: that is when the server holds a claim on the funds.
+		let htlc_sends = vtxos.iter()
+			.filter_map(|v| match v.policy() {
+				VtxoPolicy::ServerHtlcSend(p) =>
+					Some((v.id(), p.payment_hash, p.htlc_expiry)),
+				VtxoPolicy::ServerHtlcSend_v0(p) =>
+					Some((v.id(), p.payment_hash, p.htlc_expiry)),
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+
 		let mut signed_txs: Vec<Transaction> = Vec::new();
 		let mut seen_txids: HashSet<Txid> = HashSet::new();
 		let mut registered_ids: Vec<VtxoId> = Vec::new();
-		for vtxo in vtxos {
-			let vtxo = vtxo.as_ref();
+
+		for vtxo in &vtxos {
 			let vtxo_id = vtxo.id();
 
 			// Check vtxo exists in database
@@ -842,46 +911,35 @@ impl Server {
 			registered_ids.push(vtxo_id);
 		}
 
-		// Upsert the signed chain and flip the vtxos from `unregistered`
-		// to `spendable` in a single tx. Any vtxo already in another state
-		// (e.g. spendable from a round output, or spent) is left alone.
+		// Persist the fully-signed vtxos (so the server can later serve them to
+		// a wallet recovering from seed), upsert the signed chain, and flip the
+		// vtxos from `unregistered` to `spendable` in a single tx. The state
+		// flip only affects `unregistered` vtxos; the stored vtxo bytes are
+		// overwritten regardless of state, which is safe because each vtxo was
+		// validated above as a fully-signed version of that id, and any valid
+		// fully-signed version serves recovery equally well.
 		let update = VtxoTreeUpdate::new()
 			.upsert_signed_tx(signed_txs)
+			.provide_signatures(vtxos)
 			.mark_vtxos_registered(registered_ids);
-		self.db.write(async |t| t.execute_vtxo_tree_update(update).await).await?;
+		self.db.write(async |t| {
+			t.execute_vtxo_tree_update(update).await?;
+			htlc_vtxo::create_htlc_vtxos(&t, &htlc_sends, HtlcDirection::Incoming).await?;
+			Ok(())
+		}).await?;
 		Ok(())
 	}
 
-	pub async fn check_vtxos_not_exited<V: VtxoRef>(
-		&self,
-		vtxos: impl IntoIterator<Item=V>
-	) -> anyhow::Result<()> {
-		for vtxo in vtxos {
-			let vtxo_id = vtxo.vtxo_id();
-			let txid = vtxo_id.to_point().txid;
-			let status = bcd::tx_status(&self.bitcoind, txid).await?;
-
-			match status {
-				TxStatus::Confirmed(_) => {
-					// TODO: should we mark vtxo as spent here?
-					return badarg!("cannot spend vtxo that is already exited: {}", vtxo_id);
-				},
-				TxStatus::Mempool => {
-					return badarg!("cannot spend vtxo that is being exited: {}", vtxo_id);
-				},
-				TxStatus::NotFound => {},
-			}
-		}
-
-		Ok(())
-	}
-
-	/// Unblind a [BlindedMailboxIdentifier]
+	/// Unblind a [BlindedMailboxIdentifier].
+	///
+	/// Returns an error when the peer-supplied blinded point cancels the
+	/// ECDH tweak; the caller is responsible for surfacing an invalid-argument
+	/// status to the peer.
 	pub fn unblind_mailbox_id(
 		&self,
 		blinded: BlindedMailboxIdentifier,
 		vtxo_pubkey: PublicKey,
-	) -> MailboxIdentifier {
+	) -> Result<MailboxIdentifier, MailboxBlindingError> {
 		MailboxIdentifier::from_blinded(blinded, vtxo_pubkey, self.mailbox_key.leak_ref())
 	}
 
@@ -947,21 +1005,23 @@ impl Server {
 	}
 
 	/// Cosign the hArk leaf VTXO
+	///
+	/// Returns an error if the VTXO is not a hArk leaf VTXO.
 	pub fn cosign_hashlocked_leaf(
 		&self,
 		request: &LeafVtxoCosignRequest,
 		vtxo: &Vtxo<Full>,
 		funding_tx: &Transaction,
-	) -> LeafVtxoCosignResponse {
+	) -> anyhow::Result<LeafVtxoCosignResponse> {
 		// NB there is no danger in doing this multiple times
 		// because user needs the preimage alongside the signature
 
 		trace!("Signing hArk leaf for VTXO {}", request.vtxo_id);
 		let ret = LeafVtxoCosignResponse::new_cosign(
 			request, vtxo, funding_tx, self.server_key.leak_ref(),
-		);
+		).badarg("VTXO is not a hArk leaf VTXO")?;
 		slog!(HarkLeafSigned, vtxo_id: request.vtxo_id, funding_txid: funding_tx.compute_txid());
-		ret
+		Ok(ret)
 	}
 
 	/// Cosign the hArk leaf VTXO from a known round
@@ -978,7 +1038,7 @@ impl Server {
 				.badarg("VTXO's chain anchor is not a known round")?;
 			Ok((vtxo, round))
 		}).await?;
-		Ok(self.cosign_hashlocked_leaf(request, &vtxo.vtxo, &round.funding_tx))
+		self.cosign_hashlocked_leaf(request, &vtxo.vtxo, &round.funding_tx)
 	}
 
 }

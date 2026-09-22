@@ -8,8 +8,9 @@ use ark::fees::{
 	PpmFeeRate, RefreshFees,
 };
 use bark_json::movements::{MovementDestination, PaymentMethod};
-use bitcoin_ext::{FeeRateExt, P2TR_DUST};
-use ark_testing::{TestContext, btc, require_bark_version, sat};
+use bitcoin_ext::{BlockDelta, FeeRateExt, P2TR_DUST};
+use server_log::ArkFeeRecorded;
+use ark_testing::{TestContext, btc, is_bark_version, require_bark_version, sat};
 use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
 use ark_testing::exit::complete_exit;
 use ark_testing::util::{FutureExt, ToAltString};
@@ -20,6 +21,27 @@ fn assert_eq_unordered<T: Ord + Clone + std::fmt::Debug>(a: &[T], b: &[T]) {
 	a.sort();
 	b.sort();
 	assert_eq!(a, b, "unordered comparison failed");
+}
+
+/// Wait for the next `ArkFeeRecorded` event whose op_type matches, ignoring
+/// events for other ops (a single flow may span several op types). Panics on
+/// timeout or channel close so the failure diagnostic shows what op we were
+/// waiting for.
+async fn wait_for_fee_event(
+	logs: &mut tokio::sync::mpsc::UnboundedReceiver<server_log::ArkFeeRecorded>,
+	op_type: &str,
+	deadline: Duration,
+) -> server_log::ArkFeeRecorded {
+	let start = tokio::time::Instant::now();
+	loop {
+		let remaining = deadline.checked_sub(start.elapsed()).unwrap_or(Duration::ZERO);
+		match tokio::time::timeout(remaining, logs.recv()).await {
+			Ok(Some(log)) if log.op_type == op_type => return log,
+			Ok(Some(_)) => continue,
+			Ok(None) => panic!("ArkFeeRecorded channel closed before {} event arrived", op_type),
+			Err(_) => panic!("timed out waiting for {} ArkFeeRecorded event", op_type),
+		}
+	}
 }
 
 #[tokio::test]
@@ -113,14 +135,13 @@ async fn exit_fee_anchor_no_dust_change_error() {
 	assert_eq!(bark.vtxos().await.len(), 0);
 	let utxos = bark.utxos().await;
 	assert_eq!(utxos.len(), 2);
-	assert!(utxos.iter().any(|u| u.amount == sat(99_999))); // Unboarded + fee anchor change
+	// TODO: switch to 100 302 sats on 0.4.0
+	assert!(utxos.iter().any(|u| u.amount >= sat(99_999))); // Unboarded + fee anchor change
 	assert!(utxos.iter().any(|u| u.amount == sat(99_657))); // Exited amount
 }
 
 #[tokio::test]
 async fn board_fee_base_and_ppm() {
-	require_bark_version!(> "0.1.4");
-
 	let ctx = TestContext::new("fees/board_fee_base_and_ppm").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
 		cfg.fees.board = BoardFees {
@@ -136,11 +157,20 @@ async fn board_fee_base_and_ppm() {
 	// Estimate before performing the operation
 	let estimate = bark.estimate_board_offchain_fee(sat(100_000)).await;
 
+	let mut fee_logs = srv.subscribe_log::<ArkFeeRecorded>();
 	bark.board_and_confirm_and_register(&ctx, sat(100_000)).await;
 
 	// Fee = base(100) + 100,000 * 10,000 / 1,000,000 = 100 + 1,000 = 1,100
 	let expected_fee = sat(1_100);
 	let expected_vtxo_amount = sat(100_000) - expected_fee;
+
+	// Board emits one ArkFeeRecorded at register_board (post-confirmation);
+	// board has no routing component so user == net and routing is None.
+	let fee_log = wait_for_fee_event(&mut fee_logs, "board", Duration::from_secs(15)).await;
+	assert_eq!(fee_log.net_fee_sat, expected_fee.to_sat());
+	assert_eq!(fee_log.user_fee_sat, expected_fee.to_sat());
+	assert_eq!(fee_log.routing_fee_sat, None);
+	assert_eq!(fee_log.round_seq, None);
 
 	let vtxos = bark.vtxos().await;
 	assert_eq!(vtxos.len(), 1);
@@ -163,8 +193,6 @@ async fn board_fee_base_and_ppm() {
 
 #[tokio::test]
 async fn board_fee_min_fee_applies() {
-	require_bark_version!(> "0.1.4");
-
 	let ctx = TestContext::new("fees/board_fee_min_fee_applies").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
 		cfg.fees.board = BoardFees {
@@ -204,8 +232,6 @@ async fn board_fee_min_fee_applies() {
 
 #[tokio::test]
 async fn board_fee_rejects_when_fee_exceeds_amount() {
-	require_bark_version!(> "0.1.4");
-
 	let ctx = TestContext::new("fees/board_fee_rejects_when_fee_exceeds_amount").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
 		cfg.fees.board = BoardFees {
@@ -236,7 +262,7 @@ async fn board_fee_rejects_when_fee_exceeds_amount() {
 
 #[tokio::test]
 async fn refresh_fee_base_only() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("fees/refresh_fee_base_only").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
@@ -277,7 +303,7 @@ async fn refresh_fee_base_only() {
 
 #[tokio::test]
 async fn refresh_fee_with_ppm_expiry() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("fees/refresh_fee_with_ppm_expiry").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
@@ -302,9 +328,26 @@ async fn refresh_fee_with_ppm_expiry() {
 	// This exceeds the 50-block threshold, so 1% ppm applies.
 	// Fee = base(200) + 100,000 * 10,000 / 1,000,000 = 200 + 1,000 = 1,200
 	let expected_fee = sat(1_200);
+
+	// Subscribe before the refresh — the board above doesn't emit a refresh
+	// slog (it's an `ArkFeeOp::Board` event), but filtering by op_type below
+	// also covers any pool-issuance fee events captaind might emit.
+	let mut fee_logs = srv.subscribe_log::<ArkFeeRecorded>();
 	ctx.refresh_all(&srv, &[&bark]).await;
 	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
 	assert_eq!(bark.spendable_balance().await, sat(100_000) - expected_fee);
+
+	// Refresh emits one ArkFeeRecorded per participation at the round's
+	// success boundary. With a single-user refresh we expect exactly one
+	// event, carrying the total fee and the round_seq for downstream joins
+	// against RoundFinished / RoundFailed.
+	let event = wait_for_fee_event(&mut fee_logs, "refresh", Duration::from_secs(15)).await;
+	assert_eq!(event.net_fee_sat, expected_fee.to_sat(),
+		"refresh event fee must match the total fee");
+	assert_eq!(event.user_fee_sat, expected_fee.to_sat());
+	assert_eq!(event.routing_fee_sat, None);
+	assert!(event.round_seq.is_some(),
+		"refresh events must carry the round_seq; got {:?}", event);
 
 	let movements = bark.history().await;
 	let refresh_mvt = movements.last().unwrap();
@@ -320,7 +363,7 @@ async fn refresh_fee_with_ppm_expiry() {
 
 #[tokio::test]
 async fn refresh_fee_with_multiple_vtxos() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("fees/refresh_fee_with_multiple_vtxos").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
@@ -372,10 +415,12 @@ async fn refresh_fee_with_multiple_vtxos() {
 
 #[tokio::test]
 async fn refresh_should_refresh_vtxos() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("fees/refresh_should_refresh_vtxos").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
 		cfg.round_interval = Duration::from_secs(3600);
-		cfg.vtxo_lifetime = 144;
+		cfg.vtxo_lifetime = BlockDelta::new(144);
 		cfg.fees.refresh = RefreshFees {
 			base_fee: sat(500),
 			ppm_expiry_table: vec![
@@ -418,37 +463,37 @@ async fn refresh_should_refresh_vtxos() {
 	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
 
 	let vtxos = bark.vtxos().await;
-	assert_eq!(
-		vtxos.len(), 2, "Should have 2 VTXOs: 1 refresh output, 1 should-refresh consolidation",
-	);
+	let movements = bark.history().await;
+	assert_eq!(movements.len(), 4); // 3 boards + 1 refresh
+	let refresh_mvt = movements.last().unwrap();
 
-	let expected_fee = sat(6_500);
+	// A manual refresh only refreshes the VTXOs it was given: A and B merely meet the
+	// "should-refresh" criteria, which is not enough to bundle them in.
+	assert_eq!(vtxos.len(), 3, "A and B must stay untouched, C is replaced by its refresh output");
+	assert_eq!(vtxos.iter().filter(|v| v.amount == sat(100_000)).count(), 1, "VTXO A untouched");
+	assert_eq!(vtxos.iter().filter(|v| v.amount == sat(200_000)).count(), 1, "VTXO B untouched");
+
+	let expected_fee = sat(3_500);
 	assert_eq!(
 		vtxos.iter().filter(|v| v.amount == sat(296_500)).count(), 1,
 		"One VTXO which was explicitly refreshed, includes base fee",
 	);
-	assert_eq!(
-		vtxos.iter().filter(|v| v.amount == sat(297_000)).count(), 1,
-		"One VTXO which is a consolidation of 100K and 200K VTXOs, excludes base fee",
-	);
 
-	// Balance = 296,500 + 297,000 = 593,500
+	// Balance = 100,000 + 200,000 + 296,500 = 596,500
 	assert_eq!(bark.spendable_balance().await, sat(600_000) - expected_fee);
-
-	// Verify movement
-	let movements = bark.history().await;
-	assert_eq!(movements.len(), 4); // 3 boards + 1 refresh
-	let refresh_mvt = movements.last().unwrap();
 	assert_eq!(refresh_mvt.offchain_fee, expected_fee);
 	assert_eq!(refresh_mvt.effective_balance, -expected_fee.to_signed().unwrap());
+	assert_eq!(refresh_mvt.input_vtxos, vec![vtxo.id], "only C should be an input to the refresh");
 }
 
 #[tokio::test]
 async fn refresh_should_refresh_vtxos_no_dust() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("fees/refresh_should_refresh_vtxos_no_dust").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
 		cfg.round_interval = Duration::from_secs(3600);
-		cfg.vtxo_lifetime = 144;
+		cfg.vtxo_lifetime = BlockDelta::new(144);
 		cfg.fees.refresh = RefreshFees {
 			base_fee: Amount::ZERO,
 			ppm_expiry_table: vec![
@@ -474,7 +519,9 @@ async fn refresh_should_refresh_vtxos_no_dust() {
 	bark1.send_oor(bark2.address().await, sat(331)).await;
 
 	let bark2_vtxos = bark2.vtxos().await;
-	assert_eq!(bark1.vtxos().await.len(), 1);
+	// bark > 0.6.1 splits change in two
+	let nb_change = if is_bark_version!(> "0.6.1") { 2 } else { 1 };
+	assert_eq!(bark1.vtxos().await.len(), nb_change);
 	assert_eq!(bark2_vtxos.len(), 2);
 
 	let vtxo = bark2_vtxos.iter().find(|v| v.amount == sat(200_000)).unwrap();
@@ -494,7 +541,7 @@ async fn refresh_should_refresh_vtxos_no_dust() {
 	let vtxos = bark2.vtxos().await;
 	assert_eq!(vtxos.len(), 2, "Should have 2 VTXOs: 1 refresh output, 1 expired VTXO");
 
-	let expected_fee = sat(200_000) * PpmFeeRate::ONE_PERCENT;
+	let expected_fee = (sat(200_000) * PpmFeeRate::ONE_PERCENT).to_amount_ceil().unwrap();
 	assert_eq!(
 		vtxos.iter().filter(|v| v.amount == sat(198_000)).count(), 1,
 		"One VTXO which was explicitly refreshed",
@@ -518,7 +565,7 @@ async fn refresh_should_refresh_vtxos_no_dust() {
 
 #[tokio::test]
 async fn refresh_fee_rejects_dust_output() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("fees/refresh_fee_rejects_dust_output").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
@@ -555,10 +602,8 @@ async fn refresh_fee_rejects_dust_output() {
 
 #[tokio::test]
 async fn offboard_fee_base_deducted() {
-	require_bark_version!(> "0.1.4");
-
 	let ctx = TestContext::new("fees/offboard_fee_base_deducted").await;
-	let srv = ctx.captaind("server").cfg(|cfg| {
+	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| {
 		cfg.round_interval = Duration::from_secs(3600);
 		cfg.fees.offboard = OffboardFees {
 			base_fee: sat(5_000),
@@ -576,10 +621,7 @@ async fn offboard_fee_base_deducted() {
 	// Estimate before offboard
 	let estimate = bark.estimate_offboard_all(&address).await;
 
-	tokio::join!(
-		srv.trigger_round(),
-		bark.offboard_all(&address),
-	);
+	bark.offboard_all(&address).await;
 
 	assert_eq!(bark.spendable_balance().await, sat(0));
 
@@ -614,10 +656,8 @@ async fn offboard_fee_base_deducted() {
 
 #[tokio::test]
 async fn offboard_fee_with_ppm_expiry() {
-	require_bark_version!(> "0.1.4");
-
 	let ctx = TestContext::new("fees/offboard_fee_with_ppm_expiry").await;
-	let srv = ctx.captaind("server").cfg(|cfg| {
+	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| {
 		cfg.round_interval = Duration::from_secs(3600);
 		cfg.fees.offboard = OffboardFees {
 			base_fee: Amount::ZERO,
@@ -643,6 +683,7 @@ async fn offboard_fee_with_ppm_expiry() {
 	// Estimate before offboard
 	let estimate = bark.estimate_offboard_all(&address).await;
 
+	let mut fee_logs = srv.subscribe_log::<ArkFeeRecorded>();
 	tokio::join!(
 		srv.trigger_round(),
 		bark.offboard_all(&address),
@@ -657,6 +698,16 @@ async fn offboard_fee_with_ppm_expiry() {
 		"offchain fee should include ppm component, got {}", offb_mvt.offchain_fee,
 	);
 
+	// Offboard emits one ArkFeeRecorded at the wallet_commit FALSE->TRUE
+	// transition inside commit_offboard; user_fee_sat is the total user
+	// fee (offchain + onchain), matching movements.offchain_fee.
+	let event = wait_for_fee_event(&mut fee_logs, "offboard", Duration::from_secs(15)).await;
+	assert_eq!(event.net_fee_sat, offb_mvt.offchain_fee.to_sat(),
+		"offboard event fee must match the total offchain fee");
+	assert_eq!(event.user_fee_sat, offb_mvt.offchain_fee.to_sat());
+	assert_eq!(event.routing_fee_sat, None);
+	assert_eq!(event.round_seq, None);
+
 	ctx.generate_blocks(1).await;
 	let received = ctx.bitcoind().get_received_by_address(&address);
 	assert_eq!(received, sat(500_000) - offb_mvt.offchain_fee);
@@ -670,10 +721,8 @@ async fn offboard_fee_with_ppm_expiry() {
 
 #[tokio::test]
 async fn offboard_all_rejects_dust_output() {
-	require_bark_version!(> "0.1.4");
-
 	let ctx = TestContext::new("fees/offboard_all_rejects_dust_output").await;
-	let srv = ctx.captaind("server").cfg(|cfg| {
+	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| {
 		cfg.round_interval = Duration::from_secs(3600);
 		cfg.fee_estimator.fallback_fee_rate_regular = FeeRate::from_sat_per_vb(7).unwrap();
 		cfg.fees.offboard = OffboardFees {
@@ -706,10 +755,8 @@ async fn offboard_all_rejects_dust_output() {
 
 #[tokio::test]
 async fn send_onchain_fee_deducted() {
-	require_bark_version!(> "0.1.4");
-
 	let ctx = TestContext::new("fees/send_onchain_fee_deducted").await;
-	let srv = ctx.captaind("server").cfg(|cfg| {
+	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| {
 		cfg.fees.offboard = OffboardFees {
 			base_fee: sat(3_000),
 			fixed_additional_vb: 100,
@@ -749,9 +796,13 @@ async fn send_onchain_fee_deducted() {
 		}).as_ref(),
 	);
 
-	// Change VTXO should be board_amount - send_amount - fee
-	let [change_vtxo] = bark1.vtxos().await.try_into().expect("should have one vtxo");
-	assert_eq!(change_vtxo.amount, input_vtxo.amount - send_amount - fee);
+	// Change (split in two on bark > 0.6.1) should total
+	// board_amount - send_amount - fee
+	let nb_change = if is_bark_version!(> "0.6.1") { 2 } else { 1 };
+	let change_vtxos = bark1.vtxos().await;
+	assert_eq!(change_vtxos.len(), nb_change);
+	let change_total = change_vtxos.iter().map(|v| v.amount).sum::<Amount>();
+	assert_eq!(change_total, input_vtxo.amount - send_amount - fee);
 
 	// Verify on-chain receipt
 	ctx.generate_blocks(1).await;
@@ -766,7 +817,7 @@ async fn send_onchain_fee_deducted() {
 
 #[tokio::test]
 async fn lightning_receive_fee_deducted() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("fees/lightning_receive_fee_deducted").await;
 
@@ -797,7 +848,8 @@ async fn lightning_receive_fee_deducted() {
 	});
 
 	srv.wait_for_vtxopool(&ctx).await;
-	bark.lightning_receive(&invoice_info.invoice).wait_millis(10_000).await;
+	let mut fee_logs = srv.subscribe_log::<ArkFeeRecorded>();
+	bark.lightning_receive(&invoice_info.invoice).wait_millis(30_000).await;
 	res.ready().await.unwrap();
 
 	// Fee = base(500) + 1,000,000 * 10,000 / 1,000,000 = 500 + 10,000 = 10,500
@@ -805,6 +857,16 @@ async fn lightning_receive_fee_deducted() {
 
 	// Verify balance: board amount + (pay_amount - fee)
 	assert_eq!(bark.spendable_balance().await, board_amount + pay_amount - expected_fee);
+
+	// Lightning-receive records at the claim edge; user_fee_sat is the
+	// deducted fee. Idempotency is checked by the fact that a claim retry
+	// against a Settled subscription must not emit another event (see the
+	// `first_claim` gate in claim_lightning_receive).
+	let event = wait_for_fee_event(&mut fee_logs, "lightning_receive", Duration::from_secs(15)).await;
+	assert_eq!(event.net_fee_sat, expected_fee.to_sat());
+	assert_eq!(event.user_fee_sat, expected_fee.to_sat());
+	assert_eq!(event.routing_fee_sat, None);
+	assert_eq!(event.round_seq, None);
 
 	// Verify movement
 	let movements = bark.history().await;
@@ -824,7 +886,7 @@ async fn lightning_receive_fee_deducted() {
 
 #[tokio::test]
 async fn lightning_receive_fee_rejects_when_fee_exceeds_amount() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("fees/lightning_receive_fee_rejects_when_fee_exceeds_amount").await;
 
@@ -857,7 +919,7 @@ async fn lightning_receive_fee_rejects_when_fee_exceeds_amount() {
 
 #[tokio::test]
 async fn lightning_send_fee_deducted() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("fees/lightning_send_fee_deducted").await;
 
@@ -909,7 +971,7 @@ async fn lightning_send_fee_deducted() {
 
 #[tokio::test]
 async fn lightning_send_fee_min_fee_applies() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("fees/lightning_send_fee_min_fee_applies").await;
 
@@ -960,14 +1022,14 @@ async fn lightning_send_fee_min_fee_applies() {
 
 #[tokio::test]
 async fn lightning_send_fee_ppm_expiry_table() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("fees/lightning_send_fee_ppm_expiry_table").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).cfg(|cfg| {
-		cfg.vtxo_lifetime = 144;
+		cfg.vtxo_lifetime = BlockDelta::new(144);
 		cfg.fees.lightning_send = LightningSendFees {
 			min_fee: Amount::ZERO,
 			base_fee: sat(1_000),
@@ -994,12 +1056,27 @@ async fn lightning_send_fee_ppm_expiry_table() {
 	// (not 5%).
 	// Fee = base(1,000) + ppm_expiry(2 BTC × 1%) = 1,000 + 2,000,000 = 2,001,000
 	let invoice = lightning.external.invoice(Some(pay_amount), "test_ppm_expiry", "ppm expiry test").await;
+	let mut fee_logs = srv.subscribe_log::<ArkFeeRecorded>();
 	bark.pay_lightning_wait(invoice, None).await;
 
 	let expected_fee = sat(2_001_000);
 
 	// Balance should be: board(5 BTC) - payment(2 BTC) - fee(2,001,000 sats)
 	assert_eq!(bark.spendable_balance().await, board_amount - pay_amount - expected_fee);
+
+	// Lightning-send records at the Succeeded transition. The counter's
+	// `net_fee_sat` is the net margin (`user_fee - routing_fee`); the gross
+	// components stay on the slog. Against `lightning.external` there is no
+	// routing over the network (single-hop), so routing_fee stays at 0 and
+	// net_fee_sat == user_fee_sat.
+	let event = wait_for_fee_event(&mut fee_logs, "lightning_send", Duration::from_secs(30)).await;
+	assert_eq!(event.user_fee_sat, expected_fee.to_sat(),
+		"lightning_send slog must carry the user fee");
+	assert_eq!(event.routing_fee_sat, Some(0),
+		"single-hop payment against the external node has no routing cost");
+	assert_eq!(event.net_fee_sat, expected_fee.to_sat(),
+		"net margin equals user fee when routing cost is zero");
+	assert_eq!(event.round_seq, None);
 
 	// Verify movement
 	let movements = bark.history().await;

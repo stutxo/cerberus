@@ -30,17 +30,22 @@ use std::cmp;
 use std::convert::TryFrom;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bitcoin::{FeeRate, Network};
 use log::warn;
 use tokio::sync::RwLock;
+use tonic::codec::CompressionEncoding;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::metadata::errors::InvalidMetadataValue;
 use tonic::service::interceptor::{InterceptedService, Interceptor};
 
 use ark::ArkInfo;
 
-use crate::{mailbox, protos, ArkServiceClient, ConvertError, RequestExt};
+use crate::{
+	mailbox, protos, ArkServiceClient, ConvertError, RequestExt,
+	MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
+};
 
 
 #[cfg(all(feature = "tonic-native", feature = "tonic-web"))]
@@ -51,10 +56,27 @@ compile_error!("the `socks5-proxy` feature is only usable in conjunction with `t
 
 
 /// The HTTP header used for private server access tokens
+#[deprecated(
+	since = "0.2.4",
+	note = "access tokens are not enforced by the server; this header will be removed",
+)]
 pub const ACCESS_TOKEN_HEADER: &str = "ark-access-token";
+/// The HTTP header used to identify the client implementation.
+///
+/// We use `x-user-agent` rather than `user-agent` because browsers control the
+/// latter for `fetch`-based transports (gRPC-web from WASM), and `x-user-agent`
+/// is the established gRPC-web convention for client-set identifiers.
+///
+/// Expected value: `<name>/<version>` where `name` is 1-32 chars of lowercase
+/// ASCII alphanumeric / `-` / `_`. Anything else (uppercase, missing slash,
+/// invalid chars, too long) is rejected server-side with `invalid_argument`.
+pub const USER_AGENT_HEADER: &str = "x-user-agent";
 /// Error text used when no Ark RPC transport backend was compiled into the binary.
 pub const NO_TRANSPORT_BACKEND_MESSAGE: &str =
 	"no Ark RPC transport backend compiled in this build; enable `bark-server-rpc/tonic-native` or `bark-server-rpc/tonic-web`";
+
+/// Default timeout to add on requests to the server
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 
 #[cfg(feature = "tonic-native")]
@@ -118,10 +140,11 @@ mod transport {
 
 		#[cfg_attr(not(any(feature = "tls-native-roots", feature = "tls-webpki-roots")), allow(unused_mut))]
 		let mut endpoint = Channel::builder(uri.clone())
+			// nb how often we check if server is still there
 			.http2_keep_alive_interval(Duration::from_secs(20))
-			.keep_alive_timeout(Duration::from_secs(600))
-			.keep_alive_while_idle(true)
-			.timeout(Duration::from_secs(600));
+			// nb time we allow server to respond to ping before we consider dead
+			.keep_alive_timeout(Duration::from_secs(60)) // 1 min
+			.keep_alive_while_idle(true);
 
 		#[cfg(any(feature = "tls-native-roots", feature = "tls-webpki-roots"))]
 		if scheme == "https" {
@@ -200,16 +223,6 @@ mod transport {
 	}
 }
 
-/// The minimum protocol version supported by the client.
-///
-/// For info on protocol versions, see [server_rpc](crate) module documentation.
-pub const MIN_PROTOCOL_VERSION: u64 = 1;
-
-/// The maximum protocol version supported by the client.
-///
-/// For info on protocol versions, see [server_rpc](crate) module documentation.
-pub const MAX_PROTOCOL_VERSION: u64 = 1;
-
 
 #[derive(Debug, thiserror::Error)]
 #[error("failed to create gRPC endpoint: {msg}")]
@@ -235,8 +248,14 @@ pub enum CreateEndpointError {
 pub enum ConnectError {
 	#[error("missing info '{0}' to connect")]
 	MissingInfo(&'static str),
+	#[deprecated(
+		since = "0.2.4",
+		note = "access tokens are not enforced by the server; this variant will be removed",
+	)]
 	#[error("invalid access token: {0}")]
-	InvalidAccessToken(#[from] #[source] InvalidMetadataValue),
+	InvalidAccessToken(#[source] InvalidMetadataValue),
+	#[error("invalid user agent: {0}")]
+	InvalidUserAgent(#[source] InvalidMetadataValue),
 	#[error(transparent)]
 	CreateEndpoint(#[from] CreateEndpointError),
 	#[error("handshake request failed: {0}")]
@@ -280,21 +299,28 @@ impl tonic::service::Interceptor for ProtocolVersionInterceptor {
 /// A gRPC interceptor that attaches ark-specific headers to each request
 ///
 /// - pver: the negotiated protocol version
+/// - if no timeout is set yet, it sets [DEFAULT_REQUEST_TIMEOUT]
 /// - access_token: the access token to use for private servers
+/// - user_agent: client identifier sent on every RPC so the server can
+///   attribute traffic per implementation (see [USER_AGENT_HEADER]).
 #[derive(Clone)]
 pub struct ArkServiceInterceptor {
 	pver: Option<u64>,
 	access_token: Option<AsciiMetadataValue>,
+	user_agent: AsciiMetadataValue,
 }
 
 impl tonic::service::Interceptor for ArkServiceInterceptor {
 	fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+		req.set_default_timeout(DEFAULT_REQUEST_TIMEOUT);
 		if let Some(pver) = self.pver {
 			req.set_pver(pver);
 		}
 		if let Some(ref access_token) = self.access_token {
+			#[allow(deprecated)]
 			req.metadata_mut().insert(ACCESS_TOKEN_HEADER, access_token.clone());
 		}
+		req.metadata_mut().insert(USER_AGENT_HEADER, self.user_agent.clone());
 		Ok(req)
 	}
 }
@@ -337,6 +363,7 @@ pub struct ServerConnectionBuilder {
 	#[cfg(feature = "socks5-proxy")]
 	proxy: Option<String>,
 	access_token: Option<String>,
+	user_agent: Option<String>,
 }
 
 impl ServerConnectionBuilder {
@@ -356,8 +383,22 @@ impl ServerConnectionBuilder {
 		self
 	}
 
+	#[deprecated(
+		since = "0.2.4",
+		note = "access tokens are not enforced by the server; this method will be removed",
+	)]
 	pub fn access_token(mut self, access_token: impl Into<String>) -> Self {
 		self.access_token = Some(access_token.into());
+		self
+	}
+
+	/// Override the client identifier sent on every RPC.
+	///
+	/// Defaults to `bark/<bark-server-rpc version>` when not set. Integrators
+	/// (FFI bindings, WASM wallets, custom apps) should pass their own ident
+	/// (e.g. `"aqua/1.4.2"`) so server-side telemetry can attribute traffic.
+	pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
+		self.user_agent = Some(user_agent.into());
 		self
 	}
 
@@ -384,7 +425,7 @@ pub struct ServerConnection {
 impl ServerConnection {
 	fn handshake_req() -> protos::HandshakeRequest {
 		protos::HandshakeRequest {
-			bark_version: Some(env!("CARGO_PKG_VERSION").into()),
+			bark_version: Some(crate::BARK_CRATE_VERSION.into()),
 		}
 	}
 
@@ -423,9 +464,19 @@ impl ServerConnection {
 		#[cfg(not(feature = "socks5-proxy"))]
 		let transport = transport::connect(&address).await?;
 
+		let user_agent = builder.user_agent
+			.unwrap_or_else(|| format!("bark/{}", env!("CARGO_PKG_VERSION")));
+		let user_agent: AsciiMetadataValue = user_agent.try_into()
+			.map_err(ConnectError::InvalidUserAgent)?;
+
 		let mut interceptor = ArkServiceInterceptor {
 			pver: None,
-			access_token: builder.access_token.map(|t| t.try_into()).transpose()?,
+			#[allow(deprecated)]
+			access_token: builder.access_token
+				.map(AsciiMetadataValue::try_from)
+				.transpose()
+				.map_err(ConnectError::InvalidAccessToken)?,
+			user_agent,
 		};
 
 		let mut handshake_client = ArkServiceClient::with_interceptor(transport.clone(), interceptor.clone());
@@ -435,12 +486,18 @@ impl ServerConnection {
 		let pver = check_handshake(handshake)?;
 		interceptor.pver = Some(pver);
 
+		// Advertise zstd so capable servers compress their responses; the
+		// savings are mostly on the response path. We only accept_compressed,
+		// never send_compressed: gRPC can't negotiate request-body compression,
+		// so the client leaves its own requests uncompressed.
 		let mut client = ArkServiceClient::with_interceptor(transport.clone(), interceptor.clone())
+			.accept_compressed(CompressionEncoding::Zstd)
 			.max_decoding_message_size(64 * 1024 * 1024); // 64MB limit
 
 		let info = client.ark_info(network).await?;
 
 		let mailbox_client = mailbox::MailboxServiceClient::with_interceptor(transport, interceptor)
+			.accept_compressed(CompressionEncoding::Zstd)
 			.max_decoding_message_size(64 * 1024 * 1024); // 64MB limit
 
 		let info = Arc::new(RwLock::new(ServerInfo::new(pver, info)));

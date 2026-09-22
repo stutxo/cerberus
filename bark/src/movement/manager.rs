@@ -55,6 +55,7 @@ impl MovementManager {
 		&self,
 		subsystem_id: Subsystem,
 		movement_kind: impl Into<String>,
+		action_id: Option<&str>,
 	) -> anyhow::Result<MovementId, MovementError> {
 		self.db.create_new_movement(
 			MovementStatus::Pending,
@@ -63,6 +64,7 @@ impl MovementManager {
 				kind: movement_kind.into(),
 			},
 			chrono::Local::now(),
+			action_id,
 		).await.map_err(|e| MovementError::CreationError { e })
 	}
 
@@ -88,7 +90,7 @@ impl MovementManager {
 		subsystem_id: Subsystem,
 		movement_kind: impl Into<String>,
 	) -> anyhow::Result<MovementId, MovementError> {
-		let id = self.persist_new_movement(subsystem_id, movement_kind).await?;
+		let id = self.persist_new_movement(subsystem_id, movement_kind, None).await?;
 		let movement = self.db.get_movement_by_id(id).await
 			.map_err(|e| MovementError::LoadError { id, e })?;
 		self.notifications.dispatch_movement_created(movement);
@@ -139,11 +141,43 @@ impl MovementManager {
 		movement_kind: impl Into<String>,
 		update: MovementUpdate,
 	) -> anyhow::Result<MovementId, MovementError> {
-		let id = self.persist_new_movement(subsystem_id, movement_kind).await?;
+		let id = self.persist_new_movement(subsystem_id, movement_kind, None).await?;
 		self.update_movement(id, update).await?;
 		let movement = self.db.get_movement_by_id(id).await
 			.map_err(|e| MovementError::LoadError { id, e })?;
 		self.notifications.dispatch_movement_created(movement);
+		Ok(id)
+	}
+
+	/// Find-or-create the movement owned by `action_id`, applying `update` on
+	/// first creation.
+	///
+	/// This is the idempotent counterpart to [MovementManager::new_movement_with_update]
+	/// for movements created mid-way through a wallet action: a re-driven step
+	/// (crash recovery, an early wake, the reentrancy double-drive) reuses the
+	/// existing movement instead of inserting a duplicate. The `created`
+	/// notification is dispatched only on the first, real insert.
+	pub async fn get_or_create_movement_with_action(
+		&self,
+		subsystem_id: Subsystem,
+		movement_kind: impl Into<String>,
+		action_id: &str,
+		update: MovementUpdate,
+	) -> anyhow::Result<MovementId, MovementError> {
+		let subsystem = MovementSubsystem {
+			name: subsystem_id.as_name().to_string(),
+			kind: movement_kind.into(),
+		};
+		let (id, created) = self.db.get_or_create_movement_for_action(
+			&subsystem, chrono::Local::now(), action_id, update,
+		).await.map_err(|e| MovementError::CreationError { e })?;
+
+		// Only the first, real insert should announce the movement.
+		if created {
+			let movement = self.db.get_movement_by_id(id).await
+				.map_err(|e| MovementError::LoadError { id, e })?;
+			self.notifications.dispatch_movement_created(movement);
+		}
 		Ok(id)
 	}
 
@@ -204,7 +238,7 @@ impl MovementManager {
 		if status == MovementStatus::Pending {
 			return Err(MovementError::IncorrectPendingStatus);
 		}
-		let id = self.persist_new_movement(subsystem_id, movement_kind).await?;
+		let id = self.persist_new_movement(subsystem_id, movement_kind, None).await?;
 		let mut movement = self.db.get_movement_by_id(id).await
 			.map_err(|e| MovementError::LoadError { id, e })?;
 		let at = chrono::Local::now();
@@ -250,6 +284,34 @@ impl MovementManager {
 		self.notifications.dispatch_movement_updated(guard.clone());
 
 		// Drop the movement if it's in a finished state as this was likely a one-time update.
+		if guard.status != MovementStatus::Pending {
+			drop(guard);
+			self.unload_movement_from_cache(id).await?;
+		}
+		Ok(())
+	}
+
+	/// Applies an [RFC 7396](https://www.rfc-editor.org/rfc/rfc7396) JSON Merge Patch to a
+	/// movement's metadata. A non-object patch resets metadata to an empty object.
+	pub async fn patch_metadata(
+		&self,
+		id: MovementId,
+		patch: &serde_json::Value,
+	) -> anyhow::Result<(), MovementError> {
+		let mut guard = self.get_cached_movement(id).await?;
+
+		let mut value = serde_json::Value::Object(std::mem::take(&mut guard.metadata));
+		crate::utils::json_patch::merge(&mut value, patch);
+		guard.metadata = match value {
+			serde_json::Value::Object(map) => map,
+			_ => serde_json::Map::new(),
+		};
+		guard.time.updated_at = chrono::Local::now();
+
+		self.db.update_movement(&guard).await
+			.map_err(|e| MovementError::PersisterError { id, e })?;
+		self.notifications.dispatch_movement_updated(guard.clone());
+
 		if guard.status != MovementStatus::Pending {
 			drop(guard);
 			self.unload_movement_from_cache(id).await?;

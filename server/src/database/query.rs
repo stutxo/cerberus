@@ -22,6 +22,7 @@ use ark::mailbox::MailboxIdentifier;
 use ark::rounds::RoundId;
 use ark::tree::signed::{UnlockHash, UnlockPreimage};
 use ark::vtxo::{Bare, Full};
+use bitcoin_ext::BlockHeight;
 
 use crate::database::model::{VirtualTransaction, VtxoState};
 use crate::database::rounds::{StoredRoundInput, StoredRoundOutput, StoredRoundParticipation};
@@ -82,7 +83,7 @@ pub async fn get_vtxo_by_id(
 {
 	let stmt = tx.prepare_typed("
 		SELECT id, vtxo_id, vtxo, expiry, oor_spent_txid, spent_in_round, offboarded_in,
-			banned_until_height, spend_state::TEXT AS spend_state, created_at, updated_at
+			banned_until_height, confirmed_height, spend_state::TEXT AS spend_state, created_at, updated_at
 		FROM vtxo
 		WHERE vtxo_id = $1;
 	", &[Type::TEXT]).await?;
@@ -105,7 +106,7 @@ pub async fn get_vtxos_by_id(
 {
 	let statement = tx.prepare_typed("
 		SELECT id, vtxo_id, vtxo, expiry, oor_spent_txid, spent_in_round, offboarded_in,
-			banned_until_height, spend_state::TEXT AS spend_state, created_at, updated_at
+			banned_until_height, confirmed_height, spend_state::TEXT AS spend_state, created_at, updated_at
 		FROM vtxo
 		WHERE vtxo_id = ANY($1);
 	", &[Type::TEXT_ARRAY]).await?;
@@ -134,25 +135,27 @@ pub async fn get_vtxos_by_id(
 
 /// Get a bare VTXO by id, constructed from the metadata columns
 /// without deserializing the full vtxo blob.
-pub async fn get_bare_vtxo_by_id(
+pub async fn try_get_bare_vtxo_by_id(
 	tx: &PgTransaction<'_>,
 	id: VtxoId,
-) -> anyhow::Result<VtxoState<Bare, ServerVtxoPolicy>>
+) -> anyhow::Result<Option<VtxoState<Bare, ServerVtxoPolicy>>>
 {
 	let stmt = tx.prepare_typed("
 		SELECT id, vtxo_id, expiry, exit_delta, policy_type, policy,
 			server_pubkey, amount, anchor_point,
 			oor_spent_txid, spent_in_round, offboarded_in,
-			banned_until_height, spend_state::TEXT AS spend_state, created_at, updated_at
+			banned_until_height, confirmed_height, spend_state::TEXT AS spend_state, created_at, updated_at
 		FROM vtxo
 		WHERE vtxo_id = $1;
 	", &[Type::TEXT]).await?;
 
-	let row = tx.query_opt(&stmt, &[&id.to_string()]).await
-		.context("Query get_bare_vtxo_by_id failed")?
-		.not_found([id], "VTXO not found")?;
-
-	Ok(VtxoState::try_from(row)?)
+	let opt = tx.query_opt(&stmt, &[&id.to_string()]).await
+		.context("Query get_bare_vtxo_by_id failed")?;
+	if let Some(row) = opt {
+		Ok(Some(VtxoState::try_from(row)?))
+	} else {
+		Ok(None)
+	}
 }
 
 pub async fn store_round_participation(
@@ -161,16 +164,19 @@ pub async fn store_round_participation(
 	unlock_preimage: UnlockPreimage,
 	inputs: &[VtxoId],
 	outputs: impl IntoIterator<Item = &StoredRoundOutput>,
+	scheduled_height: Option<BlockHeight>,
 ) -> anyhow::Result<()> {
 	let part_stmt = tx.prepare_typed(
-		"INSERT INTO round_participation (unlock_hash, unlock_preimage, created_at) \
-		VALUES ($1, $2, NOW()) RETURNING id",
-		&[Type::TEXT, Type::TEXT]
+		"INSERT INTO round_participation \
+			(unlock_hash, unlock_preimage, scheduled_height, created_at) \
+		VALUES ($1, $2, $3, NOW()) RETURNING id",
+		&[Type::TEXT, Type::TEXT, Type::INT4]
 	).await?;
 
 	let part_row = tx.query_one(&part_stmt, &[
 		&unlock_hash.to_string(),
 		&unlock_preimage.to_lower_hex_string(),
+		&scheduled_height.map(|h| h.to_u32() as i32),
 	]).await?;
 
 	let part_id = part_row.get::<_, i64>("id");
@@ -200,6 +206,40 @@ pub async fn store_round_participation(
 	}
 
 	Ok(())
+}
+
+/// Delete every *pending* (not yet assigned to a round) delegated round
+/// participation that has any of the given vtxos as an input.
+pub async fn delete_pending_participations_for_inputs(
+	tx: &PgTransaction<'_>,
+	inputs: &[VtxoId],
+) -> anyhow::Result<u64> {
+	if inputs.is_empty() {
+		return Ok(0);
+	}
+
+	let input_strs = inputs.iter().map(|i| i.to_string()).collect::<Vec<_>>();
+	let stmt = tx.prepare_typed(
+		"WITH stale AS (
+			SELECT DISTINCT rp.id
+			FROM round_participation rp
+			JOIN round_part_input rpi ON rpi.participation_id = rp.id
+			WHERE rp.round_id IS NULL AND rpi.vtxo_id = ANY($1)
+		),
+		deleted AS (
+			DELETE FROM round_participation WHERE id IN (SELECT id FROM stale) RETURNING id
+		),
+		_inputs AS (
+			DELETE FROM round_part_input WHERE participation_id IN (SELECT id FROM deleted)
+		),
+		_outputs AS (
+			DELETE FROM round_part_output WHERE participation_id IN (SELECT id FROM deleted)
+		)
+		SELECT id FROM deleted",
+		&[Type::TEXT_ARRAY],
+	).await?;
+
+	Ok(tx.execute(&stmt, &[&input_strs]).await?)
 }
 
 /// complete a round participation from the main row
@@ -264,6 +304,8 @@ pub async fn complete_round_participation(
 	);
 
 	let forfeited_at = part_row.get::<_, Option<chrono::DateTime<chrono::Local>>>("forfeited_at");
+	let scheduled_height = part_row.get::<_, Option<i32>>("scheduled_height")
+		.map(|h| BlockHeight::try_from(h).expect("invalid block height in db"));
 
 	Ok(StoredRoundParticipation {
 		unlock_preimage: Secret::new(unlock_preimage),
@@ -272,6 +314,7 @@ pub async fn complete_round_participation(
 		outputs,
 		round_id,
 		forfeited_at,
+		scheduled_height,
 	})
 }
 

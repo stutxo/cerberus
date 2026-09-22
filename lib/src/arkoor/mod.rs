@@ -63,6 +63,43 @@
 //! to construct a builder. The [ArkoorBuilder::server_cosign]
 //! will construct the [ArkoorCosignResponse] which is sent to the client.
 //!
+//! # Dust isolation
+//!
+//! The bitcoin network considers any output below 330 sat dust.
+//! A transaction with a dust output is considered non-standard and
+//! will not be relayed to miners. The transaction is still valid,
+//! but it is hard to get it onchain. We don't want clients or the
+//! server to face these difficulties.
+//!
+//! We accept the limitations of the bitcoin network. Exiting a
+//! dust-valued vtxo is hard.
+//!
+//! However, we do not want these problems to escalate to other
+//! (and potentially larger) vtxos.
+//!
+//! The key idea of dust-isolation: we don't want a transaction to
+//! mix large and dust outputs. We split dust outputs out into a
+//! dust-isolation transaction.
+//!
+//! E.g. a client who has a 100_000 sat vtxo and pays 160 sat.
+//! The checkpoint tx has two outputs:
+//! - 99_670 sat (change vtxo)
+//! - 330 sat (to the dust-isolation tx)
+//!
+//! The dust-isolation tx has:
+//! - 170 sat (dust change)
+//! - 160 sat (payment amount)
+//!
+//! In the dust-isolation transaction we allow outputs below twice
+//! the dust limit. And when every output of a spend stays below
+//! that, we skip the dust-isolation tx entirely: there is no large
+//! output to protect.
+//!
+//! E.g. a user with a 600 sat vtxo pays 100 sat. Splitting
+//! [230, 100] sat into dust-isolation would leave 270 sat as
+//! change, which is dust again. So the checkpoint just carries
+//! [500, 100] directly.
+//!
 
 pub mod package;
 
@@ -70,6 +107,7 @@ use std::marker::PhantomData;
 
 use bitcoin::hashes::Hash;
 use bitcoin::sighash::{self, SighashCache};
+use bitcoin::amount::CheckedSum;
 use bitcoin::{
 	Amount, OutPoint, ScriptBuf, Sequence, TapSighash, TapSighashType, Transaction, TxIn, TxOut, Txid, Witness
 };
@@ -96,10 +134,18 @@ pub enum ArkoorConstructionError {
 	},
 	#[error("An output is below the dust threshold")]
 	Dust,
+	#[error("Dust isolation is used but not needed")]
+	IsolationNotNeeded,
 	#[error("At least one output is required")]
 	NoOutputs,
+	#[error("An output has zero value")]
+	ZeroValueOutput,
+	#[error("Too many outputs provided")]
+	TooManyOutputs,
 	#[error("Too many inputs provided")]
 	TooManyInputs,
+	#[error("Total amount overflowed while allocating outputs to inputs")]
+	Overflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, thiserror::Error)]
@@ -454,10 +500,16 @@ pub struct ArkoorBuilder<S: state::BuilderState> {
 	/// The input vtxo to be spent
 	input: Vtxo<Full>,
 	/// Regular output vtxos
+	///
+	/// Each one gets its own checkpoint output. Sub-dust amounts are allowed
+	/// here only when there are no isolated outputs and every normal output
+	/// stays below twice [P2TR_DUST]. See the dust isolation section in the
+	/// module docs.
 	outputs: Vec<ArkoorDestination>,
 	/// Isolated outputs that will go through an isolation tx
 	///
-	/// This is meant to isolate dust outputs from non-dust ones.
+	/// Each one must be below twice [P2TR_DUST]. See the dust isolation
+	/// section in the module docs.
 	isolated_outputs: Vec<ArkoorDestination>,
 
 	/// Data on the checkpoint tx, if checkpoints are enabled
@@ -540,7 +592,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 			expiry_height: self.input.expiry_height,
 			server_pubkey: self.input.server_pubkey,
 			exit_delta: self.input.exit_delta,
-			point: OutPoint::new(*checkpoint_txid, output_idx as u32),
+			point: OutPoint::new(*checkpoint_txid, u32::try_from(output_idx).expect("output index fits in u32")),
 			anchor_point: self.input.anchor_point,
 			genesis: Full {
 				items: self.input.genesis.items.clone().into_iter().chain([
@@ -554,11 +606,11 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 							).tap_tweak(),
 							checkpoint_sig,
 						),
-						output_idx: output_idx as u8,
+						output_idx: u8::try_from(output_idx).expect("arkoor output index fits in u8"),
 						other_outputs: checkpoint_tx.output
 							.iter().enumerate()
 							.filter_map(|(i, txout)| {
-								if i == (output_idx as usize) || txout.is_p2a_fee_anchor() {
+								if i == output_idx || txout.is_p2a_fee_anchor() {
 									None
 								} else {
 									Some(txout.clone())
@@ -604,11 +656,11 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 								).tap_tweak(),
 								checkpoint_sig,
 							),
-							output_idx: output_idx as u8,
+							output_idx: u8::try_from(output_idx).expect("arkoor output index fits in u8"),
 							other_outputs: checkpoint_tx.output
 								.iter().enumerate()
 								.filter_map(|(i, txout)| {
-									if i == (output_idx as usize) || txout.is_p2a_fee_anchor() {
+									if i == output_idx || txout.is_p2a_fee_anchor() {
 										None
 									} else {
 										Some(txout.clone())
@@ -644,7 +696,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 				expiry_height: self.input.expiry_height,
 				server_pubkey: self.input.server_pubkey,
 				exit_delta: self.input.exit_delta,
-				point: OutPoint::new(arkoor_tx.compute_txid(), output_idx as u32),
+				point: OutPoint::new(arkoor_tx.compute_txid(), u32::try_from(output_idx).expect("output index fits in u32")),
 				anchor_point: self.input.anchor_point,
 				genesis: Full {
 					items: self.input.genesis.items.iter().cloned().chain([
@@ -658,7 +710,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 								).tap_tweak(),
 								arkoor_sig,
 							),
-							output_idx: output_idx as u8,
+							output_idx: u8::try_from(output_idx).expect("arkoor output index fits in u8"),
 							other_outputs: arkoor_tx.output
 								.iter().enumerate()
 								.filter_map(|(idx, txout)| {
@@ -707,7 +759,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 				expiry_height: self.input.expiry_height,
 				server_pubkey: self.input.server_pubkey,
 				exit_delta: self.input.exit_delta,
-				point: OutPoint::new(fanout_tx.compute_txid(), isolated_idx as u32),
+				point: OutPoint::new(fanout_tx.compute_txid(), u32::try_from(isolated_idx).expect("output index fits in u32")),
 				anchor_point: self.input.anchor_point,
 				genesis: Full {
 					items: self.input.genesis.items.iter().cloned().chain([
@@ -722,7 +774,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 								).tap_tweak(),
 								pre_fanout_tx_sig,
 							),
-							output_idx: dust_isolation_output_idx as u8,
+							output_idx: u8::try_from(dust_isolation_output_idx).expect("arkoor output index fits in u8"),
 							// other outputs are the normal outputs
 							// (we skip our combined dust output and fee anchor)
 							other_outputs: checkpoint_tx.output
@@ -749,7 +801,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 								).tap_tweak(),
 								isolation_fanout_tx_sig,
 							),
-							output_idx: isolated_idx as u8,
+							output_idx: u8::try_from(isolated_idx).expect("arkoor output index fits in u8"),
 							// other outputs are the other isolated outputs
 							// (we skip our output and fee anchor)
 							other_outputs: fanout_tx.output
@@ -777,7 +829,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 				expiry_height: self.input.expiry_height,
 				server_pubkey: self.input.server_pubkey,
 				exit_delta: self.input.exit_delta,
-				point: OutPoint::new(fanout_tx.compute_txid(), isolated_idx as u32),
+				point: OutPoint::new(fanout_tx.compute_txid(), u32::try_from(isolated_idx).expect("output index fits in u32")),
 				anchor_point: self.input.anchor_point,
 				genesis: Full {
 					items: self.input.genesis.items.iter().cloned().chain([
@@ -792,7 +844,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 								).tap_tweak(),
 								pre_fanout_tx_sig,
 							),
-							output_idx: dust_isolation_output_idx as u8,
+							output_idx: u8::try_from(dust_isolation_output_idx).expect("arkoor output index fits in u8"),
 							other_outputs: arkoor_tx.output
 								.iter().enumerate()
 								.filter_map(|(idx, txout)| {
@@ -816,7 +868,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 								).tap_tweak(),
 								isolation_fanout_tx_sig,
 							),
-							output_idx: isolated_idx as u8,
+							output_idx: u8::try_from(isolated_idx).expect("arkoor output index fits in u8"),
 							other_outputs: fanout_tx.output
 								.iter().enumerate()
 								.filter_map(|(idx, txout)| {
@@ -891,7 +943,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 				expiry_height: self.input.expiry_height,
 				server_pubkey: self.input.server_pubkey,
 				exit_delta: self.input.exit_delta,
-				point: OutPoint::new(int_txid, output_idx as u32),
+				point: OutPoint::new(int_txid, u32::try_from(output_idx).expect("output index fits in u32")),
 				anchor_point: self.input.anchor_point,
 				genesis: Full {
 					items: self.input.genesis.items.clone().into_iter().chain([
@@ -901,7 +953,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 								self.input_tweak,
 								intermediate_sig,
 							),
-							output_idx: output_idx as u8,
+							output_idx: u8::try_from(output_idx).expect("arkoor output index fits in u8"),
 							other_outputs: int_tx.output.iter().enumerate()
 								.filter_map(|(i, txout)| {
 									if i == output_idx || txout.is_p2a_fee_anchor() {
@@ -1038,7 +1090,7 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 					version: bitcoin::transaction::Version(3),
 					lock_time: bitcoin::absolute::LockTime::ZERO,
 					input: vec![TxIn {
-						previous_output: OutPoint::new(checkpoint_txid, vout as u32),
+						previous_output: OutPoint::new(checkpoint_txid, u32::try_from(vout).expect("output index fits in u32")),
 						script_sig: ScriptBuf::new(),
 						sequence: Sequence::ZERO,
 						witness: Witness::new(),
@@ -1141,8 +1193,12 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 		// to ensure our transaction with an ephemeral anchor is standard.
 		// We need `==` for standardness and we can't be lenient
 		let input_amount = input.amount();
+
+		// `output_amount` is client-supplied and uncapped. Checked sum is needed to prevent overflow.
 		let output_amount = outputs.iter().chain(isolation_outputs.iter())
-			.map(|o| o.total_amount).sum::<Amount>();
+			.map(|o| o.total_amount)
+			.checked_sum()
+			.ok_or(ArkoorConstructionError::Overflow)?;
 
 		if input_amount != output_amount {
 			return Err(ArkoorConstructionError::Unbalanced {
@@ -1156,13 +1212,60 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 			return Err(ArkoorConstructionError::NoOutputs)
 		}
 
-		// If isolation is provided, the sum must be over dust threshold
+		// Every output must carry value. A zero-value output yields a VTXO that
+		// holds nothing: it can't be boarded or spent through arkoor, so it only
+		// wastes signing work and storage. Sub-dust (but non-zero) outputs stay
+		// allowed; those are what dust isolation handles.
+		if outputs.iter().chain(isolation_outputs.iter())
+			.any(|o| o.total_amount == Amount::ZERO)
+		{
+			return Err(ArkoorConstructionError::ZeroValueOutput)
+		}
+
+		// Output vouts are encoded as u8 in the genesis chain, so the counts must fit u8.
+		if outputs.len() > u8::MAX as usize || isolation_outputs.len() > u8::MAX as usize {
+			return Err(ArkoorConstructionError::TooManyOutputs)
+		}
+
+		// The isolated outputs are reachable through a single combined
+		// checkpoint output, which has to be standard to keep the
+		// checkpoint tx relayable.
 		if !isolation_outputs.is_empty() {
 			let isolation_sum: Amount = isolation_outputs.iter()
 				.map(|o| o.total_amount).sum();
 			if isolation_sum < P2TR_DUST {
 				return Err(ArkoorConstructionError::Dust)
 			}
+		}
+
+		// An output of 660 sat or more can be split into two standard outputs,
+		// so it never needs isolation.
+		if isolation_outputs.iter().any(|o| o.total_amount >= P2TR_DUST * 2) {
+			return Err(ArkoorConstructionError::IsolationNotNeeded)
+		}
+
+		// Dust isolation must contain at least one dust output. Standard
+		// outputs alone can simply be normal outputs.
+		if !isolation_outputs.is_empty()
+			&& isolation_outputs.iter().all(|o| o.total_amount >= P2TR_DUST)
+		{
+			return Err(ArkoorConstructionError::IsolationNotNeeded)
+		}
+
+		// Once dust isolation is used, all dust belongs there.
+		if !isolation_outputs.is_empty()
+			&& outputs.iter().any(|o| o.total_amount < P2TR_DUST)
+		{
+			return Err(ArkoorConstructionError::Dust)
+		}
+
+		// A dust output makes the zero-fee checkpoint (or arkoor) tx
+		// unrelayable. Then nobody can bring the other outputs onchain. We
+		// accept this for small outputs, but not for outputs of 660 sat or more.
+		if outputs.iter().any(|o| o.total_amount < P2TR_DUST)
+			&& outputs.iter().any(|o| o.total_amount >= P2TR_DUST * 2)
+		{
+			return Err(ArkoorConstructionError::Dust)
 		}
 
 		Ok(())
@@ -1214,8 +1317,9 @@ impl ArkoorBuilder<state::Initial> {
 
 	/// Create builder with checkpoint and automatic dust isolation
 	///
-	/// This constructor takes a single list of outputs and automatically
-	/// determines the best strategy for handling dust.
+	/// This constructor takes a single list of outputs and spreads them over
+	/// the normal and isolated lists. See the dust isolation section in the
+	/// module docs.
 	pub fn new_with_checkpoint_isolate_dust(
 		input: Vtxo<Full>,
 		outputs: Vec<ArkoorDestination>,
@@ -1322,7 +1426,8 @@ impl ArkoorBuilder<state::Initial> {
 		let unsigned_isolation_fanout_tx = if !isolated_outputs.is_empty() {
 			// Combined dust isolation output is at index outputs.len()
 			// (after all normal outputs)
-			let dust_isolation_output_vout = outputs.len() as u32;
+			let dust_isolation_output_vout = u32::try_from(outputs.len())
+				.expect("output count fits in u32");
 
 			let parent_txid = if let Some((_tx, txid)) = &unsigned_checkpoint_tx {
 				*txid
@@ -1859,6 +1964,9 @@ mod test {
 	use bitcoin::Amount;
 	use bitcoin::secp256k1::Keypair;
 	use bitcoin::secp256k1::rand;
+	use bitcoin::secp256k1::rand::{Rng, SeedableRng};
+
+	use bitcoin_ext::{BlockDelta, BlockHeight};
 
 	use crate::SECP;
 	use crate::test_util::dummy::DummyTestVtxoSpec;
@@ -1952,8 +2060,8 @@ mod test {
 		let (funding_tx, alice_vtxo) = DummyTestVtxoSpec {
 			amount: Amount::from_sat(100_330),
 			fee: Amount::from_sat(330),
-			expiry_height: 1000,
-			exit_delta : 128,
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(128),
 			user_keypair: alice_keypair.clone(),
 			server_keypair: server_keypair.clone()
 		}.build();
@@ -2107,8 +2215,8 @@ mod test {
 		let (funding_tx, alice_vtxo) = DummyTestVtxoSpec {
 			amount: Amount::from_sat(100_330),
 			fee: Amount::from_sat(330),
-			expiry_height: 1000,
-			exit_delta : 128,
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(128),
 			user_keypair: alice_keypair.clone(),
 			server_keypair: server_keypair.clone()
 		}.build();
@@ -2203,8 +2311,8 @@ mod test {
 		let (funding_tx, alice_vtxo) = DummyTestVtxoSpec {
 			amount: Amount::from_sat(100_330),
 			fee: Amount::from_sat(330),
-			expiry_height: 1000,
-			exit_delta : 128,
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(128),
 			user_keypair: alice_keypair.clone(),
 			server_keypair: server_keypair.clone()
 		}.build();
@@ -2277,8 +2385,8 @@ mod test {
 		let (funding_tx, alice_vtxo) = DummyTestVtxoSpec {
 			amount: Amount::from_sat(100_330),
 			fee: Amount::from_sat(330),
-			expiry_height: 1000,
-			exit_delta : 128,
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(128),
 			user_keypair: alice_keypair.clone(),
 			server_keypair: server_keypair.clone()
 		}.build();
@@ -2370,8 +2478,8 @@ mod test {
 		let (funding_tx, alice_vtxo) = DummyTestVtxoSpec {
 			amount: Amount::from_sat(1_330),
 			fee: Amount::from_sat(330),
-			expiry_height: 1000,
-			exit_delta : 128,
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(128),
 			user_keypair: alice_keypair.clone(),
 			server_keypair: server_keypair.clone()
 		}.build();
@@ -2450,56 +2558,6 @@ mod test {
 	}
 
 	#[test]
-	fn build_checkpointed_arkoor_dust_sum_too_small() {
-		// Test that dust_sum < P2TR_DUST is now allowed after removing validation
-		let alice_keypair = Keypair::new(&SECP, &mut rand::thread_rng());
-		let bob_keypair = Keypair::new(&SECP, &mut rand::thread_rng());
-		let server_keypair = Keypair::new(&SECP, &mut rand::thread_rng());
-
-		let (funding_tx, alice_vtxo) = DummyTestVtxoSpec {
-			amount: Amount::from_sat(100_330),
-			fee: Amount::from_sat(330),
-			expiry_height: 1000,
-			exit_delta : 128,
-			user_keypair: alice_keypair.clone(),
-			server_keypair: server_keypair.clone()
-		}.build();
-
-		alice_vtxo.validate(&funding_tx).expect("The unsigned vtxo is valid");
-
-		// Non-dust outputs
-		let outputs = vec![
-			ArkoorDestination {
-				total_amount: Amount::from_sat(99_900),
-				policy: VtxoPolicy::new_pubkey(bob_keypair.public_key())
-			},
-		];
-
-		// dust outputs with combined sum < P2TR_DUST (330)
-		let dust_outputs = vec![
-			ArkoorDestination {
-				total_amount: Amount::from_sat(50),
-				policy: VtxoPolicy::new_pubkey(alice_keypair.public_key())
-			},
-			ArkoorDestination {
-				total_amount: Amount::from_sat(50),
-				policy: VtxoPolicy::new_pubkey(alice_keypair.public_key())
-			}
-		];
-
-		// This should fail because isolation sum (100) < P2TR_DUST (330)
-		let result = ArkoorBuilder::new_with_checkpoint(
-			alice_vtxo.clone(),
-			outputs.clone(),
-			dust_outputs.clone(),
-		);
-		match result {
-			Err(ArkoorConstructionError::Dust) => {},
-			_ => panic!("Expected Dust error for isolation sum < 330"),
-		}
-	}
-
-	#[test]
 	fn spend_dust_vtxo() {
 		// Test the "all dust" case: create a 200 sat vtxo and split into two 100 sat outputs
 		let alice_keypair = Keypair::new(&SECP, &mut rand::thread_rng());
@@ -2510,8 +2568,8 @@ mod test {
 		let (funding_tx, alice_vtxo) = DummyTestVtxoSpec {
 			amount: Amount::from_sat(200),
 			fee: Amount::ZERO,
-			expiry_height: 1000,
-			exit_delta: 128,
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(128),
 			user_keypair: alice_keypair.clone(),
 			server_keypair: server_keypair.clone()
 		}.build();
@@ -2601,8 +2659,8 @@ mod test {
 		let (funding_tx, alice_vtxo) = DummyTestVtxoSpec {
 			amount: Amount::from_sat(500),
 			fee: Amount::ZERO,
-			expiry_height: 1000,
-			exit_delta: 128,
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(128),
 			user_keypair: alice_keypair.clone(),
 			server_keypair: server_keypair.clone()
 		}.build();
@@ -2691,8 +2749,8 @@ mod test {
 		let (funding_tx, alice_vtxo) = DummyTestVtxoSpec {
 			amount: Amount::from_sat(1000),
 			fee: Amount::ZERO,
-			expiry_height: 1000,
-			exit_delta: 128,
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(128),
 			user_keypair: alice_keypair.clone(),
 			server_keypair: server_keypair.clone()
 		}.build();
@@ -2732,8 +2790,8 @@ mod test {
 		let (funding_tx, alice_vtxo) = DummyTestVtxoSpec {
 			amount: Amount::from_sat(400),
 			fee: Amount::ZERO,
-			expiry_height: 1000,
-			exit_delta: 128,
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(128),
 			user_keypair: alice_keypair.clone(),
 			server_keypair: server_keypair.clone()
 		}.build();
@@ -2773,8 +2831,8 @@ mod test {
 		let (funding_tx, alice_vtxo) = DummyTestVtxoSpec {
 			amount: Amount::from_sat(1000),
 			fee: Amount::ZERO,
-			expiry_height: 1000,
-			exit_delta: 128,
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(128),
 			user_keypair: alice_keypair.clone(),
 			server_keypair: server_keypair.clone()
 		}.build();
@@ -2820,8 +2878,8 @@ mod test {
 		let (funding_tx, alice_vtxo) = DummyTestVtxoSpec {
 			amount: Amount::from_sat(1000),
 			fee: Amount::ZERO,
-			expiry_height: 1000,
-			exit_delta: 128,
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(128),
 			user_keypair: alice_keypair.clone(),
 			server_keypair: server_keypair.clone()
 		}.build();
@@ -2872,8 +2930,8 @@ mod test {
 		let (funding_tx, alice_vtxo) = DummyTestVtxoSpec {
 			amount: Amount::from_sat(600),
 			fee: Amount::ZERO,
-			expiry_height: 1000,
-			exit_delta: 128,
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(128),
 			user_keypair: alice_keypair.clone(),
 			server_keypair: server_keypair.clone()
 		}.build();
@@ -2918,8 +2976,8 @@ mod test {
 		let (funding_tx, alice_vtxo) = DummyTestVtxoSpec {
 			amount: Amount::from_sat(1000),
 			fee: Amount::ZERO,
-			expiry_height: 1000,
-			exit_delta: 128,
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(128),
 			user_keypair: alice_keypair.clone(),
 			server_keypair: server_keypair.clone()
 		}.build();
@@ -2955,5 +3013,155 @@ mod test {
 		assert_eq!(builder.outputs[0].total_amount, Amount::from_sat(660));
 		assert_eq!(builder.isolated_outputs[0].total_amount, Amount::from_sat(170));
 		assert_eq!(builder.isolated_outputs[1].total_amount, Amount::from_sat(170));
+	}
+
+	#[test]
+	fn validate_amounts_output_sum_overflow_rejected() {
+		// This is the path captaind runs on every arkoor cosign request
+		// (from_cosign_request -> ArkoorBuilder::new -> validate_amounts).
+		// Client output amounts are uncapped, so two near-`u64::MAX` amounts
+		// must be rejected, not panic the `Amount` sum.
+		let alice_keypair = Keypair::new(&SECP, &mut rand::thread_rng());
+		let bob_keypair = Keypair::new(&SECP, &mut rand::thread_rng());
+		let server_keypair = Keypair::new(&SECP, &mut rand::thread_rng());
+
+		let (_funding_tx, alice_vtxo) = DummyTestVtxoSpec {
+			amount: Amount::from_sat(10_330),
+			fee: Amount::from_sat(330),
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(128),
+			user_keypair: alice_keypair,
+			server_keypair,
+		}.build();
+
+		let outputs = vec![
+			ArkoorDestination {
+				total_amount: Amount::from_sat(u64::MAX),
+				policy: VtxoPolicy::new_pubkey(bob_keypair.public_key()),
+			},
+			ArkoorDestination {
+				total_amount: Amount::from_sat(u64::MAX),
+				policy: VtxoPolicy::new_pubkey(bob_keypair.public_key()),
+			},
+		];
+
+		let result = ArkoorBuilder::new_with_checkpoint(alice_vtxo, outputs, vec![]);
+		assert_eq!(result.err(), Some(ArkoorConstructionError::Overflow));
+	}
+
+	/// This is a test helper. It checks the output placement rules for the
+	/// given normal and isolated output amounts. The server cosign path
+	/// enforces the same rules: [ArkoorBuilder::from_cosign_request] funnels
+	/// into [ArkoorBuilder::new].
+	fn verify_isolation_rules(
+		normal_amounts: &[u64],
+		isolation_amounts: &[u64],
+	) -> Result<(), ArkoorConstructionError> {
+		let user_keypair = Keypair::new(&SECP, &mut rand::thread_rng());
+		let server_keypair = Keypair::new(&SECP, &mut rand::thread_rng());
+
+		// A vtxo can't be worth nothing, so the empty case gets a single sat.
+		let total = normal_amounts.iter().chain(isolation_amounts).sum::<u64>();
+		let (_funding_tx, vtxo) = DummyTestVtxoSpec {
+			amount: Amount::from_sat(total.max(1)),
+			fee: Amount::ZERO,
+			expiry_height: BlockHeight::new(1000),
+			exit_delta: BlockDelta::new(128),
+			user_keypair: user_keypair.clone(),
+			server_keypair,
+		}.build();
+
+		let dest = |amount: &u64| ArkoorDestination {
+			total_amount: Amount::from_sat(*amount),
+			policy: VtxoPolicy::new_pubkey(user_keypair.public_key()),
+		};
+		let outputs = normal_amounts.iter().map(dest).collect::<Vec<_>>();
+		let isolated_outputs = isolation_amounts.iter().map(dest).collect::<Vec<_>>();
+
+		ArkoorBuilder::new_with_checkpoint(vtxo, outputs, isolated_outputs).map(|_| ())
+	}
+
+	#[test]
+	fn output_placement_rules() {
+		verify_isolation_rules(&[], &[]).expect_err("no outputs");
+		verify_isolation_rules(&[100], &[]).expect("all-dust spend stays in normal outputs");
+		verify_isolation_rules(&[200, 200], &[])
+			.expect("no dust-isolation tx needed when everything is dust");
+		verify_isolation_rules(&[200, 400], &[]).expect("dust may mix with sub-660 outputs");
+		verify_isolation_rules(&[200, 500], &[]).expect("dust may mix with small outputs");
+		// Both placements of [600, 200, 200] pass. The rules leave this open:
+		// no output reaches 660, so mixing is legal, and the dust sums to 400,
+		// so isolation is legal too.
+		verify_isolation_rules(&[600, 200, 200], &[])
+			.expect("dust may mix when no output reaches 660");
+		verify_isolation_rules(&[600], &[200, 200])
+			.expect("the same outputs may also use isolation");
+		verify_isolation_rules(&[], &[100, 200])
+			.expect_err("no spurious dust-isolation without normal outputs");
+		verify_isolation_rules(&[500], &[100])
+			.expect_err("isolation sum below the dust limit next to normal outputs");
+		verify_isolation_rules(&[10_000], &[100, 100])
+			.expect_err("isolation sum must reach the dust limit");
+		verify_isolation_rules(&[500], &[200, 200]).expect("isolation sum reaches the dust limit");
+		verify_isolation_rules(&[], &[660]).expect_err("no normal outputs");
+		verify_isolation_rules(&[], &[659]).expect_err("no normal outputs");
+		verify_isolation_rules(&[400], &[660])
+			.expect_err("660 sat can be split and does not need isolation");
+		verify_isolation_rules(&[400], &[659])
+			.expect_err("dust-isolation must contain at least one dust output");
+		verify_isolation_rules(&[400], &[659, 100]).expect("just below the split threshold");
+		verify_isolation_rules(&[330], &[]).expect("the dust limit itself is a valid normal output");
+		verify_isolation_rules(&[10_000], &[100_000])
+			.expect_err("large outputs never need isolation");
+		verify_isolation_rules(&[10_000], &[100, 10_000])
+			.expect_err("isolated outputs cannot be large");
+		verify_isolation_rules(&[200], &[400, 100])
+			.expect_err("dust in the normal outputs while dust-isolation is used");
+		verify_isolation_rules(&[100, 10_000], &[])
+			.expect_err("dust must not share the checkpoint with a large output");
+
+		// The dust rule rejects it, and not a malformed request.
+		assert_eq!(
+			verify_isolation_rules(&[200, 10_000], &[]).unwrap_err(),
+			ArkoorConstructionError::Dust,
+			"dust must not share the checkpoint with a large output",
+		);
+	}
+
+	#[test]
+	#[ignore = "slow; run on demand with --run-ignored all"]
+	fn isolate_dust_fuzz() {
+		// new_with_checkpoint_isolate_dust must find a placement that satisfies
+		// the dust isolation rules for every list of non-zero outputs.
+		// Self::new validates the placement, so Ok means the rules hold.
+		let mut rng = rand::rngs::StdRng::seed_from_u64(1105);
+
+		let user_keypair = Keypair::new(&SECP, &mut rand::thread_rng());
+		let server_keypair = Keypair::new(&SECP, &mut rand::thread_rng());
+
+		for nb_outputs in 1..=4 {
+			for _ in 0..2_500 {
+				let amounts = (0..nb_outputs)
+					.map(|_| rng.gen_range(1..10_000u64))
+					.collect::<Vec<u64>>();
+
+				let (_funding_tx, vtxo) = DummyTestVtxoSpec {
+					amount: Amount::from_sat(amounts.iter().sum()),
+					fee: Amount::ZERO,
+					expiry_height: BlockHeight::new(1000),
+					exit_delta: BlockDelta::new(128),
+					user_keypair: user_keypair.clone(),
+					server_keypair: server_keypair.clone(),
+				}.build();
+
+				let outputs = amounts.iter().map(|a| ArkoorDestination {
+					total_amount: Amount::from_sat(*a),
+					policy: VtxoPolicy::new_pubkey(user_keypair.public_key()),
+				}).collect::<Vec<_>>();
+
+				let result = ArkoorBuilder::new_with_checkpoint_isolate_dust(vtxo, outputs);
+				assert!(result.is_ok(), "amounts {:?}: {:?}", amounts, result.err());
+			}
+		}
 	}
 }

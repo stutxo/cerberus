@@ -9,16 +9,17 @@
 //!
 //! See [ExitModel] for persisting the state machine in a database.
 
-use bitcoin::{Amount, FeeRate, Txid};
+use bitcoin::{Amount, Txid};
 use log::{debug, trace};
 
 use ark::{Vtxo, VtxoId};
 use ark::vtxo::{Bare, Full};
+use bitcoin_ext::BlockHeight;
 
 use crate::exit::models::{ExitError, ExitState};
 use crate::exit::progress::{ExitStateProgress, ProgressContext, ProgressStep};
 use crate::exit::transaction_manager::ExitTransactionManager;
-use crate::onchain::ExitUnilaterally;
+use crate::movement::MovementId;
 use crate::persist::BarkPersister;
 use crate::persist::models::StoredExit;
 use crate::{Wallet, WalletVtxo};
@@ -40,6 +41,7 @@ pub struct ExitVtxo {
 	state: ExitState,
 	history: Vec<ExitState>,
 	txids: Option<Vec<Txid>>,
+	movement_id: Option<MovementId>,
 }
 
 impl ExitVtxo {
@@ -47,15 +49,17 @@ impl ExitVtxo {
 	/// The unilateral exit can't progress until [ExitVtxo::initialize] is called.
 	///
 	/// # Parameters
-	/// - `vtxo_id`: the [VtxoId] being exited.
+	/// - `vtxo`: the [Vtxo] being exited.
 	/// - `tip`: current chain tip used to initialize the starting state.
-	pub fn new(vtxo: &Vtxo<Bare>, tip: u32) -> Self {
+	/// - `movement_id`: the [MovementId] of the pending movement that records this exit.
+	pub fn new(vtxo: &Vtxo<Bare>, tip: BlockHeight, movement_id: Option<MovementId>) -> Self {
 		Self {
 			vtxo_id: vtxo.id(),
 			amount: vtxo.amount(),
 			state: ExitState::new_start(tip),
 			history: vec![],
 			txids: None,
+			movement_id,
 		}
 	}
 
@@ -73,6 +77,7 @@ impl ExitVtxo {
 			state: entry.state,
 			history: entry.history,
 			txids: None,
+			movement_id: entry.movement_id,
 		}
 	}
 
@@ -102,6 +107,13 @@ impl ExitVtxo {
 		self.txids.as_ref()
 	}
 
+	/// Returns the [MovementId] of the pending movement that records this exit, if any.
+	/// Older exits created before movement tracking was wired up may not have an associated
+	/// movement here; callers should handle that case gracefully.
+	pub fn movement_id(&self) -> Option<MovementId> {
+		self.movement_id
+	}
+
 	/// True if the exit is currently [ExitState::Claimable] and can be claimed/spent.
 	pub fn is_claimable(&self) -> bool {
 		matches!(self.state, ExitState::Claimable(..))
@@ -118,11 +130,10 @@ impl ExitVtxo {
 		&mut self,
 		tx_manager: &mut ExitTransactionManager,
 		persister: &dyn BarkPersister,
-		onchain: &dyn ExitUnilaterally,
 	) -> anyhow::Result<(), ExitError> {
 		trace!("Initializing VTXO for exit {}", self.vtxo_id);
 		let vtxo = self.get_full_vtxo(persister).await?;
-		self.txids = Some(tx_manager.track_vtxo_exits(&vtxo, onchain).await?);
+		self.txids = Some(tx_manager.track_vtxo_exits(&vtxo).await?);
 		Ok(())
 	}
 
@@ -139,14 +150,10 @@ impl ExitVtxo {
 	///   or if an exit transaction fails to broadcast; if the error includes a newer state, it will
 	///   be committed before returning.
 	///
-	/// Notes:
-	/// - If `fee_rate_override` is `None`, a suitable fee rate will be calculated.
 	pub async fn progress(
 		&mut self,
 		wallet: &Wallet,
 		tx_manager: &mut ExitTransactionManager,
-		onchain: &mut dyn ExitUnilaterally,
-		fee_rate_override: Option<FeeRate>,
 		continue_until_finished: bool,
 	) -> anyhow::Result<(), ExitError> {
 		if self.txids.is_none() {
@@ -155,21 +162,25 @@ impl ExitVtxo {
 			});
 		}
 
-		let vtxo = self.get_vtxo(&*wallet.db).await?;
+		let vtxo = self.get_vtxo(&*wallet.inner.db).await?;
 		const MAX_ITERATIONS: usize = 100;
 		for _ in 0..MAX_ITERATIONS {
 			let mut context = ProgressContext {
 				vtxo: &vtxo,
 				exit_txids: self.txids.as_ref().unwrap(),
 				wallet,
-				fee_rate: fee_rate_override.unwrap_or(wallet.chain.fee_rates().await.fast),
 				tx_manager,
 			};
 			// Attempt to move to the next state, which may or may not generate a new state
-			trace!("Progressing VTXO {} at height {}", self.id(), wallet.chain.tip().await.unwrap());
-			match self.state.clone().progress(&mut context, onchain).await {
+			if log::log_enabled!(log::Level::Trace) {
+				match wallet.inner.chain.tip().await {
+					Ok(h) => trace!("Progressing VTXO {} at height {}", self.id(), h),
+					Err(_) => trace!("Progressing VTXO {}", self.id()),
+				}
+			}
+			match self.state.clone().progress(&mut context).await {
 				Ok(new_state) => {
-					self.update_state_if_newer(new_state, &*wallet.db).await?;
+					self.update_state_if_newer(new_state, &*wallet.inner.db).await?;
 					if !continue_until_finished {
 						return Ok(());
 					}
@@ -181,7 +192,7 @@ impl ExitVtxo {
 				Err(e) => {
 					// We may need to commit a new state before returning an error
 					if let Some(new_state) = e.state {
-						self.update_state_if_newer(new_state, &*wallet.db).await?;
+						self.update_state_if_newer(new_state, &*wallet.inner.db).await?;
 					}
 					return Err(e.error);
 				}
@@ -189,6 +200,20 @@ impl ExitVtxo {
 		}
 		debug_assert!(false, "Exceeded maximum iterations for progressing VTXO {}", self.id());
 		Ok(())
+	}
+
+	/// Transitions this exit to the terminal-but-resumable [ExitState::Canceled] and persists it.
+	///
+	/// This only updates the exit's own state and history. The caller
+	/// ([crate::exit::Exit::cancel_exit]) is responsible for dropping the exit's transactions from
+	/// the transaction manager, finalizing the movement, and removing the exit from active
+	/// tracking.
+	pub async fn cancel(
+		&mut self,
+		tip: BlockHeight,
+		persister: &dyn BarkPersister,
+	) -> anyhow::Result<(), ExitError> {
+		self.update_state_if_newer(ExitState::new_canceled(tip), persister).await
 	}
 
 	pub async fn get_vtxo(&self, persister: &dyn BarkPersister) -> anyhow::Result<WalletVtxo, ExitError> {

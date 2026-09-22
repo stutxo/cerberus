@@ -6,11 +6,13 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap;
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use ark::{ArkInfo, Vtxo, VtxoId};
 use ark::encode::ProtocolEncoding;
 use ark::vtxo::Full;
+use bark::ImportVtxoArgs;
+use bark::vtxo::VtxoStateKind;
 use bark_json::primitives::{VtxoInfo, WalletVtxoInfo};
 use server_rpc as rpc;
 
@@ -76,12 +78,46 @@ pub enum VtxoCommand {
 		vtxo: Vec<VtxoId>,
 	},
 
+	/// Take the server's word for the state of VTXOs in this wallet (dangerous)
+	///
+	/// Asks the server about each VTXO and writes the answer into the wallet.
+	/// The server is believed without question, so a VTXO it calls spent is
+	/// marked spent here and disappears from your balance. A VTXO locked by a
+	/// running operation keeps its lock.
+	#[command()]
+	TrustAndAdoptServerStatus {
+		/// You must use this flag to acknowledge the danger of running this command
+		#[arg(long = "dangerous")]
+		dangerous: bool,
+		/// Check every VTXO in the wallet that has not exited
+		#[arg(long = "all", conflicts_with = "vtxos")]
+		all: bool,
+		/// The VTXOs to check
+		vtxos: Vec<VtxoId>,
+	},
+
 	/// Import serialized VTXOs into the wallet
 	#[command()]
 	Import {
-		/// VTXO encoded in hex
-		#[arg(long = "vtxo")]
-		vtxo: Vec<String>,
+		/// VTXOs encoded in hex
+		vtxos: Vec<String>,
+		/// (deprecated) VTXOs encoded in hex
+		#[arg(long = "vtxo", hide = true)]
+		vtxo_multi: Vec<String>,
+		/// How many consecutive unused key indices to scan for each VTXO's user
+		/// pubkey. Overrides the wallet's configured gap limit.
+		#[arg(long = "gap-limit")]
+		gap_limit: Option<u32>,
+		/// Import as spendable without asking the server for each VTXO's state.
+		///
+		/// Use it when you already know it's spendable or when the server can't be reached,
+		/// as it can leave the wallet in an inconsistent state.
+		#[arg(long = "skip-status-check")]
+		skip_status_check: bool,
+		/// Keep the VTXOs that import successfully even when another one in the
+		/// batch fails. Only the VTXOs that were kept are reported.
+		#[arg(long = "allow-partial")]
+		allow_partial: bool,
 	},
 }
 
@@ -99,7 +135,7 @@ async fn execute_vtxo_command(datadir: &Path, command: VtxoCommand) -> anyhow::R
 				bail!("You must acknowledge the danger. Run again with --dangerous")
 			}
 
-			let (wallet, _onchain) = open_wallet(&datadir).await
+			let wallet = open_wallet(&datadir, crate::USER_AGENT).await
 				.context("Failed to open wallet")?
 				.context("No wallet found")?;
 
@@ -115,24 +151,89 @@ async fn execute_vtxo_command(datadir: &Path, command: VtxoCommand) -> anyhow::R
 					.context("Failed to drop vtxo")?;
 			}
 		}
-		VtxoCommand::Import { vtxo } => {
-			if vtxo.is_empty() {
-				bail!("No VTXOs provided. Use --vtxo <hex> to specify VTXOs to import");
+		VtxoCommand::TrustAndAdoptServerStatus { dangerous, all, vtxos } => {
+			if !dangerous {
+				bail!("You must acknowledge the danger. Run again with --dangerous")
+			}
+			if !all && vtxos.is_empty() {
+				bail!("Pass either --all or a list of vtxo ids");
 			}
 
-			let (wallet, _onchain) = open_wallet(&datadir).await
+			let wallet = open_wallet(&datadir, crate::USER_AGENT).await
 				.context("Failed to open wallet")?
 				.context("No wallet found")?;
 
-			let mut imported = Vec::with_capacity(vtxo.len());
-			for vtxo_hex in vtxo {
+			let ids = if all {
+				wallet.all_vtxos().await.context("Failed to list vtxos")?
+					.iter()
+					.filter(|v| v.state.kind() != VtxoStateKind::Exited)
+					.map(|v| v.id())
+					.collect()
+			} else {
+				vtxos
+			};
+
+			let mut updated = Vec::with_capacity(ids.len());
+			let mut failed = 0;
+			for vtxo_id in ids {
+				match wallet.trust_and_adopt_server_vtxo_status(vtxo_id).await {
+					Ok(Some(adoption)) => info!("Server reports vtxo {} as {:?}", vtxo_id, adoption),
+					Ok(None) => info!("Vtxo {} is locked, leaving it alone", vtxo_id),
+					Err(e) => {
+						warn!("Failed to check vtxo {}: {:#}", vtxo_id, e);
+						failed += 1;
+						continue;
+					},
+				}
+
+				match wallet.get_vtxo_by_id(vtxo_id).await {
+					Ok(wallet_vtxo) => updated.push(WalletVtxoInfo::from(&wallet_vtxo)),
+					Err(e) => {
+						warn!("Failed to get vtxo {}: {:#}", vtxo_id, e);
+						failed += 1;
+					},
+				}
+			}
+			output_json(&updated);
+			if failed > 0 {
+				bail!("Failed to update {} vtxos", failed);
+			}
+		},
+		VtxoCommand::Import { vtxos, vtxo_multi, gap_limit, skip_status_check, allow_partial } => {
+			if vtxos.is_empty() && vtxo_multi.is_empty() {
+				bail!("No VTXOs provided. Add raw VTXO arguments to import");
+			}
+
+			if !vtxo_multi.is_empty() {
+				warn!("The --vtxo flag is deprecated. You can pass arguments \
+					directly without the flag.");
+			}
+
+
+			// first try to parse all
+			let mut to_import = Vec::with_capacity(vtxos.len() + vtxo_multi.len());
+			for vtxo_hex in vtxos.into_iter().chain(vtxo_multi) {
 				let vtxo = Vtxo::deserialize_hex(&vtxo_hex)
 					.with_context(|| format!("invalid vtxo: {}", vtxo_hex))?;
-				let vtxo_id = vtxo.id();
-				wallet.import_vtxo(&vtxo).await.with_context(|| format!("Failed to import vtxo {}", vtxo_id))?;
+				to_import.push(vtxo);
+			}
+
+			let wallet = open_wallet(&datadir, crate::USER_AGENT).await
+				.context("Failed to open wallet")?
+				.context("No wallet found")?;
+
+			info!("Importing {} VTXOs...", to_import.len());
+			let args = ImportVtxoArgs {
+				gap_limit, skip_status_check, allow_partial,
+			};
+			let ids = wallet.import_vtxos(&to_import, args).await
+				.context("Failed to import vtxos")?;
+
+			let mut imported = Vec::with_capacity(ids.len());
+			for vtxo_id in ids {
 				let wallet_vtxo = wallet.get_vtxo_by_id(vtxo_id).await
 					.with_context(|| format!("Failed to get imported vtxo {}", vtxo_id))?;
-				imported.push(WalletVtxoInfo::from(wallet_vtxo));
+				imported.push(WalletVtxoInfo::from(&wallet_vtxo));
 			}
 			output_json(&imported);
 		}

@@ -4,14 +4,82 @@ All URIs are relative to *http://localhost*
 
 Method | HTTP request | Description
 ------------- | ------------- | -------------
+[**emergency_exit_fee**](ExitsApi.md#emergency_exit_fee) | **GET** /api/v1/exits/fee | Estimate emergency exit fee
+[**exit_cancel**](ExitsApi.md#exit_cancel) | **POST** /api/v1/exits/cancel/{vtxo_id} | Cancel an exit
 [**exit_claim_all**](ExitsApi.md#exit_claim_all) | **POST** /api/v1/exits/claim/all | Claim all exited VTXOs
 [**exit_claim_vtxos**](ExitsApi.md#exit_claim_vtxos) | **POST** /api/v1/exits/claim/vtxos | Claim specific exited VTXOs
 [**exit_progress**](ExitsApi.md#exit_progress) | **POST** /api/v1/exits/progress | Progress exits
 [**exit_start_all**](ExitsApi.md#exit_start_all) | **POST** /api/v1/exits/start/all | Start exit for all VTXOs
 [**exit_start_vtxos**](ExitsApi.md#exit_start_vtxos) | **POST** /api/v1/exits/start/vtxos | Start exit for specific VTXOs
-[**get_all_exit_status**](ExitsApi.md#get_all_exit_status) | **GET** /api/v1/exits/status | List all exit statuses
-[**get_exit_status_by_vtxo_id**](ExitsApi.md#get_exit_status_by_vtxo_id) | **GET** /api/v1/exits/status/{vtxo_id} | Get exit status
+[**get_all_exit_status**](ExitsApi.md#get_all_exit_status) | **GET** /api/v1/exits/status/all | List all exit statuses
+[**get_all_exit_status_deprecated**](ExitsApi.md#get_all_exit_status_deprecated) | **GET** /api/v1/exits/status | List all exit statuses (deprecated)
+[**get_exit_status_by_vtxo_id**](ExitsApi.md#get_exit_status_by_vtxo_id) | **GET** /api/v1/exits/status/vtxo/{vtxo_id} | Get VTXO exit status
+[**get_exit_status_by_vtxo_id_deprecated**](ExitsApi.md#get_exit_status_by_vtxo_id_deprecated) | **GET** /api/v1/exits/status/{vtxo_id} | Get exit status (deprecated)
+[**get_finished_exits**](ExitsApi.md#get_finished_exits) | **GET** /api/v1/exits/status/finished | List finished exits
+[**get_live_exit_status**](ExitsApi.md#get_live_exit_status) | **GET** /api/v1/exits/status/live | List live exit statuses
 
+
+
+## emergency_exit_fee
+
+> models::EmergencyExitFeeEstimateResponse emergency_exit_fee(vtxo_ids, fee_rate_sat_per_vb, destination)
+Estimate emergency exit fee
+
+Estimates the on-chain cost of unilaterally (emergency) exiting a set of VTXOs without server cooperation. The breakdown separates the broadcast cost—CPFP-bumping every not-yet-confirmed transaction in each VTXO's exit tree, paid now from confirmed on-chain funds—from the claim cost of the single batched transaction that later drains the matured outputs. The estimate reflects current chain state, so exit transactions already confirmed cost nothing. `fundable` is false when the wallet's confirmed on-chain balance can't cover the full broadcast walk, which would stall the exit midway.
+
+### Parameters
+
+
+Name | Type | Description  | Required | Notes
+------------- | ------------- | ------------- | ------------- | -------------
+**vtxo_ids** | Option<**String**> | Comma-separated VTXO ids to exit; omit to exit the entire wallet |  |
+**fee_rate_sat_per_vb** | Option<**i64**> | Fee rate in sat/vB applied to both legs; omit to price the broadcast leg at the current fast rate and the claim leg at the regular rate |  |
+**destination** | Option<**String**> | Claim destination address; omit to use a placeholder for weighing |  |
+
+### Return type
+
+[**models::EmergencyExitFeeEstimateResponse**](EmergencyExitFeeEstimateResponse.md)
+
+### Authorization
+
+[bearer](../README.md#bearer)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
+## exit_cancel
+
+> models::ExitCancelResponse exit_cancel(vtxo_id)
+Cancel an exit
+
+Aborts an in-progress emergency exit while it is still safe to do so—before its final transaction has been broadcast. Exit transactions are ordered topologically and only the final one moves the VTXO on-chain, so an exit can still be canceled even after its shared ancestor transactions are in the mempool or a block. Canceling leaves the VTXO spendable, so a fresh exit can be started for it later. Before canceling, the endpoint verifies directly against the chain that the final transaction hasn't been broadcast; nothing is rebroadcast in the process. Canceling an already-canceled exit succeeds as a no-op, so retries are safe. Note the daemon auto-progresses exits at the cadence defined by `SLOW_INTERVAL`, so cancel promptly once an exit reaches a state you no longer wish to pursue.
+
+### Parameters
+
+
+Name | Type | Description  | Required | Notes
+------------- | ------------- | ------------- | ------------- | -------------
+**vtxo_id** | **String** | The VTXO whose unilateral exit should be canceled | [required] |
+
+### Return type
+
+[**models::ExitCancelResponse**](ExitCancelResponse.md)
+
+### Authorization
+
+[bearer](../README.md#bearer)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
 
 
 ## exit_claim_all
@@ -79,7 +147,7 @@ Name | Type | Description  | Required | Notes
 > models::ExitProgressResponse exit_progress(exit_progress_request)
 Progress exits
 
-Triggers all in-progress exits to advance by one step. The daemon already progresses exits automatically in the background—use this endpoint when you want immediate progress rather than waiting for the next automatic cycle. On each call, the endpoint checks whether previously broadcast transactions have confirmed and, if so, creates and broadcasts the next transaction in the sequence. The on-chain wallet must have sufficient bitcoin to cover transaction fees.
+Triggers all in-progress exits to advance. The daemon already progresses exits automatically in the background—use this endpoint when you want immediate progress rather than waiting for the next automatic cycle. On each call, the endpoint syncs transaction statuses, advances the exit state machine, and creates or fee-bumps CPFP children for any exit transactions that need them. The on-chain wallet must have sufficient bitcoin to cover transaction fees.
 
 ### Parameters
 
@@ -166,7 +234,7 @@ Name | Type | Description  | Required | Notes
 > Vec<models::ExitTransactionStatus> get_all_exit_status(history, transactions)
 List all exit statuses
 
-Returns the current state of every emergency exit in the wallet. Each entry includes which phase the exit is in (start, processing, awaiting-delta, claimable, claim-in-progress, or claimed), and optionally the full state transition history and the exit transaction packages with their CPFP children.
+Returns every exit, live and finished. Optionally includes each exit's state history and its transactions with their CPFP children.
 
 ### Parameters
 
@@ -192,12 +260,39 @@ Name | Type | Description  | Required | Notes
 [[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
 
 
+## get_all_exit_status_deprecated
+
+> get_all_exit_status_deprecated()
+List all exit statuses (deprecated)
+
+Deprecated: redirects to `GET /exits/status/all`.
+
+### Parameters
+
+This endpoint does not need any parameter.
+
+### Return type
+
+ (empty response body)
+
+### Authorization
+
+[bearer](../README.md#bearer)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: Not defined
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
 ## get_exit_status_by_vtxo_id
 
 > models::ExitTransactionStatus get_exit_status_by_vtxo_id(vtxo_id, history, transactions)
-Get exit status
+Get VTXO exit status
 
-Returns the current state of an emergency exit for the specified VTXO, including which phase the exit is in (start, processing, awaiting-delta, claimable, claim-in-progress, or claimed). Optionally includes the full state transition history and the exit transaction packages with their CPFP children.
+Returns the exit status for the given VTXO, live or finished. Optionally includes the state history and the exit transactions with their CPFP children.
 
 ### Parameters
 
@@ -211,6 +306,100 @@ Name | Type | Description  | Required | Notes
 ### Return type
 
 [**models::ExitTransactionStatus**](ExitTransactionStatus.md)
+
+### Authorization
+
+[bearer](../README.md#bearer)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
+## get_exit_status_by_vtxo_id_deprecated
+
+> models::ExitTransactionStatus get_exit_status_by_vtxo_id_deprecated(vtxo_id, history, transactions)
+Get exit status (deprecated)
+
+Deprecated: use `GET /exits/status/vtxo/{vtxo_id}` instead.
+
+### Parameters
+
+
+Name | Type | Description  | Required | Notes
+------------- | ------------- | ------------- | ------------- | -------------
+**vtxo_id** | **String** | The VTXO to check the exit status of | [required] |
+**history** | Option<**bool**> | Whether to include the detailed history of the exit process |  |
+**transactions** | Option<**bool**> | Whether to include the exit transactions and their CPFP children |  |
+
+### Return type
+
+[**models::ExitTransactionStatus**](ExitTransactionStatus.md)
+
+### Authorization
+
+[bearer](../README.md#bearer)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
+## get_finished_exits
+
+> Vec<models::ExitTransactionStatus> get_finished_exits(history, transactions)
+List finished exits
+
+Returns exits that reached a terminal state: claimed, aborted because the VTXO was already spent, or canceled. Finished exits are dropped from active tracking—they are never progressed—but they're retained for auditing and surfaced here.
+
+### Parameters
+
+
+Name | Type | Description  | Required | Notes
+------------- | ------------- | ------------- | ------------- | -------------
+**history** | Option<**bool**> | Whether to include the detailed state history of each finished exit |  |
+**transactions** | Option<**bool**> | Whether to include the exit transactions and their CPFP children |  |
+
+### Return type
+
+[**Vec<models::ExitTransactionStatus>**](ExitTransactionStatus.md)
+
+### Authorization
+
+[bearer](../README.md#bearer)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
+## get_live_exit_status
+
+> Vec<models::ExitTransactionStatus> get_live_exit_status(history, transactions)
+List live exit statuses
+
+Returns exits that are still progressing. Optionally includes each exit's state history and its transactions with their CPFP children.
+
+### Parameters
+
+
+Name | Type | Description  | Required | Notes
+------------- | ------------- | ------------- | ------------- | -------------
+**history** | Option<**bool**> | Whether to include the detailed history of the exit process |  |
+**transactions** | Option<**bool**> | Whether to include the exit transactions and their CPFP children |  |
+
+### Return type
+
+[**Vec<models::ExitTransactionStatus>**](ExitTransactionStatus.md)
 
 ### Authorization
 

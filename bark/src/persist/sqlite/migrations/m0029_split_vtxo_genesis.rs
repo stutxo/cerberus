@@ -138,7 +138,6 @@ fn exit_tx_weight_wu(vtxo: &Vtxo<Full>) -> u64 {
 mod test {
 	use super::*;
 
-	use ark::vtxo::Bare;
 	use bitcoin::Weight;
 	use rusqlite::Connection;
 
@@ -230,7 +229,7 @@ mod test {
 				VALUES (?1, ?2, ?3, ?4)",
 				params![
 					vtxo.id().to_string(),
-					vtxo.expiry_height(),
+					vtxo.expiry_height().to_u32(),
 					vtxo.amount().to_sat(),
 					vtxo.serialize(),
 				],
@@ -253,9 +252,9 @@ mod test {
 			).unwrap_or_else(|e| panic!("read {label}: {e}"));
 			let (raw_bare, raw_genesis, exit_depth, exit_tx_weight) = row;
 
-			let bare = Vtxo::<Bare>::deserialize(&raw_bare).unwrap();
-			let genesis = Vtxo::<Bare>::decode_genesis(&mut &raw_genesis[..]).unwrap();
-			let reassembled = bare.with_genesis(genesis);
+			let reassembled = Vtxo::<Full>::deserialize_with_genesis(
+				&raw_bare[..], &raw_genesis[..],
+			).expect("failed to reassemble VTXO");
 			assert_eq!(reassembled.serialize(), vtxo.serialize(),
 				"{label}: reassembled bytes differ from original");
 

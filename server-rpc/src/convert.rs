@@ -139,7 +139,7 @@ impl_try_from_bytes_bitcoin!(Transaction, "bitcoin transaction");
 
 
 impl From<ark::ArkInfo> for protos::ArkInfo {
-	#[allow(deprecated)] // offboard_feerate_sat_vkb kept for old clients
+	#[allow(deprecated)] // vtxo_expiry_delta and offboard_feerate kept for old clients
 	fn from(v: ark::ArkInfo) -> Self {
 		protos::ArkInfo {
 			network: v.network.to_string(),
@@ -147,26 +147,37 @@ impl From<ark::ArkInfo> for protos::ArkInfo {
 			mailbox_pubkey: v.mailbox_pubkey.serialize().to_vec(),
 			round_interval_secs: v.round_interval.as_secs() as u32,
 			nb_round_nonces: v.nb_round_nonces as u32,
-			vtxo_exit_delta: v.vtxo_exit_delta as u32,
-			vtxo_expiry_delta: v.vtxo_expiry_delta as u32,
-			htlc_send_expiry_delta: v.htlc_send_expiry_delta as u32,
-			htlc_expiry_delta: v.htlc_expiry_delta as u32,
+			vtxo_exit_delta: v.vtxo_exit_delta.into(),
+			vtxo_lifetime: v.vtxo_lifetime.into(),
+			// we serve the deprecated field from the new one so that it
+			// can never go stale for old clients
+			vtxo_expiry_delta: v.vtxo_lifetime.into(),
+			htlc_send_expiry_delta: v.htlc_send_expiry_delta.into(),
+			htlc_expiry_delta: v.htlc_expiry_delta.into(),
 			max_vtxo_amount: v.max_vtxo_amount.map(|v| v.to_sat()),
 			required_board_confirmations: v.required_board_confirmations as u32,
-			max_user_invoice_cltv_delta: v.max_user_invoice_cltv_delta as u32,
+			max_user_invoice_cltv_delta: v.max_user_invoice_cltv_delta.into(),
 			min_board_amount: v.min_board_amount.to_sat(),
 			offboard_feerate_sat_vkb: v.offboard_feerate.to_sat_per_kwu() * 4,
+			max_offboard_inputs: v.max_offboard_inputs as u32,
 			ln_receive_anti_dos_required: v.ln_receive_anti_dos_required,
 			fees: Some(v.fees.into()),
 			max_vtxo_exit_depth: v.max_vtxo_exit_depth as u32,
+			tos_link: v.tos_link,
 		}
 	}
 }
 
 impl TryFrom<protos::ArkInfo> for ark::ArkInfo {
 	type Error = ConvertError;
-	#[allow(deprecated)] // offboard_feerate_sat_vkb kept for old clients
+	#[allow(deprecated)] // vtxo_expiry_delta and offboard_feerate kept for old clients
 	fn try_from(v: protos::ArkInfo) -> Result<Self, Self::Error> {
+		// Servers from before the rename only set vtxo_expiry_delta.
+		let vtxo_lifetime = check_block_delta(match v.vtxo_lifetime {
+			0 => v.vtxo_expiry_delta,
+			l => l,
+		}).map_err(|_| "invalid vtxo_lifetime")?;
+
 		Ok(ark::ArkInfo {
 			network: v.network.parse().map_err(|_| "invalid network")?,
 			server_pubkey: PublicKey::from_slice(&v.server_pubkey)
@@ -177,22 +188,25 @@ impl TryFrom<protos::ArkInfo> for ark::ArkInfo {
 			nb_round_nonces: v.nb_round_nonces as usize,
 			vtxo_exit_delta: check_block_delta(v.vtxo_exit_delta)
 				.map_err(|_| "invalid vtxo_exit_delta")?,
-			vtxo_expiry_delta: check_block_delta(v.vtxo_expiry_delta)
-				.map_err(|_| "invalid vtxo_expiry_delta")?,
+			vtxo_lifetime,
+			vtxo_expiry_delta: vtxo_lifetime,
 			htlc_send_expiry_delta: check_block_delta(v.htlc_send_expiry_delta)
 				.map_err(|_| "invalid htlc_send_expiry_delta")?,
 			htlc_expiry_delta: check_block_delta(v.htlc_expiry_delta)
 				.map_err(|_| "invalid htlc_expiry_delta")?,
 			max_vtxo_amount: v.max_vtxo_amount.map(|v| Amount::from_sat(v)),
-			required_board_confirmations: v.required_board_confirmations as usize,
+			required_board_confirmations: check_block_delta(v.required_board_confirmations)
+				.map_err(|_| "invalid required_board_confirmations")?.to_u16() as usize,
 			max_user_invoice_cltv_delta: check_block_delta(v.max_user_invoice_cltv_delta)
 				.map_err(|_| "invalid max_user_invoice_cltv_delta")?,
 			min_board_amount: Amount::from_sat(v.min_board_amount),
 			offboard_feerate: FeeRate::from_sat_per_kwu(v.offboard_feerate_sat_vkb / 4),
+			max_offboard_inputs: v.max_offboard_inputs as usize,
 			ln_receive_anti_dos_required: v.ln_receive_anti_dos_required,
 			fees: v.fees.ok_or("missing fees")?.try_into()?,
 			max_vtxo_exit_depth: v.max_vtxo_exit_depth.try_into()
 				.map_err(|_| "invalid max_vtxo_exit_depth")?,
+			tos_link: v.tos_link,
 		})
 	}
 }
@@ -783,6 +797,8 @@ mod test {
 			round_interval_secs: 60,
 			nb_round_nonces: 1,
 			vtxo_exit_delta: 12,
+			vtxo_lifetime: 100,
+			#[allow(deprecated)]
 			vtxo_expiry_delta: 100,
 			htlc_send_expiry_delta: 100,
 			htlc_expiry_delta: 6,
@@ -791,31 +807,75 @@ mod test {
 			max_user_invoice_cltv_delta: 50,
 			min_board_amount: 0,
 			ln_receive_anti_dos_required: false,
+			#[allow(deprecated)]
 			offboard_feerate_sat_vkb: 1000,
 			fees: None,
 			max_vtxo_exit_depth: 5,
+			max_offboard_inputs: 10,
+			tos_link: None,
 		}
 	}
 
 	#[test]
 	fn ark_info_rejects_oversized_vtxo_exit_delta() {
 		let mut proto = baseline_ark_info_proto();
-		proto.vtxo_exit_delta = ark::vtxo::policy::MAX_BLOCK_DELTA as u32 + 1;
+		proto.vtxo_exit_delta = ark::vtxo::policy::MAX_BLOCK_DELTA.to_u32() + 1;
 		assert!(ark::ArkInfo::try_from(proto).is_err());
 	}
 
 	#[test]
 	fn ark_info_rejects_oversized_htlc_expiry_delta() {
 		let mut proto = baseline_ark_info_proto();
-		proto.htlc_expiry_delta = ark::vtxo::policy::MAX_BLOCK_DELTA as u32 + 1;
+		proto.htlc_expiry_delta = ark::vtxo::policy::MAX_BLOCK_DELTA.to_u32() + 1;
 		assert!(ark::ArkInfo::try_from(proto).is_err());
 	}
 
 	#[test]
 	fn ark_info_rejects_oversized_max_user_invoice_cltv_delta() {
 		let mut proto = baseline_ark_info_proto();
-		proto.max_user_invoice_cltv_delta = ark::vtxo::policy::MAX_BLOCK_DELTA as u32 + 1;
+		proto.max_user_invoice_cltv_delta = ark::vtxo::policy::MAX_BLOCK_DELTA.to_u32() + 1;
 		assert!(ark::ArkInfo::try_from(proto).is_err());
+	}
+
+	#[test]
+	fn ark_info_rejects_oversized_required_board_confirmations() {
+		// A malicious server could otherwise push this near u32::MAX and overflow
+		// the client's `current_height + required` board arithmetic.
+		let mut proto = baseline_ark_info_proto();
+		proto.required_board_confirmations = ark::vtxo::policy::MAX_BLOCK_DELTA.to_u32() + 1;
+		assert!(ark::ArkInfo::try_from(proto).is_err());
+	}
+
+	#[test]
+	#[allow(deprecated)] // vtxo_expiry_delta kept for old peers
+	fn ark_info_vtxo_lifetime_falls_back_to_deprecated_field() {
+		// Servers from before the rename only set vtxo_expiry_delta.
+		let mut proto = baseline_ark_info_proto();
+		proto.fees = Some(ark::fees::FeeSchedule::default().into());
+		proto.vtxo_lifetime = 0;
+		proto.vtxo_expiry_delta = 42;
+
+		let info = ark::ArkInfo::try_from(proto).unwrap();
+		assert_eq!(info.vtxo_lifetime.to_u32(), 42);
+		assert_eq!(info.vtxo_expiry_delta.to_u32(), 42);
+	}
+
+	#[test]
+	#[allow(deprecated)] // vtxo_expiry_delta kept for old peers
+	fn ark_info_vtxo_lifetime_takes_precedence() {
+		let mut proto = baseline_ark_info_proto();
+		proto.fees = Some(ark::fees::FeeSchedule::default().into());
+		proto.vtxo_lifetime = 42;
+		proto.vtxo_expiry_delta = 100;
+
+		let info = ark::ArkInfo::try_from(proto).unwrap();
+		assert_eq!(info.vtxo_lifetime.to_u32(), 42);
+		assert_eq!(info.vtxo_expiry_delta.to_u32(), 42);
+
+		// and both fields are populated again on the way out
+		let proto = protos::ArkInfo::from(info);
+		assert_eq!(proto.vtxo_lifetime, 42);
+		assert_eq!(proto.vtxo_expiry_delta, 42);
 	}
 
 	#[test]

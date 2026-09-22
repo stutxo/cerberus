@@ -13,16 +13,15 @@ use std::fmt;
 
 use bitcoin::{Amount, Transaction};
 use bitcoin::secp256k1::{Keypair, PublicKey};
+use bitcoin_ext::BlockHeight;
 use lightning_invoice::Bolt11Invoice;
 
 use ark::{Vtxo, VtxoId, VtxoPolicy, VtxoRequest};
 use ark::vtxo::Full;
 use ark::mailbox::MailboxIdentifier;
-use ark::musig::DangerousSecretNonce;
 use ark::tree::signed::{UnlockHash, VtxoTreeSpec};
-use ark::lightning::{Invoice, PaymentHash, Preimage};
+use ark::lightning::{PaymentHash, Preimage};
 use ark::rounds::RoundSeq;
-use bitcoin_ext::BlockDelta;
 
 use crate::WalletVtxo;
 use crate::exit::{ExitState, ExitTxOrigin, ExitVtxo};
@@ -45,6 +44,10 @@ pub struct SerdeVtxo {
 	pub vtxo: Vtxo<Full>,
 	/// VTXO states, sorted from oldest to newest.
 	pub states: Vec<VtxoState>,
+	/// See [WalletVtxo::registered]. Defaults to `false` for
+	/// records stored before this field existed, so they get caught up.
+	#[serde(default)]
+	pub registered: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,7 +61,7 @@ impl SerdeVtxo {
 
 	pub fn to_wallet_vtxo(&self) -> Result<WalletVtxo, MissingStateError> {
 		let state = self.current_state().cloned().ok_or(MissingStateError)?;
-		Ok(wallet_vtxo_from_full(&self.vtxo, state))
+		Ok(wallet_vtxo_from_full(&self.vtxo, state, self.registered))
 	}
 }
 
@@ -74,12 +77,14 @@ impl SerdeVtxo {
 pub(crate) fn wallet_vtxo_from_full(
 	vtxo: &Vtxo<Full>,
 	state: VtxoState,
+	registered: bool,
 ) -> WalletVtxo {
 	WalletVtxo {
 		vtxo: vtxo.to_bare(),
 		state,
 		exit_depth: vtxo.exit_depth(),
 		exit_tx_weight: vtxo.transactions().map(|t| t.tx.weight()).sum(),
+		registered,
 	}
 }
 
@@ -137,7 +142,7 @@ impl StoredRoundState<Unlocked> {
 	}
 }
 
-impl StoredRoundState {
+impl StoredRoundState<Locked> {
 	pub fn state_mut(&mut self) -> &mut RoundState {
 		&mut self.state
 	}
@@ -165,75 +170,36 @@ pub struct PendingBoard {
 	pub movement_id: MovementId,
 }
 
-/// Persisted representation of a pending offboard.
+/// Replay-protection record for a fully-settled outgoing lightning send.
 ///
-/// Created when an offboard swap is performed, tracked until the
-/// offboard transaction confirms on-chain.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingOffboard {
-	/// The [MovementId] associated with this offboard.
-	pub movement_id: MovementId,
-	/// The txid of the offboard transaction.
-	pub offboard_txid: bitcoin::Txid,
-	/// The full signed offboard transaction.
-	pub offboard_tx: Transaction,
-	/// The VTXOs consumed by this offboard.
-	pub vtxo_ids: Vec<VtxoId>,
-	/// The destination address of the offboard.
-	pub destination: String,
-	/// When this pending offboard was created.
-	pub created_at: chrono::DateTime<chrono::Local>,
-}
-
-/// Persisted representation of a lightning send.
-///
-/// Created after the HTLCs from client to server are constructed.
+/// Written when a payment is acknowledged with a valid preimage; never
+/// deleted. Used by [`crate::actions::lightning::pay`] to refuse paying
+/// the same invoice twice.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LightningSend {
-	/// The Lightning invoice being paid.
-	pub invoice: Invoice,
-	/// The amount being sent.
-	#[serde(with = "bitcoin::amount::serde::as_sat")]
-	pub amount: Amount,
-	/// The fee paid for making the lightning payment.
-	pub fee: Amount,
-	/// The open HTLCs that are used for this payment.
-	pub htlc_vtxos: Vec<WalletVtxo>,
-	/// The movement associated with this payment.
-	pub movement_id: MovementId,
-	/// The payment preimage, serving as proof of payment.
-	///
-	/// Combined with [`finished_at`](Self::finished_at), determines the payment state:
-	/// - `None` + `finished_at: None` → Pending (in-flight)
-	/// - `None` + `finished_at: Some(_)` → Failed
-	/// - `Some(_)` + `finished_at: Some(_)` → Succeeded
-	pub preimage: Option<Preimage>,
-	/// When the payment reached a terminal state (succeeded or failed).
-	pub finished_at: Option<chrono::DateTime<chrono::Local>>,
+pub struct PaidInvoice {
+	pub payment_hash: PaymentHash,
+	pub preimage: Preimage,
+	pub paid_at: chrono::DateTime<chrono::Local>,
 }
 
-/// Persisted representation of an incoming Lightning payment.
+/// Permanent record of a fully-settled incoming lightning receive.
 ///
-/// Stores the invoice and related cryptographic material (e.g., payment hash and preimage)
-/// and tracks whether the preimage has been revealed.
-///
-/// Note: the record should be removed when the receive is completed or failed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LightningReceive {
+/// Written when an inbound payment is claimed (the wallet has obtained
+/// spendable VTXOs in exchange for the preimage); never deleted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettledLightningReceive {
 	pub payment_hash: PaymentHash,
-	pub payment_preimage: Preimage,
+	pub preimage: Preimage,
 	pub invoice: Bolt11Invoice,
-	pub preimage_revealed_at: Option<chrono::DateTime<chrono::Local>>,
-	pub htlc_vtxos: Vec<WalletVtxo>,
-	pub htlc_recv_cltv_delta: BlockDelta,
-	pub movement_id: Option<MovementId>,
-	pub finished_at: Option<chrono::DateTime<chrono::Local>>,
+	pub amount: Amount,
+	pub settled_at: chrono::DateTime<chrono::Local>,
 }
 
 /// Persistable view of an [ExitVtxo].
 ///
 /// `StoredExit` is a lightweight data transfer object tailored for storage backends. It captures
-/// the VTXO ID, the current state, and the full history of the unilateral exit.
+/// the VTXO ID, the current state, the full history of the unilateral exit, and a pointer
+/// back to the pending movement that records this exit.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredExit {
 	/// Identifier of the VTXO being exited.
@@ -242,6 +208,9 @@ pub struct StoredExit {
 	pub state: ExitState,
 	/// Historical states for auditability.
 	pub history: Vec<ExitState>,
+	/// The movement that records this exit. `None` for exits created before
+	/// movement tracking was wired up.
+	pub movement_id: Option<MovementId>,
 }
 
 impl StoredExit {
@@ -251,6 +220,7 @@ impl StoredExit {
 			vtxo_id: exit.id(),
 			state: exit.state().clone(),
 			history: exit.history().clone(),
+			movement_id: exit.movement_id(),
 		}
 	}
 }
@@ -319,13 +289,34 @@ impl<'a> From<SerdeRoundParticipation<'a>> for RoundParticipation {
 	}
 }
 
+/// Placeholder for the now-removed `secret_nonces` field. Discards
+/// any payload on read so legacy records still parse.
+#[derive(Debug, Default)]
+struct PersistedNoncesPlaceholder;
+
+impl ::serde::Serialize for PersistedNoncesPlaceholder {
+	fn serialize<S: ::serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+		s.collect_seq(std::iter::empty::<()>())
+	}
+}
+
+impl<'de> ::serde::Deserialize<'de> for PersistedNoncesPlaceholder {
+	fn deserialize<D: ::serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+		::serde::de::IgnoredAny::deserialize(d)?;
+		Ok(PersistedNoncesPlaceholder)
+	}
+}
+
 /// Model for [AttemptState]
 #[derive(Debug, Serialize, Deserialize)]
 enum SerdeAttemptState<'a> {
 	AwaitingAttempt,
 	AwaitingUnsignedVtxoTree {
 		cosign_keys: Cow<'a, [Keypair]>,
-		secret_nonces: Cow<'a, [Vec<DangerousSecretNonce>]>,
+		/// Kept for backward compatibility. See
+		/// [PersistedNoncesPlaceholder].
+		#[serde(rename = "secret_nonces", default)]
+		_legacy_secret_nonces: PersistedNoncesPlaceholder,
 		unlock_hash: UnlockHash,
 	},
 	AwaitingFinishedRound {
@@ -341,10 +332,10 @@ impl<'a> From<&'a AttemptState> for SerdeAttemptState<'a> {
 	fn from(state: &'a AttemptState) -> Self {
 		match state {
 			AttemptState::AwaitingAttempt => SerdeAttemptState::AwaitingAttempt,
-			AttemptState::AwaitingUnsignedVtxoTree { cosign_keys, secret_nonces, unlock_hash } => {
+			AttemptState::AwaitingUnsignedVtxoTree { cosign_keys, unlock_hash } => {
 				SerdeAttemptState::AwaitingUnsignedVtxoTree {
 					cosign_keys: Cow::Borrowed(cosign_keys),
-					secret_nonces: Cow::Borrowed(secret_nonces),
+					_legacy_secret_nonces: PersistedNoncesPlaceholder,
 					unlock_hash: *unlock_hash,
 				}
 			},
@@ -363,10 +354,9 @@ impl<'a> From<SerdeAttemptState<'a>> for AttemptState {
 	fn from(state: SerdeAttemptState<'a>) -> Self {
 		match state {
 			SerdeAttemptState::AwaitingAttempt => AttemptState::AwaitingAttempt,
-			SerdeAttemptState::AwaitingUnsignedVtxoTree { cosign_keys, secret_nonces, unlock_hash } => {
+			SerdeAttemptState::AwaitingUnsignedVtxoTree { cosign_keys, _legacy_secret_nonces: _, unlock_hash } => {
 				AttemptState::AwaitingUnsignedVtxoTree {
 					cosign_keys: cosign_keys.into_owned(),
-					secret_nonces: secret_nonces.into_owned(),
 					unlock_hash: unlock_hash,
 				}
 			},
@@ -387,6 +377,14 @@ enum SerdeRoundFlowState<'a> {
 	/// We don't do flow and we just wait for the round to finish
 	NonInteractivePending {
 		unlock_hash: UnlockHash,
+		/// Absent in states stored before scheduled participations were tracked.
+		#[serde(default)]
+		scheduled_height: Option<BlockHeight>,
+	},
+
+	/// A delegated participation replacing itself with a fresh submission
+	Redelegating {
+		scheduled_height: Option<BlockHeight>,
 	},
 
 	/// Waiting for round to happen
@@ -416,9 +414,15 @@ enum SerdeRoundFlowState<'a> {
 impl<'a> From<&'a RoundFlowState> for SerdeRoundFlowState<'a> {
 	fn from(state: &'a RoundFlowState) -> Self {
 		match state {
-			RoundFlowState::NonInteractivePending { unlock_hash } => {
+			RoundFlowState::NonInteractivePending { unlock_hash, scheduled_height } => {
 				SerdeRoundFlowState::NonInteractivePending {
 					unlock_hash: *unlock_hash,
+					scheduled_height: *scheduled_height,
+				}
+			},
+			RoundFlowState::Redelegating { scheduled_height } => {
+				SerdeRoundFlowState::Redelegating {
+					scheduled_height: *scheduled_height,
 				}
 			},
 			RoundFlowState::InteractivePending => SerdeRoundFlowState::InteractivePending,
@@ -448,8 +452,11 @@ impl<'a> From<&'a RoundFlowState> for SerdeRoundFlowState<'a> {
 impl<'a> From<SerdeRoundFlowState<'a>> for RoundFlowState {
 	fn from(state: SerdeRoundFlowState<'a>) -> Self {
 		match state {
-			SerdeRoundFlowState::NonInteractivePending { unlock_hash } => {
-				RoundFlowState::NonInteractivePending { unlock_hash }
+			SerdeRoundFlowState::NonInteractivePending { unlock_hash, scheduled_height } => {
+				RoundFlowState::NonInteractivePending { unlock_hash, scheduled_height }
+			},
+			SerdeRoundFlowState::Redelegating { scheduled_height } => {
+				RoundFlowState::Redelegating { scheduled_height }
 			},
 			SerdeRoundFlowState::InteractivePending => RoundFlowState::InteractivePending,
 			SerdeRoundFlowState::InteractiveOngoing { round_seq, attempt_seq, state } => {
@@ -515,25 +522,48 @@ impl<'a> From<SerdeRoundState<'a>> for RoundState {
 
 #[cfg(test)]
 mod test {
+	use bitcoin_ext::BlockHeight;
+
 	use crate::exit::{ExitState, ExitTxOrigin};
 	use crate::vtxo::VtxoState;
+	use super::SerdeAttemptState;
 
 	#[test]
 	/// Each struct stored as JSON in the database should have test to check for backwards compatibility
 	/// Parsing can occur either in convert.rs or this file (query.rs)
-	fn test_serialised_structs() {
-		// Exit state
+	fn test_serialized_structs() {
+		// Exit state — top-level variants
 		let serialised = r#"{"type":"start","tip_height":119}"#;
-		serde_json::from_str::<ExitState>(serialised).unwrap();
-		let serialised = r#"{"type":"processing","tip_height":119,"transactions":[{"txid":"9fd34b8c556dd9954bda80ba2cf3474a372702ebc31a366639483e78417c6812","status":{"type":"awaiting-input-confirmation","txids":["ddfe11920358d1a1fae970dc80459c60675bf1392896f69b103fc638313751de"]}}]}"#;
 		serde_json::from_str::<ExitState>(serialised).unwrap();
 		let serialised = r#"{"type":"awaiting-delta","tip_height":122,"confirmed_block":"122:3cdd30fc942301a74666c481beb82050ccd182050aee3c92d2197e8cad427b8f","claimable_height":134}"#;
 		serde_json::from_str::<ExitState>(serialised).unwrap();
 		let serialised = r#"{"type":"claimable","tip_height":134,"claimable_since": "134:71fe28f4c803a4c46a3a93d0a9937507d7c20b4bd9586ba317d1109e1aebaac9","last_scanned_block":null}"#;
 		serde_json::from_str::<ExitState>(serialised).unwrap();
+		let serialised = r#"{"type":"claimable","tip_height":140,"claimable_since": "134:71fe28f4c803a4c46a3a93d0a9937507d7c20b4bd9586ba317d1109e1aebaac9","last_scanned_block": "139:c6e9eb8c8b4d9620bbe87b94d7fb0fbb8eef1c4a8c1e60f7b3a5d80fe26b0d3e"}"#;
+		serde_json::from_str::<ExitState>(serialised).unwrap();
 		let serialised = r#"{"type":"claim-in-progress","tip_height":134, "claimable_since": "134:6585896bdda6f08d924bf45cc2b16418af56703b3c50930e4dccbc1728d3800a","claim_txid":"599347c35870bd36f7acb22b81f9ffa8b911d9b5e94834858aebd3ec09339f4c"}"#;
 		serde_json::from_str::<ExitState>(serialised).unwrap();
 		let serialised = r#"{"type":"claimed","tip_height":134,"txid":"599347c35870bd36f7acb22b81f9ffa8b911d9b5e94834858aebd3ec09339f4c","block": "122:3cdd30fc942301a74666c481beb82050ccd182050aee3c92d2197e8cad427b8f"}"#;
+		serde_json::from_str::<ExitState>(serialised).unwrap();
+		let serialised = r#"{"type":"vtxo-already-spent","tip_height":135}"#;
+		serde_json::from_str::<ExitState>(serialised).unwrap();
+		let serialised = r#"{"type":"canceled","tip_height":135}"#;
+		serde_json::from_str::<ExitState>(serialised).unwrap();
+
+		// Exit state — `processing` carrying each ExitTxStatus variant. These fixtures
+		// guard against the same class of bug the m0029 migration was written to fix:
+		// renaming, dropping, or reshaping a nested status variant must trip this test.
+		let serialised = r#"{"type":"processing","tip_height":119,"transactions":[{"txid":"9fd34b8c556dd9954bda80ba2cf3474a372702ebc31a366639483e78417c6812","status":{"type":"verify-inputs"}}]}"#;
+		serde_json::from_str::<ExitState>(serialised).unwrap();
+		let serialised = r#"{"type":"processing","tip_height":119,"transactions":[{"txid":"9fd34b8c556dd9954bda80ba2cf3474a372702ebc31a366639483e78417c6812","status":{"type":"awaiting-input-confirmation","txids":["ddfe11920358d1a1fae970dc80459c60675bf1392896f69b103fc638313751de"]}}]}"#;
+		serde_json::from_str::<ExitState>(serialised).unwrap();
+		let serialised = r#"{"type":"processing","tip_height":119,"transactions":[{"txid":"9fd34b8c556dd9954bda80ba2cf3474a372702ebc31a366639483e78417c6812","status":{"type":"awaiting-cpfp-broadcast"}}]}"#;
+		serde_json::from_str::<ExitState>(serialised).unwrap();
+		let serialised = r#"{"type":"processing","tip_height":119,"transactions":[{"txid":"9fd34b8c556dd9954bda80ba2cf3474a372702ebc31a366639483e78417c6812","status":{"type":"awaiting-confirmation","child_txid":"ddfe11920358d1a1fae970dc80459c60675bf1392896f69b103fc638313751de","origin":{"type":"wallet","confirmed_in":null}}}]}"#;
+		serde_json::from_str::<ExitState>(serialised).unwrap();
+		let serialised = r#"{"type":"processing","tip_height":119,"transactions":[{"txid":"9fd34b8c556dd9954bda80ba2cf3474a372702ebc31a366639483e78417c6812","status":{"type":"awaiting-confirmation","child_txid":"ddfe11920358d1a1fae970dc80459c60675bf1392896f69b103fc638313751de","origin":{"type":"mempool","fee_rate_kwu":25000,"total_fee":27625}}}]}"#;
+		serde_json::from_str::<ExitState>(serialised).unwrap();
+		let serialised = r#"{"type":"processing","tip_height":134,"transactions":[{"txid":"9fd34b8c556dd9954bda80ba2cf3474a372702ebc31a366639483e78417c6812","status":{"type":"confirmed","child_txid":"ddfe11920358d1a1fae970dc80459c60675bf1392896f69b103fc638313751de","block":"122:3cdd30fc942301a74666c481beb82050ccd182050aee3c92d2197e8cad427b8f","origin":{"type":"block","confirmed_in":"122:3cdd30fc942301a74666c481beb82050ccd182050aee3c92d2197e8cad427b8f"}}}]}"#;
 		serde_json::from_str::<ExitState>(serialised).unwrap();
 
 		// Exit child tx origins
@@ -541,6 +571,10 @@ mod test {
 		serde_json::from_str::<ExitTxOrigin>(serialized).unwrap();
 		let serialized = r#"{"type":"wallet","confirmed_in": "134:71fe28f4c803a4c46a3a93d0a9937507d7c20b4bd9586ba317d1109e1aebaac9"}"#;
 		serde_json::from_str::<ExitTxOrigin>(serialized).unwrap();
+		// New shape: mempool is a unit variant; fee data lives on ChildTransactionInfo.fee_info.
+		let serialized = r#"{"type":"mempool"}"#;
+		serde_json::from_str::<ExitTxOrigin>(serialized).unwrap();
+		// Legacy shape: extra fee_rate_kwu/total_fee fields must still deserialize cleanly.
 		let serialized = r#"{"type":"mempool","fee_rate_kwu":25000,"total_fee":27625}"#;
 		serde_json::from_str::<ExitTxOrigin>(serialized).unwrap();
 		let serialized = r#"{"type":"block","confirmed_in": "134:71fe28f4c803a4c46a3a93d0a9937507d7c20b4bd9586ba317d1109e1aebaac9"}"#;
@@ -551,7 +585,84 @@ mod test {
 		serde_json::from_str::<VtxoState>(serialised).unwrap();
 		let serialised = r#"{"type": "spent"}"#;
 		serde_json::from_str::<VtxoState>(serialised).unwrap();
+		let serialised = r#"{"type": "exited"}"#;
+		serde_json::from_str::<VtxoState>(serialised).unwrap();
+		// Legacy locked shape: pre-holder records carry `movement_id` instead.
 		let serialised = r#"{"type": "locked", "movement_id": null}"#;
 		serde_json::from_str::<VtxoState>(serialised).unwrap();
+		let serialised = r#"{"type": "locked", "movement_id": 42}"#;
+		serde_json::from_str::<VtxoState>(serialised).unwrap();
+		// Current locked shapes: `holder` is absent, null, or one of the VtxoLockHolder variants.
+		let serialised = r#"{"type": "locked", "holder": null}"#;
+		serde_json::from_str::<VtxoState>(serialised).unwrap();
+		let serialised = r#"{"type": "locked", "holder": {"type": "movement", "id": 42}}"#;
+		serde_json::from_str::<VtxoState>(serialised).unwrap();
+		let serialised = r#"{"type": "locked", "holder": {"type": "action", "id": "test-action-id"}}"#;
+		serde_json::from_str::<VtxoState>(serialised).unwrap();
+
+		// Round-attempt state — `AwaitingUnsignedVtxoTree`. Legacy
+		// records carry `secret_nonces` as an array of 132-byte buffers.
+		let serialised = r#"{"AwaitingUnsignedVtxoTree":{"cosign_keys":[],"secret_nonces":[[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]]],"unlock_hash":"0000000000000000000000000000000000000000000000000000000000000000"}}"#;
+		serde_json::from_str::<SerdeAttemptState>(serialised).unwrap();
+		let serialised = r#"{"AwaitingUnsignedVtxoTree":{"cosign_keys":[],"unlock_hash":"0000000000000000000000000000000000000000000000000000000000000000"}}"#;
+		serde_json::from_str::<SerdeAttemptState>(serialised).unwrap();
+	}
+
+	/// `SerdeRoundState` is written to sqlite via `rmp_serde` (positional
+	/// MessagePack), so its wire format needs covering separately from
+	/// the JSON fixtures.
+	#[test]
+	fn test_serialized_round_state_msgpack() {
+		use bitcoin::hex::FromHex;
+
+		// Legacy record carrying `secret_nonces`.
+		let serialised = "81b84177616974696e67556e7369676e65645674786f5472656593909191dc0084000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c4200000000000000000000000000000000000000000000000000000000000000000";
+		rmp_serde::from_slice::<SerdeAttemptState>(
+			&Vec::<u8>::from_hex(serialised).unwrap(),
+		).unwrap();
+		// Current record: `secret_nonces` is an empty placeholder seq.
+		let serialised = "81b84177616974696e67556e7369676e65645674786f54726565939090c4200000000000000000000000000000000000000000000000000000000000000000";
+		rmp_serde::from_slice::<SerdeAttemptState>(
+			&Vec::<u8>::from_hex(serialised).unwrap(),
+		).unwrap();
+	}
+
+	/// `NonInteractivePending` gained a trailing `scheduled_height` field. Since
+	/// `rmp_serde` encodes struct variants positionally, legacy records are a
+	/// shorter array and must still deserialize (with `scheduled_height: None`).
+	#[test]
+	fn test_serialized_non_interactive_pending_scheduled_height() {
+		use bitcoin::hashes::Hash;
+		use super::{SerdeRoundFlowState, UnlockHash};
+
+		// Legacy shape: the variant payload held only `unlock_hash`.
+		#[derive(serde::Serialize)]
+		enum LegacyRoundFlowState {
+			NonInteractivePending { unlock_hash: UnlockHash },
+		}
+
+		let unlock_hash = UnlockHash::all_zeros();
+		let legacy = rmp_serde::to_vec(
+			&LegacyRoundFlowState::NonInteractivePending { unlock_hash },
+		).unwrap();
+		match rmp_serde::from_slice::<SerdeRoundFlowState>(&legacy).unwrap() {
+			SerdeRoundFlowState::NonInteractivePending { unlock_hash: uh, scheduled_height } => {
+				assert_eq!(uh, unlock_hash);
+				assert_eq!(scheduled_height, None);
+			},
+			_ => panic!("wrong variant"),
+		}
+
+		// Current shape round-trips a stored schedule height.
+		let current = rmp_serde::to_vec(&SerdeRoundFlowState::NonInteractivePending {
+			unlock_hash,
+			scheduled_height: Some(BlockHeight::new(123_456)),
+		}).unwrap();
+		match rmp_serde::from_slice::<SerdeRoundFlowState>(&current).unwrap() {
+			SerdeRoundFlowState::NonInteractivePending { scheduled_height, .. } => {
+				assert_eq!(scheduled_height, Some(BlockHeight::new(123_456)));
+			},
+			_ => panic!("wrong variant"),
+		}
 	}
 }

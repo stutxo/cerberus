@@ -5,7 +5,7 @@ pub mod onchain;
 use std::borrow::Borrow;
 use std::time::Duration;
 
-use bitcoin::secp256k1::PublicKey;
+use bitcoin::secp256k1::{schnorr, PublicKey};
 use bitcoin::{Amount, Txid};
 #[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
@@ -14,6 +14,11 @@ use ark::VtxoId;
 use ark::lightning::{PaymentHash, Preimage};
 use bitcoin_ext::{AmountExt, BlockDelta};
 
+use bark::actions::lightning::pay::{LightningSendState, Progress as SendProgress};
+use bark::actions::lightning::receive::{
+	LightningReceive, LightningReceiveState, Progress as ReceiveProgress,
+};
+
 use crate::cli::fees::FeeSchedule;
 use crate::exit::error::ExitError;
 use crate::exit::package::ExitTransactionPackage;
@@ -21,7 +26,7 @@ use crate::exit::ExitState;
 use crate::primitives::{TransactionInfo, WalletVtxoInfo};
 use crate::serde_utils;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct ArkInfo {
 	/// The bitcoin network the server operates on
@@ -40,12 +45,17 @@ pub struct ArkInfo {
 	/// Number of nonces per round
 	pub nb_round_nonces: usize,
 	/// Delta between exit confirmation and coins becoming spendable
+	#[cfg_attr(feature = "utoipa", schema(value_type = u16))]
 	pub vtxo_exit_delta: BlockDelta,
-	/// Expiration delta of the VTXO
-	pub vtxo_expiry_delta: BlockDelta,
+	/// The number of blocks a VTXO lives before it expires
+	#[serde(default)]
+	#[cfg_attr(feature = "utoipa", schema(value_type = u16))]
+	pub vtxo_lifetime: BlockDelta,
 	/// The number of blocks after which an HTLC-send VTXO expires once granted.
+	#[cfg_attr(feature = "utoipa", schema(value_type = u16))]
 	pub htlc_send_expiry_delta: BlockDelta,
 	/// The number of blocks to keep between Lightning and Ark HTLCs expiries
+	#[cfg_attr(feature = "utoipa", schema(value_type = u16))]
 	pub htlc_expiry_delta: BlockDelta,
 	/// Maximum amount of a VTXO
 	#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
@@ -54,7 +64,8 @@ pub struct ArkInfo {
 	pub required_board_confirmations: usize,
 	/// Maximum CLTV delta server will allow clients to request an
 	/// invoice generation with.
-	pub max_user_invoice_cltv_delta: u16,
+	#[cfg_attr(feature = "utoipa", schema(value_type = u16))]
+	pub max_user_invoice_cltv_delta: BlockDelta,
 	/// Minimum amount for a board the server will cosign
 	#[serde(rename = "min_board_amount_sat", with = "bitcoin::amount::serde::as_sat")]
 	#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
@@ -72,6 +83,87 @@ pub struct ArkInfo {
 	/// cosign further OOR transactions spending it. Clients should refresh
 	/// their VTXOs into a round before this limit is reached.
 	pub max_vtxo_exit_depth: u16,
+	/// Link to the server's terms of service, if any.
+	pub tos_link: Option<String>,
+	/// The maximum number of inputs for an offboard
+	pub max_offboard_inputs: usize,
+
+	/// The number of blocks a VTXO lives before it expires.
+	///
+	/// **Deprecated**: renamed to `vtxo_lifetime`. This field is still
+	/// populated with the same value for backwards compatibility and will
+	/// be removed in a future release.
+	#[deprecated(note = "renamed to `vtxo_lifetime`")]
+	#[serde(default)]
+	#[cfg_attr(feature = "utoipa", schema(required = true, value_type = u16))]
+	pub vtxo_expiry_delta: BlockDelta,
+}
+
+impl<'de> serde::Deserialize<'de> for ArkInfo {
+	#[allow(deprecated)]
+	fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+		#[derive(Deserialize)]
+		struct ArkInfoStub {
+			network: bitcoin::Network,
+			server_pubkey: PublicKey,
+			mailbox_pubkey: PublicKey,
+			#[serde(with = "serde_utils::duration")]
+			round_interval: Duration,
+			nb_round_nonces: usize,
+			vtxo_exit_delta: BlockDelta,
+			#[serde(default)]
+			vtxo_lifetime: BlockDelta,
+			htlc_send_expiry_delta: BlockDelta,
+			htlc_expiry_delta: BlockDelta,
+			max_vtxo_amount: Option<Amount>,
+			required_board_confirmations: usize,
+			max_user_invoice_cltv_delta: BlockDelta,
+			#[serde(rename = "min_board_amount_sat", with = "bitcoin::amount::serde::as_sat")]
+			min_board_amount: Amount,
+			offboard_feerate_sat_per_kvb: u64,
+			ln_receive_anti_dos_required: bool,
+			fees: FeeSchedule,
+			max_vtxo_exit_depth: u16,
+			tos_link: Option<String>,
+			max_offboard_inputs: usize,
+			#[serde(default)]
+			vtxo_expiry_delta: BlockDelta,
+		}
+
+		let v = ArkInfoStub::deserialize(d)?;
+
+		let vtxo_lifetime = match (v.vtxo_lifetime, v.vtxo_expiry_delta) {
+			(BlockDelta::ZERO, expiry) => expiry,
+			(lifetime, BlockDelta::ZERO) => lifetime,
+			(lifetime, expiry) if lifetime == expiry => lifetime,
+			(lifetime, expiry) => return Err(serde::de::Error::custom(format!(
+				"vtxo_lifetime ({}) and vtxo_expiry_delta ({}) don't match", lifetime, expiry,
+			))),
+		};
+
+		Ok(ArkInfo {
+			network: v.network,
+			server_pubkey: v.server_pubkey,
+			mailbox_pubkey: v.mailbox_pubkey,
+			round_interval: v.round_interval,
+			nb_round_nonces: v.nb_round_nonces,
+			vtxo_exit_delta: v.vtxo_exit_delta,
+			vtxo_lifetime: vtxo_lifetime,
+			vtxo_expiry_delta: vtxo_lifetime,
+			htlc_send_expiry_delta: v.htlc_send_expiry_delta,
+			htlc_expiry_delta: v.htlc_expiry_delta,
+			max_vtxo_amount: v.max_vtxo_amount,
+			required_board_confirmations: v.required_board_confirmations,
+			max_user_invoice_cltv_delta: v.max_user_invoice_cltv_delta,
+			min_board_amount: v.min_board_amount,
+			offboard_feerate_sat_per_kvb: v.offboard_feerate_sat_per_kvb,
+			ln_receive_anti_dos_required: v.ln_receive_anti_dos_required,
+			fees: v.fees,
+			max_vtxo_exit_depth: v.max_vtxo_exit_depth,
+			tos_link: v.tos_link,
+			max_offboard_inputs: v.max_offboard_inputs,
+		})
+	}
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -82,7 +174,7 @@ pub struct NextRoundStart {
 }
 
 impl<T: Borrow<ark::ArkInfo>> From<T> for ArkInfo {
-	#[allow(deprecated)] // offboard_feerate kept for old clients
+	#[allow(deprecated)] // vtxo_expiry_delta and offboard_feerate kept for old clients
 	fn from(v: T) -> Self {
 		let v = v.borrow();
 	    ArkInfo {
@@ -92,7 +184,10 @@ impl<T: Borrow<ark::ArkInfo>> From<T> for ArkInfo {
 			round_interval: v.round_interval,
 			nb_round_nonces: v.nb_round_nonces,
 			vtxo_exit_delta: v.vtxo_exit_delta,
-			vtxo_expiry_delta: v.vtxo_expiry_delta,
+			vtxo_lifetime: v.vtxo_lifetime,
+			// we serve the deprecated field from the new one so that it
+			// can never go stale for old clients
+			vtxo_expiry_delta: v.vtxo_lifetime,
 			htlc_send_expiry_delta: v.htlc_send_expiry_delta,
 			htlc_expiry_delta: v.htlc_expiry_delta,
 			max_vtxo_amount: v.max_vtxo_amount,
@@ -103,8 +198,28 @@ impl<T: Borrow<ark::ArkInfo>> From<T> for ArkInfo {
 			ln_receive_anti_dos_required: v.ln_receive_anti_dos_required,
 			fees: v.fees.clone().into(),
 			max_vtxo_exit_depth: v.max_vtxo_exit_depth,
+			max_offboard_inputs: v.max_offboard_inputs,
+			tos_link: v.tos_link.clone(),
 		}
 	}
+}
+
+/// A signature over a message
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct SignedMessage {
+	/// The BIP-340 Schnorr signature over the message digest
+	/// `SHA256("bark/message" || message)`
+	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
+	pub signature: schnorr::Signature,
+}
+
+/// The result of verifying a signed message
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct MessageVerification {
+	/// Whether the signature is valid for the given message and key
+	pub valid: bool,
 }
 
 /// The different balances of a Bark wallet, broken down by state.
@@ -138,7 +253,9 @@ pub struct Balance {
 	#[serde(rename = "pending_board_sat", with = "bitcoin::amount::serde::as_sat")]
 	#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
 	pub pending_board: Amount,
-	/// Sats in VTXOs undergoing an emergency exit back on-chain.
+	/// Sats held in VTXOs whose unilateral exit chain is confirmed on-chain but which
+	/// haven't yet been drained to the onchain wallet. Equivalent to the sum of
+	/// `Exited` VTXOs whose exit state hasn't reached `Claimed`.
 	/// `null` if the exit subsystem is unavailable.
 	#[serde(
 		default,
@@ -172,6 +289,12 @@ pub struct ExitProgressResponse {
 	pub done: bool,
 	/// Block height at which all exit outputs will be spendable
 	pub claimable_height: Option<u32>,
+	/// Top-level error that prevented progress from running cleanly this round. Per-exit
+	/// problems live on each `ExitProgressStatus`; this slot is for failures that can't
+	/// be attributed to a specific VTXO (e.g. the chain source becoming unavailable, or
+	/// the exit manager failing to refresh its view of pending transactions).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub error: Option<ExitError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -351,42 +474,63 @@ pub struct OffboardResult {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct LightningReceiveInfo {
-	/// The amount of the lightning receive
+	/// The payment hash linked to the lightning receive
+	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
+	pub payment_hash: PaymentHash,
+	/// Lifecycle phase of the receive: `awaiting-payment`, `htlcs-ready`,
+	/// `preimage-revealed`, `delivering`, or `settled`.
+	pub state: String,
+	/// The invoice string, if known.
+	pub invoice: String,
+	/// The payment preimage, if known.
+	#[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+	pub payment_preimage: Option<Preimage>,
+	/// The amount of the lightning receive, if known.
 	#[serde(rename = "amount_sat", with = "bitcoin::amount::serde::as_sat")]
 	#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
 	pub amount: Amount,
-	/// The payment hash linked to the lightning receive info
-	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
-	pub payment_hash: PaymentHash,
-	/// The payment preimage linked to the lightning receive info
-	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
-	pub payment_preimage: Preimage,
-	/// The timestamp at which the preimage was revealed
-	pub preimage_revealed_at: Option<chrono::DateTime<chrono::Local>>,
-	/// The timestamp at which the lightning receive was finished
-	pub finished_at: Option<chrono::DateTime<chrono::Local>>,
-	/// The invoice string
-	pub invoice: String,
-	/// The HTLC VTXOs granted by the server for the lightning receive
+	/// IDs of the HTLC-recv VTXOs granted by the server, if any.
 	///
-	/// Empty if the lightning HTLC has not yet been received by the server.
+	/// Empty until the inbound HTLC has been received and prepared.
+	#[serde(default, deserialize_with = "serde_utils::null_as_default")]
+	#[cfg_attr(feature = "utoipa", schema(value_type = Vec<String>, required = true))]
+	pub htlc_vtxo_ids: Vec<VtxoId>,
+	/// The timestamp at which the receive settled, if it has.
+	pub settled_at: Option<chrono::DateTime<chrono::Local>>,
+
+	/// The timestamp at which the preimage was revealed.
+	#[deprecated(note = "no longer tracked; use `state` and `settled_at`")]
+	#[serde(default)]
+	pub preimage_revealed_at: Option<chrono::DateTime<chrono::Local>>,
+	/// The timestamp at which the lightning receive was finished.
+	#[deprecated(note = "renamed to `settled_at`")]
+	#[serde(default)]
+	pub finished_at: Option<chrono::DateTime<chrono::Local>>,
+	/// The HTLC VTXOs granted by the server for the lightning receive.
+	#[deprecated(note = "replaced by `htlc_vtxo_ids`")]
 	#[serde(default, deserialize_with = "serde_utils::null_as_default")]
 	#[cfg_attr(feature = "utoipa", schema(required = true))]
 	pub htlc_vtxos: Vec<WalletVtxoInfo>,
 }
 
-impl From<bark::persist::models::LightningReceive> for LightningReceiveInfo {
-	fn from(v: bark::persist::models::LightningReceive) -> Self {
-		LightningReceiveInfo {
-			payment_hash: v.payment_hash,
-			payment_preimage: v.payment_preimage,
-			preimage_revealed_at: v.preimage_revealed_at,
-			invoice: v.invoice.to_string(),
-			htlc_vtxos: v.htlc_vtxos.into_iter()
-				.map(crate::primitives::WalletVtxoInfo::from).collect(),
-			amount: v.invoice.amount_milli_satoshis().map(Amount::from_msat_floor)
-				.unwrap_or(Amount::ZERO),
-			finished_at: v.finished_at,
+impl LightningReceiveInfo {
+	/// Render a triaged receive state, mirroring the send-side status.
+	#[allow(deprecated)] // populates deprecated compat fields kept for old clients
+	pub fn from_state(state: &LightningReceiveState) -> Self {
+		match state {
+			LightningReceiveState::InProgress(recv) => LightningReceiveInfo::from(recv),
+			LightningReceiveState::Settled(s) => LightningReceiveInfo {
+				payment_hash: s.payment_hash,
+				state: "settled".to_string(),
+				invoice: s.invoice.to_string(),
+				payment_preimage: Some(s.preimage),
+				amount: s.amount,
+				htlc_vtxo_ids: vec![],
+				settled_at: Some(s.settled_at),
+				preimage_revealed_at: None,
+				finished_at: Some(s.settled_at),
+				htlc_vtxos: vec![],
+			},
 		}
 	}
 }
@@ -394,49 +538,79 @@ impl From<bark::persist::models::LightningReceive> for LightningReceiveInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct LightningSendInfo {
-	/// The amount being sent
-	#[serde(rename = "amount_sat", with = "bitcoin::amount::serde::as_sat")]
-	#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
-	pub amount: Amount,
-	/// The payment hash linked to the lightning send
+	/// The payment hash of the outgoing lightning payment
 	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
 	pub payment_hash: PaymentHash,
-	/// The invoice string
-	pub invoice: String,
-	/// The payment preimage if the payment has completed successfully
+	/// Lifecycle phase of the send: `unknown`, `start`, `htlc-received`,
+	/// `payment-initiated`, `revocable-htlcs`, `revocation-stuck`, or `paid`.
+	pub state: String,
+	/// The invoice string, if known.
+	pub invoice: Option<String>,
+	/// The payment preimage, revealed once the payment succeeded.
 	#[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
 	pub preimage: Option<Preimage>,
-	/// The HTLC VTXOs used for the lightning send
-	#[cfg_attr(feature = "utoipa", schema(value_type = Vec<WalletVtxoInfo>))]
-	pub htlc_vtxos: Vec<WalletVtxoInfo>,
-	/// When the payment reached a terminal state (succeeded or failed)
-	#[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
-	pub finished_at: Option<chrono::DateTime<chrono::Local>>,
 }
 
-impl From<bark::persist::models::LightningSend> for LightningSendInfo {
-	fn from(v: bark::persist::models::LightningSend) -> Self {
-		LightningSendInfo {
-			payment_hash: v.invoice.payment_hash(),
-			invoice: v.invoice.to_string(),
-			htlc_vtxos: v.htlc_vtxos.into_iter()
-				.map(crate::primitives::WalletVtxoInfo::from).collect(),
-			amount: v.amount,
-			preimage: v.preimage,
-			finished_at: v.finished_at,
+impl LightningSendInfo {
+	/// Render a triaged send state, mirroring the receive-side status.
+	pub fn from_state(hash: PaymentHash, state: &LightningSendState) -> Self {
+		match state {
+			LightningSendState::Unknown => LightningSendInfo {
+				payment_hash: hash,
+				state: "unknown".to_string(),
+				invoice: None,
+				preimage: None,
+			},
+			LightningSendState::Paid(paid) => LightningSendInfo {
+				payment_hash: paid.payment_hash,
+				state: "paid".to_string(),
+				invoice: None,
+				preimage: Some(paid.preimage),
+			},
+			LightningSendState::InProgress(send) => {
+				let phase = match send.progress {
+					SendProgress::Start => "start",
+					SendProgress::HtlcReceived(_) => "htlc-received",
+					SendProgress::PaymentInitiated(_) => "payment-initiated",
+					SendProgress::RevocableHtlcs { .. } => "revocable-htlcs",
+					SendProgress::RevocationStuck { .. } => "revocation-stuck",
+				};
+				LightningSendInfo {
+					payment_hash: send.invoice.payment_hash(),
+					state: phase.to_string(),
+					invoice: Some(send.invoice.to_string()),
+					preimage: None,
+				}
+			},
 		}
 	}
 }
 
-/// Represents a lightning movement, either a send or receive
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(tag = "status", rename_all = "kebab-case")]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
-pub enum LightningMovement {
-	/// A lightning receive (incoming payment)
-	Receive(LightningReceiveInfo),
-	/// A lightning send (outgoing payment)
-	Send(LightningSendInfo),
+impl From<&LightningReceive> for LightningReceiveInfo {
+	#[allow(deprecated)] // populates deprecated compat fields kept for old clients
+	fn from(recv: &LightningReceive) -> Self {
+		let (state, htlc_vtxo_ids) = match &recv.progress {
+			ReceiveProgress::AwaitingPayment => ("awaiting-payment", vec![]),
+			ReceiveProgress::HtlcsReady(htlcs) => ("htlcs-ready", htlcs.vtxo_ids.clone()),
+			ReceiveProgress::PreimageRevealed(htlcs) => ("preimage-revealed", htlcs.vtxo_ids.clone()),
+			// The HTLCs are spent once the claim outputs await delivery.
+			ReceiveProgress::Delivering(_) => ("delivering", vec![]),
+		};
+		LightningReceiveInfo {
+			payment_hash: recv.payment_hash,
+			state: state.to_string(),
+			invoice: recv.invoice.to_string(),
+			payment_preimage: Some(recv.payment_preimage),
+			amount: recv.invoice.amount_milli_satoshis()
+				.map(Amount::from_msat_floor)
+				.expect("generated invoice with no amount"),
+			htlc_vtxo_ids,
+			settled_at: None,
+			preimage_revealed_at: None,
+			finished_at: None,
+			htlc_vtxos: vec![],
+		}
+	}
 }
 
 #[cfg(test)]
@@ -449,30 +623,97 @@ mod test {
 			"amount_sat": 1000,
 			"payment_hash": "0000000000000000000000000000000000000000000000000000000000000000",
 			"payment_preimage": "0000000000000000000000000000000000000000000000000000000000000000",
-			"preimage_revealed_at": null,
-			"finished_at": null,
+			"state": "awaiting-payment",
+			"settled_at": null,
 			"invoice": "lnbc1",
 		})
 	}
 
 	#[test]
-	fn deserialize_lightning_receive_htlc_vtxos_missing() {
+	fn deserialize_lightning_receive_htlc_vtxo_ids_missing() {
 		let json = lightning_receive_base_json();
 		serde_json::from_value::<LightningReceiveInfo>(json).unwrap();
 	}
 
 	#[test]
-	fn deserialize_lightning_receive_htlc_vtxos_null() {
+	fn deserialize_lightning_receive_htlc_vtxo_ids_null() {
 		let mut json = lightning_receive_base_json();
-		json["htlc_vtxos"] = serde_json::json!(null);
+		json["htlc_vtxo_ids"] = serde_json::json!(null);
 		serde_json::from_value::<LightningReceiveInfo>(json).unwrap();
 	}
 
 	#[test]
-	fn deserialize_lightning_receive_htlc_vtxos_empty() {
+	fn deserialize_lightning_receive_htlc_vtxo_ids_empty() {
 		let mut json = lightning_receive_base_json();
-		json["htlc_vtxos"] = serde_json::json!([]);
+		json["htlc_vtxo_ids"] = serde_json::json!([]);
 		serde_json::from_value::<LightningReceiveInfo>(json).unwrap();
+	}
+
+	#[allow(deprecated)]
+	fn ark_info_base() -> ArkInfo {
+		let pubkey = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+			.parse::<PublicKey>().unwrap();
+		ArkInfo {
+			network: bitcoin::Network::Regtest,
+			server_pubkey: pubkey,
+			mailbox_pubkey: pubkey,
+			round_interval: Duration::from_secs(60),
+			nb_round_nonces: 1,
+			vtxo_exit_delta: BlockDelta::new(12),
+			vtxo_lifetime: BlockDelta::new(100),
+			vtxo_expiry_delta: BlockDelta::new(100),
+			htlc_send_expiry_delta: BlockDelta::new(100),
+			htlc_expiry_delta: BlockDelta::new(6),
+			max_vtxo_amount: None,
+			required_board_confirmations: 3,
+			max_user_invoice_cltv_delta: BlockDelta::new(100),
+			min_board_amount: Amount::from_sat(1000),
+			offboard_feerate_sat_per_kvb: 1000,
+			ln_receive_anti_dos_required: false,
+			fees: ark::fees::FeeSchedule::default().into(),
+			max_vtxo_exit_depth: 10,
+			tos_link: None,
+			max_offboard_inputs: 4,
+		}
+	}
+
+	#[test]
+	#[allow(deprecated)]
+	fn ark_info_vtxo_lifetime_falls_back_to_deprecated_field() {
+		// Servers from before the rename only set vtxo_expiry_delta.
+		let mut json = serde_json::to_value(ark_info_base()).unwrap();
+		json.as_object_mut().unwrap().remove("vtxo_lifetime");
+		json["vtxo_expiry_delta"] = serde_json::json!(42);
+
+		let info = serde_json::from_value::<ArkInfo>(json).unwrap();
+		assert_eq!(info.vtxo_lifetime, BlockDelta::new(42));
+		assert_eq!(info.vtxo_expiry_delta, BlockDelta::new(42));
+	}
+
+	#[test]
+	#[allow(deprecated)]
+	fn ark_info_vtxo_lifetime_kept_in_sync() {
+		let mut json = serde_json::to_value(ark_info_base()).unwrap();
+		json["vtxo_lifetime"] = serde_json::json!(42);
+		json["vtxo_expiry_delta"] = serde_json::json!(42);
+
+		let info = serde_json::from_value::<ArkInfo>(json).unwrap();
+		assert_eq!(info.vtxo_lifetime, BlockDelta::new(42));
+		assert_eq!(info.vtxo_expiry_delta, BlockDelta::new(42));
+
+		// and both fields are populated again on the way out
+		let json = serde_json::to_value(&info).unwrap();
+		assert_eq!(json["vtxo_lifetime"], 42);
+		assert_eq!(json["vtxo_expiry_delta"], 42);
+	}
+
+	#[test]
+	fn ark_info_vtxo_lifetime_rejects_diverging_fields() {
+		let mut json = serde_json::to_value(ark_info_base()).unwrap();
+		json["vtxo_lifetime"] = serde_json::json!(42);
+		json["vtxo_expiry_delta"] = serde_json::json!(100);
+
+		assert!(serde_json::from_value::<ArkInfo>(json).is_err());
 	}
 
 	#[test]
@@ -489,6 +730,7 @@ mod test {
 				round_interval: j.round_interval,
 				nb_round_nonces: j.nb_round_nonces,
 				vtxo_exit_delta: j.vtxo_exit_delta,
+				vtxo_lifetime: j.vtxo_lifetime,
 				vtxo_expiry_delta: j.vtxo_expiry_delta,
 				htlc_send_expiry_delta: j.htlc_send_expiry_delta,
 				htlc_expiry_delta: j.htlc_expiry_delta,
@@ -500,6 +742,8 @@ mod test {
 				ln_receive_anti_dos_required: j.ln_receive_anti_dos_required,
 				fees: j.fees.into(),
 				max_vtxo_exit_depth: j.max_vtxo_exit_depth,
+				max_offboard_inputs: j.max_offboard_inputs,
+				tos_link: j.tos_link,
 			}
 		}
 	}

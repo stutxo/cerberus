@@ -13,7 +13,8 @@ use server::secret::Secret;
 
 use crate::constants::env::POSTGRES_BINS;
 use crate::daemon::{Daemon, DaemonHelper};
-use crate::util::resolve_path;
+use crate::ports::pick_port;
+use crate::util::{poll_interval, resolve_path};
 
 
 const LOCK_DIR: &str = "/tmp/ark-testing-postgres-locks";
@@ -142,7 +143,7 @@ impl DaemonHelper for PostgresHelper {
 	}
 
 	async fn make_reservations(&self) -> anyhow::Result<()> {
-		let db_port = portpicker::pick_unused_port().expect("No ports free");
+		let db_port = pick_port();
 
 		trace!("Reserved postgres port = {}", db_port);
 		*self.port.lock() = Some(db_port);
@@ -207,7 +208,7 @@ impl DaemonHelper for PostgresHelper {
 			if self.is_ready().await {
 				return Ok(());
 			}
-			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+			tokio::time::sleep(poll_interval()).await;
 		}
 	}
 }

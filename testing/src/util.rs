@@ -2,6 +2,7 @@
 use std::{env, fmt};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -11,7 +12,11 @@ use tokio::fs;
 use tokio::process::Child;
 use tokio::time::Instant;
 
-use crate::constants::env::{CHAIN_SOURCE, TEST_DIRECTORY, TX_PROPAGATION_TIMEOUT_MILLIS};
+use crate::constants::DEFAULT_POLL_INTERVAL;
+use crate::constants::env::{
+	BARK_DOUBLE_DRIVE_ACTIONS, CHAIN_SOURCE, TEST_DIRECTORY, TEST_POLL_INTERVAL_MS,
+	TX_PROPAGATION_TIMEOUT_MILLIS,
+};
 use crate::daemon::electrs::ElectrsType;
 
 pub enum TestContextChainSource {
@@ -50,6 +55,16 @@ pub fn init_logging() {
 		.filter_module("rustls", log::LevelFilter::Off)
 		.filter_module("tonic", log::LevelFilter::Off)
 		.filter_module("tokio_postgres", log::LevelFilter::Off)
+		.filter_module("h2", log::LevelFilter::Off)
+		.filter_module("tower", log::LevelFilter::Off)
+		.filter_module("hyper_util", log::LevelFilter::Off)
+		// Span enter/exit/drop from #[instrument] and trace_span! forward through
+		// the `tracing::span` / `tracing::span::active` targets rather than the
+		// module they were declared in, so the h2/tower module mutes above don't
+		// catch them. This is the flood that shows up as "[TRACE h2::… ] -> foo;"
+		// in nextest's stdout dumps: the module_path is h2's but the log target
+		// is `tracing::span::active`.
+		.filter_module("tracing::span", log::LevelFilter::Off)
 		.parse_env(env_logger::Env::new().filter("TEST_LOG"))
 		.format(|out, rec| {
 			let now = chrono::Local::now();
@@ -138,9 +153,17 @@ pub fn is_running(child: &mut Child) -> bool {
 	}
 }
 
-pub async fn wait_for_completion(child: &mut Child) -> () {
-	while is_running(child) {
-		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+/// Wait until the child exits, returning its exit status if we could read it.
+pub async fn wait_for_completion(child: &mut Child) -> Option<ExitStatus> {
+	loop {
+		match child.try_wait() {
+			Ok(Some(status)) => return Some(status),
+			Ok(None) => tokio::time::sleep(poll_interval()).await,
+			Err(err) => {
+				error!("Failed to get status of Child={:?}: {:?}", child, err);
+				return None;
+			},
+		}
 	}
 }
 
@@ -159,6 +182,28 @@ pub fn get_tx_propagation_timeout_millis() -> u64 {
 	} else {
 		30_000
 	}
+}
+
+/// The interval between attempts in poll loops.
+///
+/// Defaults to [DEFAULT_POLL_INTERVAL], can be overridden with the
+/// TEST_POLL_INTERVAL_MS env var.
+pub fn poll_interval() -> Duration {
+	if let Ok(interval) = env::var(TEST_POLL_INTERVAL_MS) {
+		Duration::from_millis(interval.parse::<u64>()
+			.expect(&format!("{} should be in milliseconds", TEST_POLL_INTERVAL_MS)))
+	} else {
+		DEFAULT_POLL_INTERVAL
+	}
+}
+
+/// How many times the wallet executor runs each action step: 2 under the
+/// reentrancy double-drive (`BARK_DOUBLE_DRIVE_ACTIONS`), 1 otherwise.
+///
+/// Tests that count per-step side effects (e.g. server RPCs seen by a proxy)
+/// must scale their expectations by this factor.
+pub fn action_drive_factor() -> usize {
+	if env::var_os(BARK_DOUBLE_DRIVE_ACTIONS).is_some() { 2 } else { 1 }
 }
 
 /// Extension trait for futures.
@@ -265,27 +310,29 @@ impl<T: Send> ReceiverExt<T> for tokio::sync::mpsc::UnboundedReceiver<T> {
 	}
 }
 
-/// A bark version that is either a semver version or DIRTY (an unreleased build).
+/// A bark version that is either a semver version or a dev (unreleased) build.
 ///
-/// DIRTY is considered greater than any semver version, so that version
-/// checks like `require_version >= "0.1.0-beta.8"` pass on dev builds.
+/// Dev builds report either "DIRTY" (older builds) or a version containing
+/// a "-dev" marker, e.g. "0.6.0-dev". Dev is considered greater than any
+/// semver version, so that version checks like
+/// `require_version >= "0.1.0-beta.8"` pass on dev builds.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum BarkVersion {
 	Release(Version),
-	Dirty,
+	Dev,
 }
 
 impl BarkVersion {
 	pub fn parse(s: &str) -> BarkVersion {
-		if s == "DIRTY" {
-			BarkVersion::Dirty
+		if s == "DIRTY" || s.contains("-dev") {
+			BarkVersion::Dev
 		} else {
 			BarkVersion::Release(Version::parse(s).expect("invalid semver version"))
 		}
 	}
 
-	pub fn is_dirty(&self) -> bool {
-		matches!(self, BarkVersion::Dirty)
+	pub fn is_dev(&self) -> bool {
+		matches!(self, BarkVersion::Dev)
 	}
 
 	pub fn is_release(&self) -> bool {
@@ -296,7 +343,7 @@ impl BarkVersion {
 impl fmt::Display for BarkVersion {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			BarkVersion::Dirty => write!(f, "DIRTY"),
+			BarkVersion::Dev => write!(f, "DEV"),
 			BarkVersion::Release(v) => write!(f, "{}", v),
 		}
 	}
@@ -305,9 +352,9 @@ impl fmt::Display for BarkVersion {
 impl Ord for BarkVersion {
 	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
 		match (self, other) {
-			(BarkVersion::Dirty, BarkVersion::Dirty) => std::cmp::Ordering::Equal,
-			(BarkVersion::Dirty, _) => std::cmp::Ordering::Greater,
-			(_, BarkVersion::Dirty) => std::cmp::Ordering::Less,
+			(BarkVersion::Dev, BarkVersion::Dev) => std::cmp::Ordering::Equal,
+			(BarkVersion::Dev, _) => std::cmp::Ordering::Greater,
+			(_, BarkVersion::Dev) => std::cmp::Ordering::Less,
 			(BarkVersion::Release(a), BarkVersion::Release(b)) => a.cmp(b),
 		}
 	}

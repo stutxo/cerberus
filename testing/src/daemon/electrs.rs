@@ -1,6 +1,6 @@
 use std::fmt;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bdk_esplora::esplora_client::{AsyncClient, Builder};
 use bitcoin::{Network, Transaction, Txid};
@@ -12,9 +12,9 @@ use bark::chain::ChainSourceSpec;
 
 use crate::constants::bitcoind::{BITCOINRPC_TEST_PASSWORD, BITCOINRPC_TEST_USER};
 use crate::constants::env::{ESPLORA_ELECTRS_EXEC, MEMPOOL_ELECTRS_EXEC};
-use crate::constants::TX_PROPAGATION_SLEEP_TIME;
 use crate::daemon::{Daemon, DaemonHelper};
-use crate::util::{get_tx_propagation_timeout_millis, resolve_path};
+use crate::ports::pick_port;
+use crate::util::{get_tx_propagation_timeout_millis, poll_interval, resolve_path};
 
 #[derive(Clone, Copy)]
 pub enum ElectrsType {
@@ -104,7 +104,7 @@ impl Electrs {
 			if let Ok(Some(result)) = client.get_tx(&txid).await {
 				return result;
 			} else {
-				tokio::time::sleep(TX_PROPAGATION_SLEEP_TIME).await;
+				tokio::time::sleep(poll_interval()).await;
 			}
 		}
 		panic!("Failed to get raw transaction: {}", txid);
@@ -155,7 +155,7 @@ impl Electrs {
 					return;
 				}
 			}
-			tokio::time::sleep(Duration::from_millis(100)).await;
+			tokio::time::sleep(poll_interval()).await;
 		}
 		panic!("Electrs tip_height metric did not reach {} after 10s", height);
 	}
@@ -174,6 +174,7 @@ pub struct ElectrsConfig {
 	pub bitcoin_zmq_port: u16,
 	pub bitcoin_dir: PathBuf,
 	pub electrs_dir: PathBuf,
+	pub cors: Option<String>,
 }
 
 pub struct ElectrsHelper {
@@ -229,9 +230,9 @@ impl DaemonHelper for ElectrsHelper {
 	}
 
 	async fn make_reservations(&self) -> anyhow::Result<()> {
-		let rest_port = portpicker::pick_unused_port().expect("No ports free");
-		let electrum_port = portpicker::pick_unused_port().expect("No ports free");
-		let monitoring_port = portpicker::pick_unused_port().expect("No ports free");
+		let rest_port = pick_port();
+		let electrum_port = pick_port();
+		let monitoring_port = pick_port();
 
 		trace!("Reserved electrs ports = {}, {} and {}", rest_port, electrum_port, monitoring_port);
 		let mut state = self.state.lock();
@@ -275,6 +276,10 @@ impl DaemonHelper for ElectrsHelper {
 			]);
 		}
 
+		if let Some(ref cors) = self.config.cors {
+			cmd.args(["--cors", cors]);
+		}
+
 		Ok(cmd)
 	}
 
@@ -283,7 +288,7 @@ impl DaemonHelper for ElectrsHelper {
 			if self.is_ready().await {
 				return Ok(());
 			}
-			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+			tokio::time::sleep(poll_interval()).await;
 		}
 	}
 }

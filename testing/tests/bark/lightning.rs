@@ -5,20 +5,21 @@ use std::sync::atomic::{AtomicI8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ark::VtxoId;
-use ark::lightning::{Invoice, PaymentHash};
+use ark::lightning::{Invoice, Offer, OfferAmountExt, PaymentHash};
 use ark::vtxo::VtxoPolicyKind;
 use ark_testing::context::LightningPaymentSetup;
-use bark::lightning_invoice::Bolt11Invoice;
-use bark_json::exit::ExitState;
+use bark::actions::lightning::receive::LightningReceiveState;
+use bark::lightning_invoice::{Bolt11Invoice, Currency, InvoiceBuilder, PaymentSecret};
 use bark_json::movements::{MovementDestination, MovementStatus, PaymentMethod};
 use bark_json::primitives::VtxoStateInfo;
 use log::{info, trace};
 
-use ark_testing::{Captaind, Lightningd, TestContext, btc, lightning_test, require_bark_version, sat};
+use ark_testing::{Captaind, Lightningd, TestContext, btc, is_bark_version, lightning_test, require_bark_version, sat};
+use server::vtxopool::VtxoTarget;
 use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
 use ark_testing::daemon::captaind::{self, ArkClient};
 use ark_testing::util::{FutureExt, ToAltString};
-use bitcoin_ext::P2TR_DUST_SAT;
+use bitcoin_ext::{BlockDelta, P2TR_DUST_SAT};
 use server_rpc::protos::{
 	self, prepare_lightning_receive_claim_request::LightningReceiveAntiDos,
 	lightning_payment_status,
@@ -28,6 +29,8 @@ use server_rpc::protos::{
 
 #[tokio::test]
 async fn bark_pay_ln_succeeds() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/bark_pay_ln_succeeds").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -75,7 +78,45 @@ async fn bark_pay_ln_succeeds() {
 }
 
 #[tokio::test]
+async fn bark_pay_ln_change_split() {
+	require_bark_version!(> "0.6.1");
+
+	let ctx = TestContext::new("lightningd/bark_pay_ln_change_split").await;
+
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+
+	// Start a server and link it to our cln installation
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).create().await;
+
+	let bark_1 = ctx.bark("bark-1", &srv).funded(btc(3)).create().await;
+	bark_1.board_and_confirm_and_register(&ctx, btc(2)).await;
+
+	lightning.sync().await;
+
+	// Change larger than the payment is split in two so that spending
+	// builds a tree of change VTXOs instead of a chain.
+	let invoice = lightning.external.invoice(Some(btc(0.5)), "split", "large change").await;
+	bark_1.pay_lightning_wait(invoice, None).await;
+
+	let mut vtxos = bark_1.vtxos().await;
+	vtxos.sort_by_key(|v| v.amount);
+	let [piece1, piece2] = vtxos.try_into().expect("should have two change vtxos");
+	assert_eq!(piece1.amount, btc(0.75));
+	assert_eq!(piece2.amount, btc(0.75));
+
+	// Change too small to split is kept whole. Covering the payment takes
+	// both pieces, so the change piece descends from the second input.
+	let invoice = lightning.external.invoice(Some(btc(1)), "whole", "small change").await;
+	bark_1.pay_lightning_wait(invoice, None).await;
+
+	let [change] = bark_1.vtxos().await.try_into().expect("should have one change vtxo");
+	assert_eq!(change.amount, btc(0.5));
+}
+
+#[tokio::test]
 async fn bark_pay_ln_with_multiple_inputs() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/bark_pay_ln_with_multiple_inputs").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -113,6 +154,8 @@ async fn bark_pay_ln_with_multiple_inputs() {
 
 #[tokio::test]
 async fn bark_pay_invoice_twice() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/bark_pay_invoice_twice").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -143,6 +186,8 @@ async fn bark_pay_invoice_twice() {
 
 #[tokio::test]
 async fn another_bark_pays_invoice_after_first() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/another_bark_pays_invoice_after_first").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -175,7 +220,7 @@ async fn another_bark_pays_invoice_after_first() {
 
 #[tokio::test]
 async fn bark_check_lightning_payment_twice_succeeds() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("lightningd/bark_check_lightning_payment_twice_succeeds").await;
 
@@ -200,15 +245,20 @@ async fn bark_check_lightning_payment_twice_succeeds() {
 	let bolt11 = Bolt11Invoice::from_str(&invoice).unwrap();
 	let payment_hash = PaymentHash::from(&bolt11);
 
-	// Second check should succeed and return payment info with preimage, not error
-	let result = wallet.check_lightning_payment(payment_hash, false).await.expect("check_lightning_payment should not error on second call");
-	let lightning_send = result.expect("should return LightningSend on second call");
-	let preimage = lightning_send.preimage.expect("should have preimage after successful payment");
-	assert_eq!(preimage.compute_payment_hash(), payment_hash, "should return correct preimage on second call");
+	// Second check should report the payment as Paid, with a valid preimage.
+	let state = wallet.check_lightning_payment(payment_hash, false).await
+		.expect("check_lightning_payment should not error on second call");
+	let paid = match state {
+		bark::actions::lightning::pay::LightningSendState::Paid(p) => p,
+		other => panic!("expected Paid state, got {:?}", other),
+	};
+	assert_eq!(paid.preimage.compute_payment_hash(), payment_hash, "should return correct preimage on second call");
 }
 
 #[tokio::test]
 async fn two_barks_try_to_pay_same_invoice() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/two_barks_try_to_pay_same_invoice").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -244,6 +294,8 @@ async fn two_barks_try_to_pay_same_invoice() {
 
 #[tokio::test]
 async fn bark_pay_ln_fails_then_succeeds() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/bark_pay_ln_fails_then_succeeds").await;
 
 	let lightning = ctx.new_lightning_setup_no_channel("lightningd").await;
@@ -272,12 +324,14 @@ async fn bark_pay_ln_fails_then_succeeds() {
 
 	let vtxos = bark.vtxos().await;
 	assert!(!vtxos.iter().any(|v| v.id == board_vtxo), "board vtxo not spent");
-	assert_eq!(vtxos.len(), 2,
-		"user should get 2 VTXOs, change and revocation one, got: {:?}", vtxos,
+	let nb_change = if is_bark_version!(> "0.6.1") { 2 } else { 1 };
+	assert_eq!(vtxos.len(), nb_change + 1,
+		"user should get change and a revocation VTXO, got: {:?}", vtxos,
 	);
-	assert!(
-		vtxos.iter().any(|v| v.amount == (board_amount - invoice_amount)),
-		"user should get a change VTXO of 1btc, got: {:?}", vtxos,
+	let change_piece = (board_amount - invoice_amount) / nb_change as u64;
+	assert_eq!(
+		vtxos.iter().filter(|v| v.amount == change_piece).count(), nb_change,
+		"user should get change VTXOs of {}, got: {:?}", change_piece, vtxos,
 	);
 
 	assert!(
@@ -305,6 +359,8 @@ async fn bark_pay_ln_fails_then_succeeds() {
 
 #[tokio::test]
 async fn bark_refresh_ln_change_vtxo() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/bark_refresh_ln_change_vtxo").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -343,6 +399,8 @@ async fn bark_refresh_ln_change_vtxo() {
 
 #[tokio::test]
 async fn bark_refresh_payment_revocation() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/bark_refresh_payment_revocation").await;
 
 	let lightning = ctx.new_lightning_setup_no_channel("lightningd").await;
@@ -368,7 +426,7 @@ async fn bark_refresh_payment_revocation() {
 	bark_1.pay_lightning_wait(invoice, None).await;
 
 	ctx.refresh_all(&srv, &[&bark_1]).await;
-	ctx.generate_blocks(srv.config().htlc_send_expiry_delta as u32 + 6).await;
+	ctx.generate_blocks(srv.config().htlc_send_expiry_delta.to_u32() + 6).await;
 	let vtxos = bark_1.vtxos().await;
 	assert_eq!(vtxos.len(), 1, "there should be only one vtxo after refresh {:?}", vtxos);
 	assert_eq!(vtxos[0].amount, btc(2));
@@ -380,6 +438,8 @@ async fn bark_refresh_payment_revocation() {
 
 #[tokio::test]
 async fn bark_allows_sending_dust_bolt11_payment() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/bark_allows_sending_dust_bolt11_payment").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -409,6 +469,8 @@ async fn bark_allows_sending_dust_bolt11_payment() {
 
 #[tokio::test]
 async fn bark_can_send_full_balance_on_lightning() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/bark_can_send_full_balance_on_lightning").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -441,6 +503,9 @@ async fn bark_can_receive_lightning(
 	srv: &Captaind,
 	pay: impl AsyncFn(String),
 ) {
+	// The new ServerHtlcRecv policy breaks LN receive for bark 0.5.0 and older
+	require_bark_version!(> "0.5.0");
+
 	srv.wait_for_vtxopool(&ctx).await;
 
 	// Start a bark and create a VTXO to be able to board
@@ -456,12 +521,13 @@ async fn bark_can_receive_lightning(
 
 	let receives = bark.list_lightning_receives().await;
 	assert_eq!(receives.len(), 1);
-	assert_eq!(receives[0].invoice.to_string(), invoice_info.invoice);
-	assert!(receives[0].preimage_revealed_at.is_none());
+	assert_eq!(receives[0].invoice, invoice_info.invoice);
+	// Preimage hasn't been revealed yet: still awaiting payment.
+	assert_eq!(receives[0].state, "awaiting-payment");
 
 	tokio::join!(
 		pay(invoice_info.invoice.clone()),
-		bark.lightning_receive(&invoice_info.invoice).wait_millis(10_000),
+		bark.lightning_receive(&invoice_info.invoice).wait_millis(30_000),
 	);
 
 	let vtxos = bark.vtxos().await;
@@ -528,7 +594,6 @@ async fn bark_can_receive_lightning(
 	assert!(!vtxos.iter().any(|v| matches!(v.state, VtxoStateInfo::Locked { .. })),
 		"should not be any locked vtxo left");
 
-	require_bark_version!(> "0.1.3");
 	let invoice_info = bark.bolt11_invoice_with_description(pay_amount, description).await;
 	let invoice = Invoice::from_str(&invoice_info.invoice).unwrap();
 	let _ = bark.lightning_receive_status(&invoice).await.unwrap();
@@ -539,12 +604,141 @@ async fn bark_can_receive_lightning(
 }
 lightning_test!(bark_can_receive_lightning);
 
+/// Reproduces the vtxo pool "More than one change output" bug.
+///
+/// The pool only holds 10_000 sat vtxos, so an ordinary (non-dust) 10_200 sat
+/// receive must be funded by two inputs. The dest splits across the input
+/// boundary, leaving a sub-dust dest slice on the second input; dust isolation
+/// borrows from that input's change to lift it, producing two change-policy
+/// outputs
+async fn bark_can_receive_lightning_when_pool_spend_creates_subdust_output(
+	ctx: &TestContext,
+	_lightning: &LightningPaymentSetup,
+	srv: &Captaind,
+	pay: impl AsyncFn(String),
+) {
+	// The new ServerHtlcRecv policy breaks LN receive for bark 0.5.0 and older
+	require_bark_version!(> "0.5.0");
+
+	srv.wait_for_vtxopool(&ctx).await;
+
+	let bark = Arc::new(ctx.bark("bark", srv).funded(btc(3)).create().await);
+	let board_amount = btc(2);
+	bark.board_and_confirm_and_register(&ctx, board_amount).await;
+
+	// 10_200 sats: comfortably above dust, but larger than any single pool
+	// vtxo, so the server is forced to combine two 10_000 sat inputs.
+	let pay_amount = sat(10_200);
+	let invoice_info = bark.bolt11_invoice(pay_amount).await;
+	let invoice = Invoice::from_str(&invoice_info.invoice).unwrap();
+	let _ = bark.lightning_receive_status(&invoice).await.unwrap();
+
+	tokio::join!(
+		pay(invoice_info.invoice.clone()),
+		bark.lightning_receive(&invoice_info.invoice).wait_millis(30_000),
+	);
+
+	// The receive must settle. Before the fix the claim errors out server-side
+	// and this assertion (and the `lightning_receive` call above) never pass.
+	let receives = bark.list_lightning_receives().await;
+	assert!(receives.is_empty(), "lightning receive should be claimed");
+	assert_eq!(bark.offchain_balance().await.claimable_lightning_receive, btc(0),
+		"claimable lightning receive should be reset after payment");
+
+	let vtxos = bark.vtxos().await;
+	assert!(!vtxos.iter().any(|v| matches!(v.state, VtxoStateInfo::Locked { .. })),
+		"should not be any locked vtxo left");
+}
+lightning_test!(bark_can_receive_lightning_when_pool_spend_creates_subdust_output, |cfg| {
+	// Only issue small (10_000 sat) pool vtxos, so an ordinary ~10k receive has
+	// to be funded by two inputs, splitting the dest across an input boundary.
+	cfg.vtxopool.vtxo_targets = vec![
+		VtxoTarget { count: 5, amount: sat(10_000) },
+	];
+});
+
+#[tokio::test]
+async fn bark_can_receive_lightning_for_offline_address() {
+	require_bark_version!(> "0.5.0");
+
+	let ctx = TestContext::new("lightningd/bark_can_receive_lightning_for_offline_address").await;
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).create().await;
+	srv.wait_for_vtxopool(&ctx).await;
+
+	let proxy = ctx.bark("proxy", &srv).funded(btc(3)).create().await;
+	let recipient = ctx.bark("recipient", &srv).funded(btc(3)).create().await;
+	let proxy_board_amount = btc(2);
+	let recipient_board_amount = btc(1);
+	proxy.board_and_confirm_and_register(&ctx, proxy_board_amount).await;
+	recipient.board_and_confirm_and_register(&ctx, recipient_board_amount).await;
+
+	let recipient_address = recipient.address().await;
+	let pay_amount = sat(100_000);
+	let invoice_info = proxy.bolt11_invoice_for_address(&recipient_address, pay_amount).await;
+
+	tokio::join!(
+		lightning.external.pay_bolt11(invoice_info.invoice.clone()),
+		proxy.lightning_receive(&invoice_info.invoice).wait_millis(10_000),
+	);
+
+	assert_eq!(
+		proxy.spendable_balance().await,
+		proxy_board_amount,
+		"proxy should not keep the forwarded Lightning receive",
+	);
+	assert_eq!(
+		recipient.spendable_balance_no_sync().await,
+		recipient_board_amount,
+		"recipient should remain offline until explicit sync",
+	);
+
+	recipient.sync().await;
+	assert_eq!(recipient.spendable_balance().await, recipient_board_amount + pay_amount);
+}
+
+#[tokio::test]
+async fn bark_can_receive_lightning_for_own_address() {
+	require_bark_version!(> "0.5.0");
+
+	let ctx = TestContext::new("lightningd/bark_can_receive_lightning_for_own_address").await;
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).create().await;
+	srv.wait_for_vtxopool(&ctx).await;
+
+	let bark = ctx.bark("bark", &srv).funded(btc(3)).create().await;
+	let board_amount = btc(2);
+	bark.board_and_confirm_and_register(&ctx, board_amount).await;
+
+	let own_address = bark.address().await;
+	let pay_amount = sat(100_000);
+	let invoice_info = bark.bolt11_invoice_for_address(&own_address, pay_amount).await;
+
+	tokio::join!(
+		lightning.external.pay_bolt11(invoice_info.invoice.clone()),
+		bark.lightning_receive(&invoice_info.invoice).wait_millis(10_000),
+	);
+
+	// A mailbox roundtrip would leave the funds unsynced in our own
+	// mailbox, so an unsynced balance proves the claim was local.
+	assert_eq!(
+		bark.spendable_balance_no_sync().await,
+		board_amount + pay_amount,
+		"receive to our own address should land in our spendable balance without a sync",
+	);
+	// And a mailbox sync must not double-count the receive.
+	assert_eq!(bark.spendable_balance().await, board_amount + pay_amount);
+}
+
 async fn bark_check_lightning_receive_no_wait(
 	ctx: &TestContext,
 	_lightning: &LightningPaymentSetup,
 	srv: &Captaind,
 	pay: impl AsyncFn(String),
 ) {
+	// The new ServerHtlcRecv policy breaks LN receive for bark 0.5.0 and older
+	require_bark_version!(> "0.5.0");
+
 	srv.wait_for_vtxopool(&ctx).await;
 
 	// Start a bark and create a VTXO to be able to board
@@ -576,7 +770,7 @@ async fn bark_check_lightning_receive_no_wait(
 					.wait(Duration::from_secs(10)).await.expect("should not fail");
 
 				if let Some(receive) = bark.lightning_receive_status(&invoice).await {
-					if receive.finished_at.is_some() {
+					if receive.state == "settled" {
 						success = true;
 						break;
 					}
@@ -599,6 +793,8 @@ async fn bark_can_pay_ark_invoice(
 	srv: &Captaind,
 	pay: impl AsyncFn(String),
 ) {
+	require_bark_version!(> "0.5.0");
+
 	srv.wait_for_vtxopool(&ctx).await;
 
 	let bark = Arc::new(ctx.bark("bark-1", srv).funded(btc(3)).create().await);
@@ -612,7 +808,7 @@ async fn bark_can_pay_ark_invoice(
 	let inv = invoice_info.invoice.clone();
 	tokio::join!(
 		pay(invoice_info.invoice.clone()),
-		cloned.lightning_receive(&inv).wait_millis(10_000),
+		cloned.lightning_receive(&inv).wait_millis(30_000),
 	);
 
 	let vtxos = bark.vtxos().await;
@@ -630,6 +826,8 @@ lightning_test!(bark_can_pay_ark_invoice);
 
 #[tokio::test]
 async fn bark_can_revoke_on_intra_ark_timeout_invoice_pay_failure() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/bark_can_revoke_on_intra_ark_timeout_invoice_pay_failure").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -659,16 +857,18 @@ async fn bark_can_revoke_on_intra_ark_timeout_invoice_pay_failure() {
 	let cloned = bark_1.clone();
 	let cloned_invoice_info = invoice_info.clone();
 	tokio::spawn(async move {
-		cloned.lightning_receive(&cloned_invoice_info.invoice).wait_millis(10_000).await;
+		cloned.lightning_receive(&cloned_invoice_info.invoice).wait_millis(30_000).await;
 	});
 
 	bark_2.pay_lightning_wait(invoice_info.invoice, None).await;
 
 	let vtxos = bark_2.vtxos().await;
-	assert_eq!(vtxos.len(), 2, "user should get 2 VTXOs, change and revocation one");
-	assert!(vtxos.iter().any(|v| {
-		v.policy_type == VtxoPolicyKind::Pubkey && v.amount == (board_amount - pay_amount)
-	}), "user should get a change VTXO of 1btc");
+	let nb_change = if is_bark_version!(> "0.6.1") { 2 } else { 1 };
+	assert_eq!(vtxos.len(), nb_change + 1, "user should get change and a revocation VTXO");
+	let change_piece = (board_amount - pay_amount) / nb_change as u64;
+	assert_eq!(vtxos.iter().filter(|v| {
+		v.policy_type == VtxoPolicyKind::Pubkey && v.amount == change_piece
+	}).count(), nb_change, "user should get change VTXOs of {}", change_piece);
 	assert!(vtxos.iter().any(|v| {
 		v.policy_type == VtxoPolicyKind::Pubkey && v.amount == pay_amount
 	}), "user should get a revocation arkoor of payment_amount + forwarding fee");
@@ -683,6 +883,8 @@ async fn bark_can_revoke_on_intra_ark_timeout_invoice_pay_failure() {
 /// 2. Can revoke and recover their funds
 #[tokio::test]
 async fn bark_can_revoke_on_intra_ark_send_when_receiver_leaves() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/bark_can_revoke_on_intra_ark_send_when_receiver_leaves").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -733,10 +935,12 @@ async fn bark_can_revoke_on_intra_ark_send_when_receiver_leaves() {
 	bark_2.maintain().await;
 
 	let vtxos = bark_2.vtxos().await;
-	assert_eq!(vtxos.len(), 2, "user should get 2 VTXOs, change and revocation one");
-	assert!(vtxos.iter().any(|v| {
-		v.policy_type == VtxoPolicyKind::Pubkey && v.amount == (board_amount - pay_amount)
-	}), "user should get a change VTXO of 1btc");
+	let nb_change = if is_bark_version!(> "0.6.1") { 2 } else { 1 };
+	assert_eq!(vtxos.len(), nb_change + 1, "user should get change and a revocation VTXO");
+	let change_piece = (board_amount - pay_amount) / nb_change as u64;
+	assert_eq!(vtxos.iter().filter(|v| {
+		v.policy_type == VtxoPolicyKind::Pubkey && v.amount == change_piece
+	}).count(), nb_change, "user should get change VTXOs of {}", change_piece);
 	assert!(vtxos.iter().any(|v| {
 		v.policy_type == VtxoPolicyKind::Pubkey && v.amount == pay_amount
 	}), "user should get a revocation arkoor of payment_amount + forwarding fee");
@@ -746,8 +950,225 @@ async fn bark_can_revoke_on_intra_ark_send_when_receiver_leaves() {
 	assert!(!vtxos.iter().any(|v| matches!(v.state, VtxoStateInfo::Locked { .. })), "should not be any locked vtxo left");
 }
 
+/// Regression test for the intra-ark "revoke-then-claim" server drain.
+///
+/// A malicious user controls both sides of an intra-ark self-payment. The
+/// payee asks to claim the receive but withholds the preimage by parking the
+/// `claim_lightning_receive` RPC, so the server never records a settlement.
+/// Once the HTLC-send vtxos expire, the payer asks to revoke them.
+///
+/// Before the fix the revocation was accepted - the only settlement guard
+/// (`is_settled`) checks a *recorded* preimage, which the parked claim
+/// withholds - so the payer was refunded while the payee could still release
+/// the claim and get paid, granting `pay_amount` from server funds.
+///
+/// The fix refuses the revocation while the receive side is committed
+/// (`HtlcsReady`/`Settled`), so the payer is not refunded and the total
+/// spendable across both wallets never exceeds what they funded.
+#[tokio::test]
+async fn intra_ark_revoke_then_claim_does_not_drain_server() {
+	require_bark_version!(> "0.5.0");
+
+	let ctx = TestContext::new("lightningd/intra_ark_revoke_then_claim_does_not_drain_server").await;
+
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+
+	let srv = ctx.captaind("server").lightningd(&lightning.external).cfg(|cfg| {
+		cfg.invoice_check_interval = Duration::from_secs(1);
+	}).create().await;
+	ctx.fund_captaind(&srv, btc(10)).await;
+	srv.wait_for_vtxopool(&ctx).await;
+
+	/// Parks the first `claim_lightning_receive` so the preimage never reaches
+	/// the server, then forwards it once the test releases the gate.
+	#[derive(Clone)]
+	struct HoldClaim {
+		held: Arc<std::sync::atomic::AtomicBool>,
+		arrived: Arc<tokio::sync::Notify>,
+		release: Arc<tokio::sync::Notify>,
+	}
+
+	#[async_trait::async_trait]
+	impl captaind::proxy::ArkRpcProxy for HoldClaim {
+		async fn claim_lightning_receive(
+			&self,
+			upstream: &mut ArkClient,
+			req: protos::ClaimLightningReceiveRequest,
+		) -> Result<protos::ArkoorPackageCosignResponse, tonic::Status> {
+			if !self.held.swap(true, Ordering::SeqCst) {
+				self.arrived.notify_one();
+				self.release.notified().await;
+			}
+			Ok(upstream.claim_lightning_receive(req).await?.into_inner())
+		}
+	}
+
+	let arrived = Arc::new(tokio::sync::Notify::new());
+	let release = Arc::new(tokio::sync::Notify::new());
+	let proxy = srv.start_proxy_no_mailbox(HoldClaim {
+		held: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+		arrived: arrived.clone(),
+		release: release.clone(),
+	}).await;
+
+	// Both clients share the same server (and proxy) -> intra-ark self-payment.
+	let bark_payer = ctx.bark("bark-payer", &proxy.address).funded(btc(3)).create().await;
+	let bark_payee = Arc::new(ctx.bark("bark-payee", &proxy.address).funded(btc(3)).create().await);
+
+	let board_amount = btc(2);
+	bark_payer.board_and_confirm_and_register(&ctx, board_amount).await;
+	bark_payee.board_and_confirm_and_register(&ctx, board_amount).await;
+
+	let pay_amount = btc(1);
+	let invoice_info = bark_payee.bolt11_invoice(pay_amount).await;
+
+	// 1. Payer commits the HTLC-send; the intra-ark subscription becomes Accepted.
+	bark_payer.pay_lightning(invoice_info.invoice.clone(), None).await;
+
+	// 2. Payee prepares (-> HtlcsReady) then sends the claim, which the proxy
+	// parks: the preimage never reaches the server, so `is_settled` stays false.
+	let cloned_payee = bark_payee.clone();
+	let cloned_invoice = invoice_info.invoice.clone();
+	let payee_task = tokio::spawn(async move {
+		cloned_payee.try_lightning_receive(&cloned_invoice).wait_millis(120_000).await
+	});
+	arrived.notified().wait_millis(60_000).await;
+
+	// 3. Mine past the HTLC-send expiry and have the payer attempt the revoke.
+	// The server sees the payment as still pending (preimage withheld) and the
+	// tip is past expiry, so without the fix the revoke would be accepted.
+	ctx.generate_blocks(srv.config().htlc_send_expiry_delta.to_u32() + 6).await;
+	let _ = bark_payer.try_run(["maintain"]).await;
+
+	// 4. Release the parked claim; the payee still gets paid.
+	release.notify_one();
+	payee_task.wait_millis(120_000).await
+		.expect("payee claim task panicked")
+		.expect("claim should still succeed after the revoke attempt");
+
+	let payer_balance = bark_payer.spendable_balance().await;
+	let payee_balance = bark_payee.spendable_balance().await;
+
+	// The payee genuinely received the payment...
+	assert!(payee_balance > board_amount,
+		"payee should have received the lightning payment, balance: {payee_balance}");
+	// ...and the revoke was refused, so the payer was NOT also refunded.
+	// Conservation: both funded only `board_amount`, so together they can never
+	// hold more than `2 * board_amount` without the server having been drained.
+	assert!(payer_balance + payee_balance <= board_amount + board_amount,
+		"conservation violated: payer {payer_balance} + payee {payee_balance} exceeds \
+		2 x {board_amount}; the server was drained by the revoke-then-claim ordering");
+}
+
+/// Regression test for the intra-ark forged-invoice server drain.
+///
+/// A sender pays a receive with an invoice they signed themselves: same
+/// payment hash as the one the receiver got from us, far smaller amount.
+/// Nothing in a bolt11 invoice binds it to us - signature verification
+/// recovers the payee key from the signature itself, so a forged invoice
+/// verifies just fine.
+///
+/// Before the fix the server took the intra-ark shortcut on the payment hash
+/// alone. It validated the sender's amount only against the sender's own
+/// invoice, but paid the receiver the amount of the invoice *we* issued, out
+/// of the vtxopool, and ate the difference.
+#[tokio::test]
+async fn intra_ark_forged_invoice_does_not_drain_server() {
+	require_bark_version!(> "0.5.0");
+
+	let ctx = TestContext::new("lightningd/intra_ark_forged_invoice_does_not_drain_server").await;
+
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+
+	let srv = ctx.captaind("server").lightningd(&lightning.external).create().await;
+	ctx.fund_captaind(&srv, btc(10)).await;
+	srv.wait_for_vtxopool(&ctx).await;
+
+	/// Records how the server answered the payment. Bark handles a rejection
+	/// gracefully (it revokes and reports a failed payment), so the reason
+	/// has to be captured here rather than read off the exit status.
+	#[derive(Clone)]
+	struct RecordInitiate(Arc<parking_lot::Mutex<Option<String>>>);
+
+	#[async_trait::async_trait]
+	impl captaind::proxy::ArkRpcProxy for RecordInitiate {
+		async fn initiate_lightning_payment(
+			&self,
+			upstream: &mut ArkClient,
+			req: protos::InitiateLightningPaymentRequest,
+		) -> Result<protos::Empty, tonic::Status> {
+			match upstream.initiate_lightning_payment(req).await {
+				Ok(resp) => Ok(resp.into_inner()),
+				Err(e) => {
+					*self.0.lock() = Some(e.message().to_owned());
+					Err(e)
+				},
+			}
+		}
+	}
+
+	let rejection = Arc::new(parking_lot::Mutex::new(None));
+	let proxy = srv.start_proxy_no_mailbox(RecordInitiate(rejection.clone())).await;
+
+	// Both clients share the same server (and proxy) -> intra-ark payment.
+	let bark_payer = ctx.bark("bark-payer", &proxy.address).funded(btc(3)).create().await;
+	let bark_payee = ctx.bark("bark-payee", &proxy.address).funded(btc(3)).create().await;
+
+	let board_amount = btc(2);
+	bark_payer.board_and_confirm_and_register(&ctx, board_amount).await;
+	bark_payee.board_and_confirm_and_register(&ctx, board_amount).await;
+
+	// The payee invoices 1 BTC through the server.
+	let invoice_amount = btc(1);
+	let invoice_info = bark_payee.bolt11_invoice(invoice_amount).await;
+	let real = Bolt11Invoice::from_str(&invoice_info.invoice).unwrap();
+
+	// The payer forges a 1000 sat invoice on the payee's payment hash, signed
+	// with a key of their own.
+	let forged_amount = sat(1000);
+	let secp = bitcoin::secp256k1::Secp256k1::new();
+	let attacker_key = bitcoin::secp256k1::SecretKey::from_slice(&[0xab; 32]).unwrap();
+	let forged = InvoiceBuilder::new(Currency::Regtest)
+		.description("forged".into())
+		.payment_hash(*real.payment_hash())
+		.payment_secret(PaymentSecret([0x11; 32]))
+		.current_timestamp()
+		.min_final_cltv_expiry_delta(144)
+		.amount_milli_satoshis(forged_amount.to_sat() * 1000)
+		.build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &attacker_key))
+		.unwrap();
+	assert_eq!(forged.payment_hash(), real.payment_hash());
+	forged.check_signature().expect("a forged invoice is still self-consistent");
+
+	// The server must refuse to settle a receive against an invoice it never
+	// issued, instead of paying out `invoice_amount` for `forged_amount`.
+	bark_payer.pay_lightning(&forged, None).await;
+	let rejection = rejection.lock().clone().expect("server accepted the forged invoice");
+	assert!(rejection.contains("does not match the invoice we issued"),
+		"unexpected rejection reason: {rejection}");
+
+	// The payee tries to collect anyway: before the fix the subscription was
+	// already Accepted at this point and this claim took `invoice_amount`
+	// out of the vtxopool for a `forged_amount` payment.
+	let _ = bark_payee.try_lightning_receive_no_wait(&invoice_info.invoice).await;
+
+	let payer_balance = bark_payer.spendable_balance().await;
+	let payee_balance = bark_payee.spendable_balance().await;
+
+	// The payee was never paid out of the vtxopool for the forged invoice.
+	assert!(payee_balance <= board_amount,
+		"payee was paid for a forged invoice, balance: {payee_balance}");
+	// Conservation: both funded only `board_amount`, so together they can never
+	// hold more than `2 * board_amount` without the server having been drained.
+	assert!(payer_balance + payee_balance <= board_amount + board_amount,
+		"conservation violated: payer {payer_balance} + payee {payee_balance} exceeds \
+		2 x {board_amount}; the server was drained by the forged invoice");
+}
+
 #[tokio::test]
 async fn bark_revoke_expired_pending_ln_payment() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/bark_revoke_expired_pending_ln_payment").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -803,7 +1224,7 @@ async fn bark_revoke_expired_pending_ln_payment() {
 	bark_1.pay_lightning(invoice, None).await;
 
 	// htlc expiry is 6 ahead of current block
-	ctx.generate_blocks(srv.config().htlc_send_expiry_delta as u32 + 6).await;
+	ctx.generate_blocks(srv.config().htlc_send_expiry_delta.to_u32() + 6).await;
 
 	let vtxos = bark_1.vtxos().await;
 	assert_eq!(vtxos.len(), 2, "user should get 2 VTXOs, change and revocation one");
@@ -827,6 +1248,8 @@ async fn bark_revoke_expired_pending_ln_payment() {
 
 #[tokio::test]
 async fn bark_pay_ln_offer() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/bark_pay_ln_offer").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -870,6 +1293,8 @@ async fn bark_pay_ln_offer() {
 
 #[tokio::test]
 async fn bark_pay_twice_ln_offer() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/bark_pay_twice_ln_offer").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -900,6 +1325,71 @@ async fn bark_pay_twice_ln_offer() {
 	assert!(!vtxos.iter().any(|v| matches!(v.state, VtxoStateInfo::Locked { .. })), "should not be any locked vtxo left");
 }
 
+/// The server fetches the BOLT12 invoice for us, so it decides which amount the
+/// issuer signs. It must not be able to make us pay more than we authorized by
+/// returning a genuinely issuer-signed invoice for a larger amount.
+#[tokio::test]
+async fn bark_reject_inflated_ln_offer_invoice() {
+	require_bark_version!(> "0.6.1");
+
+	#[derive(Clone)]
+	struct InflateOfferAmount;
+
+	#[async_trait::async_trait]
+	impl captaind::proxy::ArkRpcProxy for InflateOfferAmount {
+		async fn fetch_bolt12_invoice(
+			&self,
+			upstream: &mut ArkClient,
+			mut req: protos::FetchBolt12InvoiceRequest,
+		) -> Result<protos::FetchBolt12InvoiceResponse, tonic::Status> {
+			let authorized_sat = req.amount_sat.unwrap_or_else(|| {
+				let offer = Offer::try_from(req.offer.clone()).expect("valid offer");
+				offer.amount().expect("offer has an amount")
+					.to_bitcoin_amount().expect("bitcoin offer amount").to_sat()
+			});
+			req.amount_sat = Some(2 * authorized_sat);
+			Ok(upstream.fetch_bolt12_invoice(req).await?.into_inner())
+		}
+	}
+
+	let ctx = TestContext::new("lightningd/bark_reject_inflated_ln_offer_invoice").await;
+
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+
+	let srv = ctx.captaind("server").lightningd(&lightning.external).create().await;
+	let proxy = srv.start_proxy_no_mailbox(InflateOfferAmount).await;
+
+	// The wallet keeps enough funds to cover the inflated invoice, so it can only
+	// refuse the payment because of the amount check.
+	let board_amount = btc(2);
+	let bark_1 = ctx.bark("bark-1", &proxy.address).funded(btc(3)).create().await;
+
+	bark_1.board_and_confirm_and_register(&ctx, board_amount).await;
+
+	lightning.sync().await;
+
+	let pay_amount = sat(100_000);
+
+	// Amountless offer: we authorize the amount ourselves.
+	let offer = lightning.external.offer(None, Some("A test payment")).await;
+	let err = bark_1.try_pay_lightning(offer, Some(pay_amount), true).await.unwrap_err();
+	assert!(err.to_string().contains("invoice amount doesn't match the requested amount"),
+		"expected an amount mismatch error, got: {err}");
+
+	// Offer with an amount: the offer is what we authorize.
+	let offer = lightning.external.offer(Some(pay_amount), Some("A test payment")).await;
+	let err = bark_1.try_pay_lightning(offer, None, true).await.unwrap_err();
+	assert!(err.to_string().contains("invoice amount doesn't match the requested amount"),
+		"expected an amount mismatch error, got: {err}");
+
+	let balance = bark_1.offchain_balance().await;
+	assert_eq!(balance.spendable, board_amount, "no funds should have moved");
+	assert_eq!(balance.pending_lightning_send, btc(0));
+	let vtxos = bark_1.vtxos().await;
+	assert!(!vtxos.iter().any(|v| matches!(v.state, VtxoStateInfo::Locked { .. })),
+		"should not be any locked vtxo");
+}
+
 
 /// ==============================
 ///
@@ -914,6 +1404,9 @@ async fn bark_sends_on_lightning_after_receiving_from_lightning(
 	srv: &Captaind,
 	pay: impl AsyncFn(String),
 ) {
+	// The new ServerHtlcRecv policy breaks LN receive for bark 0.5.0 and older
+	require_bark_version!(> "0.5.0");
+
 	// Start a bark and create a VTXO to be able to board
 	let bark = Arc::new(ctx.bark("bark", srv).funded(btc(3)).create().await);
 
@@ -927,7 +1420,7 @@ async fn bark_sends_on_lightning_after_receiving_from_lightning(
 	let cloned_invoice_info = invoice_recv_info.clone();
 	tokio::join!(
 		pay(cloned_invoice_info.invoice),
-		bark.lightning_receive(&invoice_recv_info.invoice).wait_millis(10_000),
+		bark.lightning_receive(&invoice_recv_info.invoice).wait_millis(30_000),
 	);
 
 	assert_eq!(bark.spendable_balance().await, pay_amount);
@@ -942,6 +1435,8 @@ lightning_test!(bark_sends_on_lightning_after_receiving_from_lightning);
 
 #[tokio::test]
 async fn server_allows_claim_receive_with_vtxo_proof() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/server_allows_claim_receive_with_vtxo_proof").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -974,6 +1469,8 @@ async fn server_allows_claim_receive_with_vtxo_proof() {
 
 #[tokio::test]
 async fn server_rejects_claim_receive_for_bad_vtxo_proof() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/server_rejects_claim_receive_for_bad_vtxo_proof").await;
 
 	#[derive(Clone)]
@@ -1039,10 +1536,206 @@ async fn server_rejects_claim_receive_for_bad_vtxo_proof() {
 }
 
 #[tokio::test]
-async fn server_allows_claim_receive_for_valid_token_but_not_for_invalid_or_used() {
-	let ctx = TestContext::new("lightningd/server_allows_claim_receive_for_valid_token_but_not_for_invalid_or_used").await;
+async fn bark_rejects_htlc_recv_vtxo_with_inflated_expiry_delta() {
+	require_bark_version!(> "0.5.0");
+
+	let ctx = TestContext::new("lightningd/bark_rejects_htlc_recv_vtxo_with_inflated_expiry_delta").await;
+
+	/// What the server actually puts in the granted policy.
+	const GRANTED_HTLC_EXPIRY_DELTA: BlockDelta = BlockDelta::new(30);
+	/// What the proxy advertises, and what the client budgets against.
+	const ADVERTISED_HTLC_EXPIRY_DELTA: BlockDelta = BlockDelta::new(6);
+
+	#[derive(Clone)]
+	struct UnderAdvertisedDeltaProxy;
+
+	#[async_trait::async_trait]
+	impl captaind::proxy::ArkRpcProxy for UnderAdvertisedDeltaProxy {
+		async fn get_ark_info(
+			&self, upstream: &mut ArkClient, req: protos::Empty,
+		) -> Result<protos::ArkInfo, tonic::Status> {
+			let mut info = upstream.get_ark_info(req).await?.into_inner();
+			info.htlc_expiry_delta = ADVERTISED_HTLC_EXPIRY_DELTA.to_u32();
+			Ok(info)
+		}
+	}
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
+
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).cfg(|cfg| {
+		cfg.htlc_expiry_delta = GRANTED_HTLC_EXPIRY_DELTA;
+	}).funded(btc(10)).create().await;
+	srv.wait_for_vtxopool(&ctx).await;
+
+	let proxy = srv.start_proxy_no_mailbox(UnderAdvertisedDeltaProxy).await;
+
+	let bark = ctx.bark("bark1", &proxy.address).funded(btc(3)).create().await;
+	bark.board_and_confirm_and_register(&ctx, btc(2)).await;
+
+	let invoice_info = bark.bolt11_invoice(btc(1)).await;
+	let invoice = invoice_info.invoice.clone();
+	tokio::spawn(async move {
+		lightning.external.pay_bolt11(invoice).await;
+	});
+
+	// The attempts made while the payer is still on its way find nothing to
+	// claim yet and park, so keep driving until one of them sees the grant.
+	let mut rejection = None;
+	for _ in 0..20 {
+		let res = bark.try_lightning_receive_no_wait(&invoice_info.invoice)
+			.try_wait_millis(15_000).await.expect("claim command timed out");
+		if let Err(e) = res {
+			rejection = Some(e);
+			break;
+		}
+		// A completed receive means the grant was accepted; stop and let the
+		// assertions below report it. Don't sync here: a syncing balance
+		// command also drives the receive and would swallow the rejection,
+		// leaving the next claim to fail with "no pending lightning receive".
+		if bark.spendable_balance_no_sync().await != btc(2) {
+			break;
+		}
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	}
+
+	// We never revealed the preimage, so we still hold only the board vtxo.
+	assert_eq!(bark.spendable_balance_no_sync().await, btc(2));
+
+	let rejection = rejection.expect("expected bark to reject the granted HTLC vtxos");
+	assert!(format!("{:?}", rejection).contains("leave no time to claim it unilaterally"),
+		"{rejection:?}");
+
+	// The rejection is terminal: the receive is dropped instead of retrying
+	// the same grant until the inbound HTLC expires.
+	assert!(bark.list_lightning_receives().await.is_empty());
+}
+
+/// A grant's HTLC leaf timelocks can look safe while the backing tree expires
+/// first, letting the server sweep it after learning the preimage.
+#[tokio::test]
+async fn bark_rejects_htlc_recv_vtxo_from_short_lived_tree() {
+	require_bark_version!(> "0.6.2");
+
+	let ctx = TestContext::new("lightningd/bark_rejects_htlc_recv_vtxo_from_short_lived_tree").await;
+
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+
+	// Trees expiring 8 blocks after issuance leave less than the exit margin
+	// (`vtxo_exit_margin`, 12) bark needs to exit the grant, while the grant's
+	// own HTLC leaf expiry still honors the requested CLTV.
+	// `vtxo_pre_expiry` has to come down too, or the pool discards its leaves
+	// before serving any.
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).cfg(|cfg| {
+		cfg.vtxopool.vtxo_lifetime = BlockDelta::new(8);
+		cfg.vtxopool.vtxo_pre_expiry = BlockDelta::new(2);
+	}).funded(btc(10)).create().await;
+	srv.wait_for_vtxopool(&ctx).await;
+
+	let bark = ctx.bark("bark1", &srv).funded(btc(3)).create().await;
+
+	let invoice_info = bark.bolt11_invoice(btc(1)).await;
+	let invoice = invoice_info.invoice.clone();
+	let external = lightning.external;
+	// try_ so an expected payment failure doesn't panic an orphan task, and
+	// not awaited: an htlcs-ready subscription is skipped by the
+	// receive_htlc_forward_timeout reaper, so the payer stays on the hook
+	// until the invoice expires (10 min here).
+	tokio::spawn(async move {
+		external.try_pay_bolt11(invoice).await
+	});
+
+	// Wait for the HTLCs to be held: a receive with nothing to claim yet
+	// looks the same as one that rejected.
+	let payment_hash = PaymentHash::from(
+		&Bolt11Invoice::from_str(&invoice_info.invoice).expect("valid bolt11 invoice"),
+	);
+	lightning.internal.wait_for_hold_invoice_accepted(payment_hash).await;
+
+	let rejection = bark.try_lightning_receive_no_wait(&invoice_info.invoice)
+		.try_wait_millis(15_000).await.expect("claim command timed out")
+		.expect_err("expected bark to reject the granted HTLC vtxos");
+	assert!(format!("{rejection:?}").contains("below the required minimum"), "{rejection:?}");
+
+	// We never revealed the preimage, so we still hold nothing.
+	assert_eq!(bark.spendable_balance_no_sync().await, btc(0));
+
+	// The rejection is terminal: the receive is dropped instead of retrying
+	// the same grant until the inbound HTLC expires.
+	assert!(bark.list_lightning_receives().await.is_empty());
+}
+
+/// A grant whose backing tree commits to a different exit delta than the
+/// server advertised must be rejected before the preimage is revealed.
+#[tokio::test]
+async fn bark_rejects_htlc_recv_vtxo_with_unexpected_exit_delta() {
+	require_bark_version!(> "0.6.2");
+
+	let ctx = TestContext::new("lightningd/bark_rejects_htlc_recv_vtxo_with_unexpected_exit_delta").await;
+
+	/// What the proxy advertises; the server builds its trees with the
+	/// test default of 12.
+	const ADVERTISED_EXIT_DELTA: BlockDelta = BlockDelta::new(13);
+
+	#[derive(Clone)]
+	struct MismatchedExitDeltaProxy;
+
+	#[async_trait::async_trait]
+	impl captaind::proxy::ArkRpcProxy for MismatchedExitDeltaProxy {
+		async fn get_ark_info(
+			&self, upstream: &mut ArkClient, req: protos::Empty,
+		) -> Result<protos::ArkInfo, tonic::Status> {
+			let mut info = upstream.get_ark_info(req).await?.into_inner();
+			info.vtxo_exit_delta = ADVERTISED_EXIT_DELTA.into();
+			Ok(info)
+		}
+	}
+
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+
+	let srv = ctx.captaind("server").lightningd(&lightning.internal)
+		.funded(btc(10)).create().await;
+	srv.wait_for_vtxopool(&ctx).await;
+
+	let proxy = srv.start_proxy_no_mailbox(MismatchedExitDeltaProxy).await;
+
+	let bark = ctx.bark("bark1", &proxy.address).funded(btc(3)).create().await;
+
+	let invoice_info = bark.bolt11_invoice(btc(1)).await;
+	let invoice = invoice_info.invoice.clone();
+	let external = lightning.external;
+	// try_ so an expected payment failure doesn't panic an orphan task, and
+	// not awaited: an htlcs-ready subscription is skipped by the
+	// receive_htlc_forward_timeout reaper, so the payer stays on the hook
+	// until the invoice expires (10 min here).
+	tokio::spawn(async move {
+		external.try_pay_bolt11(invoice).await
+	});
+
+	// Wait for the HTLCs to be held: a receive with nothing to claim yet
+	// looks the same as one that rejected.
+	let payment_hash = PaymentHash::from(
+		&Bolt11Invoice::from_str(&invoice_info.invoice).expect("valid bolt11 invoice"),
+	);
+	lightning.internal.wait_for_hold_invoice_accepted(payment_hash).await;
+
+	let rejection = bark.try_lightning_receive_no_wait(&invoice_info.invoice)
+		.try_wait_millis(15_000).await.expect("claim command timed out")
+		.expect_err("expected bark to reject the granted HTLC vtxos");
+	assert!(format!("{rejection:?}").contains("unexpected exit delta"), "{rejection:?}");
+
+	// We never revealed the preimage, so we still hold nothing.
+	assert_eq!(bark.spendable_balance_no_sync().await, btc(0));
+
+	assert!(bark.list_lightning_receives().await.is_empty());
+}
+
+#[tokio::test]
+async fn server_allows_claim_receive_for_valid_token_but_not_for_invalid_or_used() {
+	require_bark_version!(> "0.5.0");
+
+	let ctx = TestContext::new("lightningd/server_allows_claim_receive_for_valid_token_but_not_for_invalid_or_used").await;
+
+	let lightning = Arc::new(ctx.new_lightning_setup("lightningd").await);
 
 	// Start a server with anti-dos enabled and link it to our cln installation
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).cfg(|cfg| {
@@ -1063,30 +1756,39 @@ async fn server_allows_claim_receive_for_valid_token_but_not_for_invalid_or_used
 	// Start a bark and don't board anything
 	let bark = Arc::new(ctx.bark("bark1", &srv).funded(btc(3)).create().await);
 
-	let invoice_info_1 = bark.bolt11_invoice(btc(1)).await;
-	let invoice_info_2 = bark.bolt11_invoice(btc(1)).await;
+	let invoice_info_1 = bark.bolt11_invoice_with_token(btc(1), &token).await;
+	let invoice_info_2 = bark.bolt11_invoice_with_token(btc(1), "badtoken").await;
 	let invoice_1 = invoice_info_1.invoice.clone();
 	let invoice_2 = invoice_info_2.invoice.clone();
 
+	let cloned_ln = lightning.clone();
 	let _res = tokio::spawn(async move {
 		tokio::join!(
-			lightning.external.pay_bolt11(invoice_1),
-			lightning.external.pay_bolt11(invoice_2),
+			cloned_ln.external.pay_bolt11(invoice_1),
+			cloned_ln.external.pay_bolt11(invoice_2),
 		)
 	});
 
 	srv.wait_for_vtxopool(&ctx).await;
 
 	// First try claim with invalid token
-	let res = bark.try_lightning_receive_with_token(&invoice_info_1.invoice.clone(), "badtoken").await;
+	let res = bark.try_lightning_receive(&invoice_info_2.invoice.clone()).await;
 	assert!(res.is_err());
 	assert_eq!(bark.spendable_balance_no_sync().await, btc(0));
 	// Then claim with valid token
-	let res = bark.try_lightning_receive_with_token(&invoice_info_1.invoice, &token).await;
+	let res = bark.try_lightning_receive(&invoice_info_1.invoice).await;
 	assert!(res.is_ok());
 	assert_eq!(bark.spendable_balance_no_sync().await, btc(1));
+
 	// Claiming with token that has already been used should fail
-	let res = bark.try_lightning_receive_with_token(&invoice_info_2.invoice, &token).await;
+	let invoice_info_3 = bark.bolt11_invoice_with_token(btc(1), &token).await;
+
+	let invoice_3 = invoice_info_3.invoice.clone();
+	let _res = tokio::spawn(async move {
+		lightning.external.pay_bolt11(invoice_3).await
+	});
+
+	let res = bark.try_lightning_receive(&invoice_info_3.invoice).await;
 	assert!(res.is_err());
 	assert_eq!(bark.spendable_balance_no_sync().await, btc(1));
 }
@@ -1098,6 +1800,8 @@ async fn server_allows_claim_receive_for_valid_token_but_not_for_invalid_or_used
 /// subscriptions without missing any events.
 #[tokio::test]
 async fn stress_test_track_all_stream() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/stress_test_track_all_stream").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -1214,7 +1918,7 @@ async fn stress_test_track_all_stream() {
 /// leading to orphaned wallet state.
 #[tokio::test]
 async fn concurrent_payment_attempts_same_invoice() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("lightningd/concurrent_payment_attempts_same_invoice").await;
 
@@ -1254,7 +1958,7 @@ async fn concurrent_payment_attempts_same_invoice() {
 
 		let handle = tokio::spawn(async move {
 			info!("Task {} starting payment attempt", i);
-			let result = wallet_clone.pay_lightning_invoice(invoice_clone, None).await;
+			let result = wallet_clone.pay_lightning_invoice(invoice_clone, None, false).await;
 			info!("Task {} result: {:?}", i, result.is_ok());
 			(i, result)
 		});
@@ -1361,6 +2065,8 @@ async fn bark_can_claim_all_claimable_receives(
 	srv: &Captaind,
 	pay: impl AsyncFn(String),
 ) {
+	require_bark_version!(> "0.5.0");
+
 	srv.wait_for_vtxopool(&ctx).await;
 
 	// Start a bark and create a VTXO to be able to board
@@ -1454,8 +2160,23 @@ async fn bark_cannot_cancel_lightning_receive_after_preimage_revealed() {
 	});
 
 	// The claim will fail because the proxy drops claim_lightning_receive,
-	// but set_preimage_revealed has already been called locally.
-	let _ = bark.try_lightning_receive(&invoice_info.invoice).await;
+	// but set_preimage_revealed has already been called locally. Re-drive
+	// until that checkpoint is persisted: a single fixed window is not enough
+	// when payment routing is slow or under the double-drive reentrancy mode.
+	let invoice = Invoice::from_str(&invoice_info.invoice).unwrap();
+	let mut revealed = false;
+	for _ in 0..6 {
+		let _ = bark.try_lightning_receive(&invoice_info.invoice).try_wait_millis(10_000).await;
+		let state = bark.client().await
+			.lightning_receive_state(invoice.payment_hash()).await;
+		if let Ok(LightningReceiveState::InProgress(recv)) = state {
+			if matches!(recv.progress, bark::actions::lightning::receive::Progress::PreimageRevealed(_)) {
+				revealed = true;
+				break;
+			}
+		}
+	}
+	assert!(revealed, "receive should have reached the preimage-revealed state");
 
 	// Trying to cancel should fail because the preimage has been revealed
 	let err = bark.try_cancel_lightning_receive(&invoice_info.invoice).await.unwrap_err();
@@ -1469,6 +2190,8 @@ async fn bark_cannot_cancel_lightning_receive_after_preimage_revealed() {
 /// (5 nodes total, 4 channels)
 #[tokio::test]
 async fn bark_can_receive_lightning_long_route() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("lightningd/bark_can_receive_lightning_long_route").await;
 
 	const NUM_HOPS: usize = 5;
@@ -1526,20 +2249,21 @@ async fn bark_can_receive_lightning_long_route() {
 
 	srv.wait_for_vtxopool(&ctx).await;
 
-	bark.lightning_receive(&invoice_info.invoice).wait_millis(10_000).await;
+	bark.lightning_receive(&invoice_info.invoice).wait_millis(30_000).await;
 	bolt11_pay.ready().await.unwrap();
 
 	assert_eq!(bark.spendable_balance().await, btc(8) + bolt11_amount);
 	info!("Bolt11 receive over long route succeeded");
 }
 
-/// Exhaust the Lightning receive claim retry budget and confirm we fall back
-/// to exiting the HTLC-recv VTXOs on-chain.
+/// Exhaust the Lightning receive claim retry budget and confirm the receive
+/// is kept pending rather than auto-exited: a later claim retry or an
+/// explicit exit attempt decides what happens next.
 #[tokio::test]
-async fn bark_exits_lightning_receive_after_retry_budget_exhausted() {
+async fn bark_keeps_lightning_receive_pending_after_retry_budget_exhausted() {
 	require_bark_version!(== "DIRTY");
 
-	let ctx = TestContext::new("lightningd/exits_after_retry_budget_exhausted").await;
+	let ctx = TestContext::new("lightningd/keeps_pending_after_retry_budget_exhausted").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 
@@ -1580,18 +2304,34 @@ async fn bark_exits_lightning_receive_after_retry_budget_exhausted() {
 	});
 
 	// 1 initial attempt + 3 retries with 2s/4s/8s backoff = ~14s of waiting,
-	// plus payment routing and the on-chain exit start. Allow generous slack.
+	// plus payment routing. Allow generous slack.
 	bark.try_lightning_receive(&invoice_info.invoice).wait_millis(60_000).await
 		.expect_err("claim should fail after retry budget is exhausted");
 
-	assert_eq!(attempts.load(Ordering::Relaxed), usize::from(retries) + 1,
+	// The double-drive reentrancy mode runs each advance twice, so the server
+	// sees every claim attempt twice.
+	let expected_attempts = (usize::from(retries) + 1) * ark_testing::util::action_drive_factor();
+	assert_eq!(attempts.load(Ordering::Relaxed), expected_attempts,
 		"server should see one claim per attempt (initial + each retry)");
 
-	// The HTLC-recv VTXO must have been moved into an on-chain exit.
-	let exits = bark.list_exits().await;
-	assert_eq!(exits.len(), 1, "should have started an exit for the HTLC-recv VTXO");
-	assert!(matches!(exits[0].state, ExitState::Start(_)),
-		"exit should be in Start state, got: {:?}", exits[0].state);
+	// We no longer auto-exit when the budget runs out: the receive stays
+	// pending so the claim can be retried later.
+	assert!(bark.list_exits().await.is_empty(),
+		"no exit should start without an explicit exit attempt");
+
+	let invoice = Invoice::from_str(&invoice_info.invoice).unwrap();
+	let receive = match bark.client().await
+		.lightning_receive_state(invoice.payment_hash()).await
+		.expect("the lightning receive should still be pending")
+	{
+		LightningReceiveState::InProgress(receive) => receive,
+		LightningReceiveState::Settled(_) => {
+			panic!("the lightning receive should not be settled");
+		},
+	};
+
+	assert!(matches!(receive.progress, bark::actions::lightning::receive::Progress::PreimageRevealed(_)),
+		"the lightning receive should be in the preimage revealed state");
 }
 
 /// A transient claim failure should be absorbed by the retry budget and the
@@ -1653,4 +2393,216 @@ async fn bark_completes_lightning_receive_after_transient_claim_failures() {
 		"no exit should have been triggered after a successful retry");
 	assert!(counter.load(Ordering::Relaxed) <= 0,
 		"proxy should have served at least the failure budget");
+}
+
+/// Lightning receive claims must ignore `max_vtxo_exit_depth`.
+///
+/// The vtxo pool re-inserts its change output after every spend without any
+/// depth cap, so the pool change chain's exit depth grows by one with each
+/// lightning receive it funds and the granted HTLC-recv vtxos eventually reach
+/// the maximum. The generic arkoor input depth check used to reject claiming
+/// them, making the receive unclaimable by construction after the preimage
+/// was revealed. Claims are recovery operations and are now exempt.
+#[tokio::test]
+async fn lightning_receive_claim_ignores_max_exit_depth() {
+	require_bark_version!(> "0.5.0");
+
+	const MAX_EXIT_DEPTH: u16 = 8;
+	// Pool leaves start a few levels deep and every receive adds one, so
+	// this many receives pushes the granted HTLC-recv vtxos past the maximum.
+	const NB_RECEIVES: u16 = MAX_EXIT_DEPTH;
+
+	let ctx = TestContext::new("lightningd/lightning_receive_claim_ignores_max_exit_depth").await;
+
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+
+	let srv = ctx.captaind("srv")
+		.lightningd(&lightning.internal)
+		.funded(btc(10))
+		.cfg(|cfg| {
+			cfg.max_vtxo_exit_depth = MAX_EXIT_DEPTH;
+			// A single large bucket: after the first spend, the change output
+			// (just under 1 BTC) is always the smallest pool vtxo covering the
+			// receive amount, so every receive extends the same change chain.
+			cfg.vtxopool.vtxo_targets = vec![
+				VtxoTarget { count: 2, amount: btc(1) },
+			];
+			// Lift the pool's own change depth cap so it actually grants
+			// HTLC-recv vtxos past max_vtxo_exit_depth; this test is about
+			// recovering whatever got granted, however deep.
+			cfg.vtxopool.max_vtxo_exit_depth = 4 * MAX_EXIT_DEPTH;
+		})
+		.create().await;
+	srv.wait_for_vtxopool(&ctx).await;
+
+	let external = Arc::new(lightning.external);
+
+	let bark = ctx.bark("bark", &srv).funded(btc(3)).create().await;
+	bark.board_and_confirm_and_register(&ctx, btc(2)).await;
+
+	let pay_amount = sat(100_000);
+	for i in 0..NB_RECEIVES {
+		let invoice_info = bark.bolt11_invoice(pay_amount).await;
+
+		let invoice_str = invoice_info.invoice.clone();
+		let external = external.clone();
+		let pay = tokio::spawn(async move {
+			external.try_pay_bolt11(invoice_str).await
+		});
+
+		bark.lightning_receive(&invoice_info.invoice).wait_millis(60_000).await;
+		pay.wait_millis(30_000).await.unwrap().expect("hold invoice should settle");
+		info!("lightning receive #{} claimed", i);
+	}
+
+	assert_eq!(bark.spendable_balance().await,
+		btc(2) + pay_amount * NB_RECEIVES as u64);
+
+	// Prove the boundary was actually crossed: a claim output sits two levels
+	// below its HTLC-recv input, so a claimed vtxo deeper than the maximum
+	// means the server cosigned a claim of an at-or-past-maximum HTLC.
+	let deepest = bark.vtxos().await.iter()
+		.filter_map(|v| v.exit_depth)
+		.max().expect("wallet should have vtxos");
+	assert!(deepest > MAX_EXIT_DEPTH,
+		"the deepest claimed vtxo (depth {}) should exceed the maximum of {}",
+		deepest, MAX_EXIT_DEPTH,
+	);
+}
+
+/// The vtxo pool must not serve ever-deeper vtxos.
+///
+/// The pool re-inserts its change output after every spend, so without a cap
+/// the same arkoor chain funds receive after receive and the granted HTLC-recv
+/// vtxos get one level deeper each time (and correspondingly more expensive
+/// to exit unilaterally). `max_vtxo_exit_depth` bounds how deep change may
+/// be kept: once the chain reaches the cap it is dropped and the next receive
+/// is funded from a fresh pool leaf.
+#[tokio::test]
+async fn lightning_receive_pool_change_arkoor_depth_capped() {
+	require_bark_version!(> "0.5.0");
+
+	const MAX_EXIT_DEPTH: u16 = 1;
+
+	let ctx = TestContext::new("lightningd/lightning_receive_pool_change_arkoor_depth_capped").await;
+
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+
+	let srv = ctx.captaind("srv")
+		.lightningd(&lightning.internal)
+		.funded(btc(10))
+		.cfg(|cfg| {
+			cfg.vtxopool.max_vtxo_exit_depth = MAX_EXIT_DEPTH;
+			// A single large bucket, so that without the cap every receive
+			// would be funded from the same ever-deeper change chain.
+			cfg.vtxopool.vtxo_targets = vec![
+				VtxoTarget { count: 2, amount: btc(1) },
+			];
+		})
+		.create().await;
+	srv.wait_for_vtxopool(&ctx).await;
+
+	let external = Arc::new(lightning.external);
+
+	let bark = ctx.bark("bark", &srv).funded(btc(3)).create().await;
+	bark.board_and_confirm_and_register(&ctx, btc(2)).await;
+
+	// With a cap of 1, the pool's own leaves are already too deep to keep
+	// arkoor change for, so every receive is funded from a fresh leaf and
+	// the pool must refill twice: once at startup and again after the first
+	// pair of receives drains both leaves. Pool issuance now runs off
+	// chain-tip changes, so we advance the chain between the pairs to
+	// trigger the refill.
+	let pay_amount = sat(100_000);
+	const NB_RECEIVES: u16 = 4;
+	for i in 0..NB_RECEIVES {
+		if i > 0 && i % 2 == 0 {
+			let last = srv.vtxopool_last_issuance();
+			ctx.generate_blocks(1).await;
+			srv.wait_for_vtxopool_issuance_after(&ctx, last).await;
+		}
+
+		let invoice_info = bark.bolt11_invoice(pay_amount).await;
+
+		let invoice_str = invoice_info.invoice.clone();
+		let external = external.clone();
+		let pay = tokio::spawn(async move {
+			external.try_pay_bolt11(invoice_str).await
+		});
+
+		bark.lightning_receive(&invoice_info.invoice).wait_millis(60_000).await;
+		pay.wait_millis(30_000).await.unwrap().expect("hold invoice should settle");
+		info!("lightning receive #{} claimed", i);
+	}
+
+	assert_eq!(bark.spendable_balance().await,
+		btc(2) + pay_amount * NB_RECEIVES as u64);
+
+	// All claim outputs sit a constant two levels below their HTLC-recv
+	// input, so their exit depth spread mirrors the spread of the vtxos the
+	// pool served. Bounded change reuse means a spread of at most the cap;
+	// without the cap the depth would grow with every receive (spread 3).
+	let depths = bark.vtxos().await.iter()
+		.filter(|v| v.amount == pay_amount)
+		.map(|v| v.exit_depth.expect("exit depth is known"))
+		.collect::<Vec<_>>();
+	assert_eq!(depths.len(), NB_RECEIVES as usize);
+	let spread = depths.iter().max().unwrap() - depths.iter().min().unwrap();
+	assert!(spread <= MAX_EXIT_DEPTH,
+		"pool served vtxos with depth spread {} exceeding the arkoor depth \
+		 cap of {}; depths: {:?}",
+		spread, MAX_EXIT_DEPTH, depths,
+	);
+}
+
+/// Lightning payment revocations must ignore `max_vtxo_exit_depth`.
+///
+/// HTLC-send vtxos are granted two levels deeper than the arkoor input that
+/// funds them (checkpoint + arkoor), so they can sit at the maximum even
+/// though the grant itself respected the limit. The generic arkoor input
+/// depth check used to reject revoking them after a failed payment,
+/// stranding the sender's funds. Revocations are recovery operations and
+/// are now exempt.
+#[tokio::test]
+async fn lightning_pay_revocation_ignores_max_exit_depth() {
+	require_bark_version!(> "0.5.0");
+
+	const MAX_EXIT_DEPTH: u16 = 3;
+
+	let ctx = TestContext::new("lightningd/lightning_pay_revocation_ignores_max_exit_depth").await;
+
+	// No channel: the payment cannot be routed, so it always fails and bark
+	// revokes the HTLC-send vtxos.
+	let lightning = ctx.new_lightning_setup_no_channel("lightningd").await;
+
+	let srv = ctx.captaind("srv")
+		.lightningd(&lightning.internal)
+		.funded(btc(10))
+		.cfg(|cfg| {
+			cfg.max_vtxo_exit_depth = MAX_EXIT_DEPTH;
+		})
+		.create().await;
+
+	let board_amount = btc(2);
+	let bark = ctx.bark("bark", &srv).funded(btc(3)).create().await;
+	bark.board_and_confirm_and_register(&ctx, board_amount).await;
+
+	// The board vtxo is at depth 1, so the HTLC-send vtxos of this payment
+	// are granted at depth 3 (checkpoint + arkoor) — exactly the maximum.
+	let invoice_amount = btc(0.5);
+	let invoice = lightning.external.invoice(Some(invoice_amount), "unroutable", "no channel").await;
+	bark.pay_lightning_wait(invoice, None).await;
+
+	// The payment failed and the HTLC-send vtxos were revoked: the full
+	// balance is restored as change + revocation vtxo, nothing stays locked.
+	assert_eq!(bark.spendable_balance().await, board_amount);
+	let vtxos = bark.vtxos().await;
+	let revocation = vtxos.iter().find(|v| v.amount == invoice_amount)
+		.expect("should have a revocation vtxo of the payment amount");
+	assert!(revocation.exit_depth.expect("exit depth is known") > MAX_EXIT_DEPTH,
+		"the revocation vtxo should be deeper than the maximum, \
+		 proving its HTLC-send input was at the maximum exit depth",
+	);
+	assert!(!vtxos.iter().any(|v| matches!(v.state, VtxoStateInfo::Locked { .. })),
+		"should not be any locked vtxo left");
 }

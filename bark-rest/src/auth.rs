@@ -1,5 +1,6 @@
 
 use std::fmt;
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
@@ -9,23 +10,37 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use subtle::ConstantTimeEq;
 
 use crate::ServerState;
 use crate::error::{ErrorResponse, unauthorized};
 
 const BEARER_PREFIX: &str = "Bearer ";
 
-pub fn authed_router(state: &ServerState, router: Router<ServerState>) -> Router<ServerState> {
+pub fn authed_router(
+	state: &Arc<ServerState>,
+	router: Router<Arc<ServerState>>,
+) -> Router<Arc<ServerState>> {
 	router.route_layer(axum::middleware::from_fn_with_state(state.clone(), guard_auth))
 }
 
 /// A bearer token that is the 32-byte secret itself.
 ///
 /// The token grants full access when it matches any registered secret.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct AuthToken {
 	secret: [u8; 32],
 }
+
+/// Constant-time, so comparing a presented token against the configured one
+/// doesn't leak how many leading bytes matched.
+impl PartialEq for AuthToken {
+	fn eq(&self, other: &Self) -> bool {
+		self.secret.ct_eq(&other.secret).into()
+	}
+}
+
+impl Eq for AuthToken {}
 
 #[derive(Debug)]
 pub struct TokenDecodeError(String);
@@ -113,7 +128,7 @@ fn extract_auth_token(req: &Request<Body>) -> Result<Option<String>, &'static st
 }
 
 pub fn authenticate_request(
-	State(state): State<ServerState>,
+	state: &ServerState,
 	req: &Request<Body>,
 ) -> Result<(), ErrorResponse> {
 	// If no auth token is configured, allow unauthenticated access.
@@ -141,11 +156,11 @@ pub fn authenticate_request(
 }
 
 pub(crate) async fn guard_auth(
-	state: State<ServerState>,
+	state: State<Arc<ServerState>>,
 	req: Request<Body>,
 	next: Next,
 ) -> Response {
-	match authenticate_request(state, &req) {
+	match authenticate_request(&state.0, &req) {
 		Ok(()) => next.run(req).await,
 		Err(e) => e.into_response(),
 	}
@@ -153,10 +168,7 @@ pub(crate) async fn guard_auth(
 
 #[cfg(test)]
 mod tests {
-	use std::collections::HashMap;
-	use std::sync::Arc;
-
-	use tokio::sync::RwLock;
+	use tokio_util::sync::CancellationToken;
 
 	use super::*;
 
@@ -164,15 +176,9 @@ mod tests {
 		AuthToken::new([42u8; 32])
 	}
 
-	fn make_state(token: AuthToken) -> State<ServerState> {
-		State(ServerState {
-			wallet: Arc::new(parking_lot::RwLock::new(None)),
-			on_wallet_create: None,
-			auth_token: Some(token),
-			on_wallet_delete: None,
-
-			websocket_tickets: Arc::new(RwLock::new(HashMap::new())),
-		})
+	fn make_state(token: AuthToken) -> ServerState {
+		let shutdown = CancellationToken::new();
+		ServerState::builder().auth_token(token).build(shutdown)
 	}
 
 	#[test]
@@ -226,14 +232,14 @@ mod tests {
 		};
 
 		// valid token passes
-		let res = authenticate_request(make_state(token.clone()), &req(Some(&token.encode())));
+		let res = authenticate_request(&make_state(token.clone()), &req(Some(&token.encode())));
 		assert!(res.is_ok(), "valid token should pass: {:?}", res);
 
 		// missing, wrong, and garbage tokens all fail
 		let state = make_state(token);
 		let no_hdr = Request::builder().body(Body::empty()).unwrap();
-		assert!(authenticate_request(state.clone(), &no_hdr).is_err());
-		assert!(authenticate_request(state.clone(), &req(Some(&AuthToken::new([0u8; 32]).encode()))).is_err());
-		assert!(authenticate_request(state, &req(Some("not-a-valid-token"))).is_err());
+		assert!(authenticate_request(&state, &no_hdr).is_err());
+		assert!(authenticate_request(&state, &req(Some(&AuthToken::new([0u8; 32]).encode()))).is_err());
+		assert!(authenticate_request(&state, &req(Some("not-a-valid-token"))).is_err());
 	}
 }

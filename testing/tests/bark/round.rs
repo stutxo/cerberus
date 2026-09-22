@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,21 +9,25 @@ use tokio_stream::StreamExt;
 
 use ark::{VtxoPolicy, VtxoRequest};
 use ark::rounds::RoundEvent;
+use ark::tree::signed::HashlockVersion;
 use ark::vtxo::policy::PubkeyVtxoPolicy;
 use bark::persist::models::{StoredRoundState, Unlocked};
-use bark::round::RoundParticipation;
+use bark::round::{RoundFlowKind, RoundParticipation};
 use bark::subsystem::RoundMovement;
-use bark::vtxo::VtxoState;
-use server_log::{AttemptingRound, RestartMissingVtxoSigs, RoundFinished, RoundUserVtxoNotAllowed};
+use bark::vtxo::{VtxoLockHolder, VtxoState};
+use server::database::Db;
+use server_log::{AttemptingRound, NoRoundPayments, RestartMissingVtxoSigs, RoundFinished, RoundUserVtxoNotAllowed};
 use server_rpc::protos;
 
-use ark_testing::{TestContext, btc, require_bark_version, sat, signed_sat};
+use ark_testing::{TestContext, btc, is_bark_version, require_bark_version, sat, secs, signed_sat};
 use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
 use ark_testing::daemon::captaind::{self, ArkClient};
 use ark_testing::util::FutureExt;
 
 #[tokio::test]
 async fn large_round() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("bark/large_round").await;
 	#[cfg(not(feature = "slow_test"))]
 	const N: usize = 9;
@@ -57,6 +62,8 @@ async fn large_round() {
 
 #[tokio::test]
 async fn refresh_all() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("bark/refresh_all").await;
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;
 	let bark1 = ctx.bark("bark1", &srv).funded(sat(1_000_000)).create().await;
@@ -68,7 +75,9 @@ async fn refresh_all() {
 	ctx.refresh_all(&srv, &[&bark1]).await;
 	bark1.board_and_confirm_and_register(&ctx, sat(400_000)).await;
 
-	// We want bark2 to have a refresh, board, round and oor vtxo
+	// We want bark2 to have change (split in two on bark > 0.6.1), board
+	// and oor vtxos
+	let nb_change = if is_bark_version!(> "0.6.1") { 2 } else { 1 };
 	let pk1 = bark1.address().await;
 	let pk2 = bark2.address().await;
 	bark2.send_oor(&pk1, sat(20_000)).await; // generates change
@@ -76,7 +85,7 @@ async fn refresh_all() {
 	bark2.board(sat(20_000)).await;
 	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
 
-	assert_eq!(3, bark2.vtxos().await.len());
+	assert_eq!(2 + nb_change, bark2.vtxos().await.len());
 	ctx.refresh_all(&srv, &[&bark2]).await;
 	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
 	assert_eq!(1, bark2.vtxos().await.len());
@@ -85,6 +94,8 @@ async fn refresh_all() {
 
 #[tokio::test]
 async fn refresh_counterparty() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("bark/refresh_counterparty").await;
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;
 	let bark1 = ctx.bark("bark1", &srv).funded(sat(1_000_000)).create().await;
@@ -128,6 +139,8 @@ async fn refresh_counterparty() {
 #[tokio::test]
 async fn second_round_attempt() {
 	//! test that we can recover from an error in the round
+
+	require_bark_version!(> "0.5.0");
 
 	/// This proxy will drop the very first request to provide_vtxo_signatures.
 	#[derive(Clone)]
@@ -190,6 +203,8 @@ async fn bark_can_sign_up_to_round_during_signup_phase() {
 	//! able to join the ongoing round during the signup phase, even though it
 	//! wasn't listening when the round started.
 
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("bark/bark_can_sign_up_to_round_during_signup_phase").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
 		cfg.round_interval = Duration::from_secs(3600);
@@ -221,6 +236,8 @@ async fn bark_can_sign_up_to_round_during_signup_phase() {
 
 #[tokio::test]
 async fn delegated_maintenance_refresh() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("bark/delegated_maintenance_refresh").await;
 	let srv = ctx.captaind("server").funded(btc(1)).create().await;
 	let bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
@@ -229,7 +246,7 @@ async fn delegated_maintenance_refresh() {
 	bark.board_and_confirm_and_register(&ctx, sat(800_000)).await;
 
 	// Let vtxo almost expire so it needs refresh
-	ctx.generate_blocks(srv.config().vtxo_lifetime as u32).await;
+	ctx.generate_blocks(srv.config().vtxo_lifetime.to_u32()).await;
 
 	// Call delegated maintenance - should return immediately
 	bark.maintain_delegated().await;
@@ -279,6 +296,370 @@ async fn delegated_maintenance_refresh() {
 	assert_eq!(vtxos[0].amount, sat(800_000));
 }
 
+#[tokio::test]
+async fn delegated_refresh_from_legacy_hashlock_round() {
+	//! Emulates the upgrade from the v0 to the v1 hashlock clauses.
+	//!
+	//! A delegated refresh is completed in a round conducted with the legacy
+	//! v0 clauses, then the server restarts with the current clauses (the
+	//! upgrade) and the client must still be able to finish the refresh.
+	//! The tree encoding doesn't record the clause version, so the server
+	//! has to detect the version of the stored tree to serve correctly
+	//! reconstructed VTXOs (rebuilding with the wrong version yields cosign
+	//! signatures that don't verify and wrong vtxo ids) and the client has
+	//! to accept the still-locked v0 leaves.
+	//!
+	//! NB 0.6.0 clients only accept v1 leaves when finishing delegated
+	//! rounds, so they can't complete this recovery.
+	require_bark_version!(> "0.6.0");
+
+	let ctx = TestContext::new("bark/delegated_refresh_from_legacy_hashlock_round").await;
+	let srv = ctx.captaind("server")
+		.cfg(|cfg| cfg.round_legacy_hashlock_clauses = true)
+		.funded(btc(1))
+		.create().await;
+	let mut bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
+
+	// Board funds and confirm
+	bark.board_and_confirm_and_register(&ctx, sat(800_000)).await;
+
+	// Let vtxo almost expire so it needs refresh
+	ctx.generate_blocks(srv.config().vtxo_lifetime.to_u32()).await;
+
+	// Register the delegated refresh, then let the server run the round
+	// without us
+	bark.maintain_delegated().await;
+	let mut log_round_finished = srv.subscribe_log::<RoundFinished>();
+	srv.trigger_round().await;
+	log_round_finished.recv().wait(Duration::from_secs(30)).await.unwrap();
+
+	// Make sure the round was actually conducted with the legacy clauses,
+	// otherwise this test silently degrades into a regular refresh test
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let round = db.read(async |t| {
+		let id = t.get_last_round_id().await?.expect("no round in db");
+		Ok(t.get_round(id).await?.expect("round not in db"))
+	}).await.unwrap();
+	assert_eq!(round.signed_tree.detect_hashlock_version(), Ok(HashlockVersion::V0));
+
+	// The upgrade: restart the server building rounds with the current clauses
+	srv.stop().await.unwrap();
+	srv.config_mut().round_legacy_hashlock_clauses = false;
+	srv.start().await.unwrap();
+	// the server listens on a new port after the restart
+	bark.set_server_address(srv.ark_url()).await;
+
+	// The refresh movement is still pending, we never synced
+	let movements = bark.history().await;
+	let movement_id = movements.iter().find(|m| {
+		m.subsystem.name == "bark.round" &&
+		m.subsystem.kind == "refresh" &&
+		m.status == bark_json::movements::MovementStatus::Pending
+	}).expect("should have pending refresh movement").id;
+
+	// Sync until the delegated round progresses: the server serves the
+	// v0 round vtxos and we complete the forfeit dance
+	let mut success = false;
+	for i in 0..100 {
+		bark.sync().await;
+
+		let movements = bark.history().await;
+		if let Some(movement) = movements.iter().find(|m| m.id == movement_id) {
+			if movement.status == bark_json::movements::MovementStatus::Successful {
+				success = true;
+				break;
+			}
+		}
+
+		// Generate blocks to let the round funding tx confirm
+		if i % 5 == 0 {
+			ctx.generate_blocks(1).await;
+		}
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+	assert!(success, "refresh movement should complete successfully");
+
+	// Verify that the vtxo was refreshed and the server registered the new
+	// vtxo under the same id we hold
+	let vtxos = bark.vtxos().await;
+	assert_eq!(vtxos.len(), 1, "should still have one vtxo after refresh");
+	assert_eq!(vtxos[0].amount, sat(800_000));
+	let vtxo_id = vtxos[0].id.to_string();
+	let server_knows = db.read(async |t| {
+		let row = t.query_one(
+			"SELECT COUNT(*) FROM vtxo WHERE vtxo_id = $1", &[&vtxo_id],
+		).await?;
+		Ok(row.get::<_, i64>(0))
+	}).await.unwrap();
+	assert_eq!(server_knows, 1, "server should know our refreshed vtxo {}", vtxo_id);
+}
+
+#[tokio::test]
+async fn delegated_refresh_must_not_leave_server_trace_on_failure() {
+	//! A delegated refresh and a lightning send race on the same VTXO, the refresh fails locally,
+	//! but it had already submitted its participation to the server, so the
+	//! server forfeits the VTXO in a round the wallet no longer tracks. The
+	//! VTXO ends up spent in a round and unusable.
+	//!
+	//! The scenario: the refresh selects its input while it is still Spendable,
+	//! then a concurrent lightning send (`start_lightning_send` ->
+	//! `request_lightning_send_htlcs`) progresses far enough to *consume* that
+	//! input into its HTLC vtxos (it locks the input and then
+	//! `mark_vtxos_as_spent`). The refresh then tries to lock the input and
+	//! fails because it is no longer lockable.
+	//!
+	//! The invariant `join_next_round_delegated` must uphold is atomicity with
+	//! respect to *server* state: either it fully succeeds, or it fails leaving
+	//! nothing on the server. The dangerous behavior is committing the
+	//! participation server-side and only then failing the local lock: the
+	//! server still has a delegated participation (with the user's attestation)
+	//! and will forfeit the VTXO in the next round, with no local round state
+	//! tracking it.
+	//!
+	//! We force the interleaving deterministically rather than relying on
+	//! timing: a real concurrent lightning send hits exactly this window.
+	//!
+	//! We assert the atomicity contract: the refresh either succeeds (the round
+	//! forfeits exactly our VTXO as a tracked refresh) or it fails with no
+	//! server-side trace (the triggered round sits out with no payments).
+
+	require_bark_version!(> "0.5.0");
+
+	let ctx = TestContext::new("bark/delegated_refresh_must_not_leave_server_trace_on_failure").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+	let bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
+
+	bark.board_and_confirm_and_register(&ctx, sat(800_000)).await;
+
+	let wallet = bark.client().await;
+
+	// The delegated refresh selects its input while it is still Spendable.
+	let [vtxo] = wallet.spendable_vtxos().await.unwrap()
+		.try_into().expect("should have exactly one spendable vtxo");
+	let vtxo_id = vtxo.vtxo.id();
+
+	let participation = wallet.build_refresh_participation(vec![vtxo_id]).await
+		.unwrap().expect("should build participation");
+
+	// A concurrent lightning send progresses past `Progress::Start`: it locks
+	// the input and then consumes it into its HTLC vtxos. After this the input
+	// is no longer lockable by the refresh.
+	let ln_holder = VtxoLockHolder::Action { id: "ln-pay-test-action".to_string() };
+	wallet.lock_vtxos(vec![vtxo_id], Some(ln_holder)).await
+		.expect("lightning send lock should succeed on a Spendable vtxo");
+	wallet.mark_vtxos_as_spent(vec![vtxo_id]).await
+		.expect("lightning send should consume its input into its HTLC vtxos");
+
+	// Subscribe before triggering so we catch whatever the next round does.
+	let mut log_round_finished = srv.subscribe_log::<RoundFinished>();
+	let mut log_no_payments = srv.subscribe_log::<NoRoundPayments>();
+
+	let res = wallet.join_next_round_delegated(participation, Some(RoundMovement::Refresh)).await;
+
+	// Trigger a round so any server-side participation gets executed.
+	srv.trigger_round().await;
+
+	match res {
+		Ok(_) => {
+			// The refresh committed: the round must forfeit exactly our VTXO,
+			// fully tracked as a refresh.
+			let finished = log_round_finished.recv().wait(secs(30)).await
+				.expect("a successful delegated refresh should produce a round");
+			assert_eq!(
+				finished.nb_input_vtxos, 1,
+				"a successful delegated refresh round should forfeit our vtxo",
+			);
+		},
+		Err(err) => {
+			info!("delegated refresh failed as expected: {:#}", err);
+			// Atomicity: a failed refresh must leave NO participation on the
+			// server. Otherwise the server forfeits the VTXO in a round the
+			// wallet no longer tracks (the "spent in round, unusable" loss).
+			// With no participation registered, the triggered round sits out.
+			log_no_payments.recv().wait(secs(30)).await
+				.expect("a failed delegated refresh must leave no server-side trace, \
+					so the triggered round sits out with no payments");
+		},
+	}
+}
+
+#[tokio::test]
+async fn delegated_round_duplicate_outputs_get_distinct_vtxos() {
+	//! A delegated participation with two identical outputs (an equal split)
+	//! must yield two distinct VTXOs.
+	//!
+	//! The server used to bind outputs to tree leaves by value, so identical
+	//! outputs aliased to the same leaf: the wallet was served the same VTXO
+	//! twice while it forfeited its full input, and the other leaf stranded
+	//! until the server swept it after expiry.
+
+	require_bark_version!(> "0.6.2");
+
+	let ctx = TestContext::new("bark/delegated_round_duplicate_outputs_get_distinct_vtxos").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+	let bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
+
+	bark.board_and_confirm_and_register(&ctx, sat(800_000)).await;
+
+	{
+		let wallet = bark.client().await;
+		let [vtxo] = wallet.spendable_vtxos().await.unwrap()
+			.try_into().expect("should have exactly one spendable vtxo");
+
+		// Build a regular refresh participation, then split its single
+		// output into two identical halves.
+		let mut participation = wallet.build_refresh_participation(vec![vtxo.vtxo.id()]).await
+			.unwrap().expect("should build participation");
+		let [output] = participation.outputs.try_into()
+			.expect("refresh participation should have exactly one output");
+		let half = output.amount / 2;
+		assert_eq!(half * 2, output.amount, "test needs an even output amount");
+		let req = VtxoRequest { policy: output.policy, amount: half };
+		participation.outputs = vec![req.clone(), req];
+
+		wallet.join_next_round_delegated(participation, Some(RoundMovement::Refresh)).await
+			.expect("delegated join should succeed");
+	}
+
+	// Let the server run the round without us.
+	let mut log_round_finished = srv.subscribe_log::<RoundFinished>();
+	srv.trigger_round().await;
+	log_round_finished.recv().wait(secs(30)).await.unwrap();
+
+	// Sync until the wallet finishes the forfeit dance and the refresh
+	// movement completes.
+	let movements = bark.history().await;
+	let movement_id = movements.iter().find(|m| {
+		m.subsystem.name == "bark.round" &&
+		m.subsystem.kind == "refresh" &&
+		m.status == bark_json::movements::MovementStatus::Pending
+	}).expect("should have pending refresh movement").id;
+
+	let mut success = false;
+	for i in 0..100 {
+		bark.sync().await;
+
+		let movements = bark.history().await;
+		if let Some(movement) = movements.iter().find(|m| m.id == movement_id) {
+			if movement.status == bark_json::movements::MovementStatus::Successful {
+				success = true;
+				break;
+			}
+		}
+
+		// Generate blocks to let the round funding tx confirm
+		if i % 5 == 0 {
+			ctx.generate_blocks(1).await;
+		}
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+	assert!(success, "refresh movement should complete successfully");
+
+	// Both outputs must have been delivered as distinct VTXOs.
+	let vtxos = bark.vtxos().await;
+	assert_eq!(vtxos.len(), 2, "should have two vtxos after the split: {:?}", vtxos);
+	assert_ne!(vtxos[0].id, vtxos[1].id, "the split vtxos must be distinct");
+	assert_eq!(vtxos[0].amount, vtxos[1].amount);
+}
+
+#[tokio::test]
+async fn delegated_refresh_dropped_when_input_spent_before_round() {
+	require_bark_version!(> "0.5.0");
+
+	let ctx = TestContext::new("bark/delegated_refresh_dropped_when_input_spent_before_round").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+	let sender = ctx.bark("sender", &srv).funded(sat(1_000_000)).create().await;
+	let receiver = ctx.bark("receiver", &srv).create().await;
+
+	sender.board_and_confirm_and_register(&ctx, sat(800_000)).await;
+
+	// Submit a delegated refresh: the participation now sits pending on the
+	// server and (with the new behaviour) the input VTXO is left unlocked.
+	sender.refresh_all_delegated_no_sync().await;
+
+	// Without syncing, spend that same VTXO via an OOR send. The server marks the
+	// input spent and must drop the pending delegated participation in the same
+	// breath.
+	sender.send_oor_nosync(receiver.address().await, sat(300_000)).await;
+
+	// The OOR send was honoured: the receiver actually got paid.
+	assert_eq!(receiver.spendable_balance().await, sat(300_000));
+
+	// Trigger a round. With the participation dropped, the server has nothing to
+	// forfeit and the round sits out with no payments — rather than forfeiting a
+	// VTXO the sender already spent.
+	let mut log_no_payments = srv.subscribe_log::<NoRoundPayments>();
+	srv.trigger_round().await;
+	log_no_payments.recv().wait(secs(30)).await
+		.expect("round must sit out: the spent input's delegated participation should be dropped");
+}
+
+#[tokio::test]
+async fn delegated_refresh_then_unsynced_spend_is_rejected() {
+	require_bark_version!(> "0.5.0");
+
+	let ctx = TestContext::new("bark/delegated_refresh_then_unsynced_spend_is_rejected").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+	let sender = ctx.bark("sender", &srv).funded(sat(1_000_000)).create().await;
+	let receiver = ctx.bark("receiver", &srv).create().await;
+
+	sender.board_and_confirm_and_register(&ctx, sat(800_000)).await;
+
+	// Ask the server to refresh our VTXO on our behalf. In delegated mode the
+	// participation (with our attestation) is submitted to the server and the
+	// input VTXO is left unlocked locally.
+	sender.refresh_all_delegated_no_sync().await;
+
+	// The server completes the delegated refresh in a round, forfeiting the input.
+	let mut log_round_finished = srv.subscribe_log::<RoundFinished>();
+	srv.trigger_round().await;
+	let finished = log_round_finished.recv().wait(secs(30)).await
+		.expect("server should complete the delegated refresh in a round");
+	assert!(finished.nb_input_vtxos >= 1, "the delegated refresh should forfeit our input VTXO");
+
+	// The wallet never synced, so it still thinks the old VTXO is spendable.
+	// Spending it must be rejected by the server.
+	let res = sender.try_send_oor(receiver.address().await, sat(300_000), false).await;
+	assert!(res.is_err(),
+		"spending a VTXO the server already forfeited in a delegated refresh must fail, \
+			but the send succeeded");
+	info!("unsynced OOR send correctly rejected: {:#}", res.unwrap_err());
+}
+
+#[tokio::test]
+async fn delegated_refresh_sync_cleans_up_after_input_spent_elsewhere() {
+	require_bark_version!(> "0.5.0");
+
+	let ctx = TestContext::new("bark/delegated_refresh_sync_cleans_up_after_input_spent_elsewhere").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+	let sender = ctx.bark("sender", &srv).funded(sat(1_000_000)).create().await;
+	let receiver = ctx.bark("receiver", &srv).create().await;
+
+	sender.board_and_confirm_and_register(&ctx, sat(800_000)).await;
+
+	// Request a delegated refresh: a participation sits pending on the server and
+	// a pending delegated round state sits in the wallet; the input is unlocked.
+	sender.refresh_all_delegated_no_sync().await;
+
+	// Without syncing, spend that same input via an OOR send. The server drops
+	// the pending participation and the wallet marks the input spent locally.
+	sender.send_oor_nosync(receiver.address().await, sat(300_000)).await;
+	assert_eq!(receiver.spendable_balance().await, sat(300_000));
+
+	// Now the wallet syncs. The server reports the participation gone, so the
+	// stale delegated round state must be cleaned up.
+	sender.sync().await;
+
+	let wallet = sender.client().await;
+	let pending = wallet.pending_round_states().await.unwrap();
+	assert!(
+		pending.is_empty(),
+		"a delegated refresh whose input was spent elsewhere must be cleaned up on \
+			sync, but {} round state(s) are still pending",
+		pending.len(),
+	);
+}
+
 async fn print_pending_rounds(wallet: &bark::Wallet) -> Vec<StoredRoundState<Unlocked>> {
 	let states = wallet.pending_round_states().await.unwrap();
 	info!("Wallet has {} pending round states:", states.len());
@@ -293,7 +674,7 @@ async fn stepwise_round() {
 	//! this test tests that the bark rust api can be used to participate
 	//! in rounds stepwise by manually feeding events into the wallet
 
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("bark/stepwise_round").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {
@@ -305,7 +686,7 @@ async fn stepwise_round() {
 	bark.board_and_confirm_and_register(&ctx, sat(800_000)).await;
 
 	// let vtxo almost expire
-	ctx.generate_blocks(srv.config().vtxo_lifetime as u32 - BOARD_CONFIRMATIONS).await;
+	ctx.generate_blocks(srv.config().vtxo_lifetime.to_u32() - BOARD_CONFIRMATIONS).await;
 
 	let bark = bark.client().await; // explicitly override name to avoid cli usage
 
@@ -392,9 +773,95 @@ async fn stepwise_round() {
 	//TODO(stevenroose) test new vtxo state and movement
 }
 
+
+#[tokio::test]
+async fn interactive_round_redelegates_the_inputs_it_did_not_take() {
+	//! An interactive registration leaves a pending delegated participation
+	//! alone even when they share inputs: nothing locally decides which of
+	//! the two a round will pick. The round settles it, taking the shared
+	//! input, and the inputs it did not take are re-delegated.
+
+	// Unlike the other round participation tests, this one drives its
+	// refreshes through the CLI, so it exercises the bark binary under test
+	// rather than the current bark-wallet crate. It needs a binary that
+	// re-delegates a participation that lost inputs instead of failing it
+	// wholesale.
+	require_bark_version!(> "0.7.1");
+
+	let ctx = TestContext::new("bark/interactive_round_redelegates_the_inputs_it_did_not_take").await;
+	let srv = ctx.captaind("server").cfg(|cfg| {
+		cfg.round_interval = Duration::from_secs(3600);
+	}).funded(btc(10)).create().await;
+	let bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
+
+	let [a] = bark.board_and_confirm_and_register(&ctx, sat(200_000)).await
+		.try_into().expect("one vtxo per board");
+	let [b] = bark.board_and_confirm_and_register(&ctx, sat(200_000)).await
+		.try_into().expect("one vtxo per board");
+	let [c] = bark.board_and_confirm_and_register(&ctx, sat(200_000)).await
+		.try_into().expect("one vtxo per board");
+
+	// Delegate a refresh of A and B to the server.
+	bark.run([
+		"refresh", "--delegated", "--vtxo", &a.to_string(), "--vtxo", &b.to_string(),
+	]).await;
+
+	{
+		let wallet = bark.client().await;
+		let pending = wallet.pending_round_states().await.unwrap();
+		assert_eq!(pending.len(), 1, "only the delegated participation should be pending");
+		assert_eq!(pending[0].state().flow_kind(), RoundFlowKind::DelegatedPending);
+		let inputs = pending[0].state().participation().inputs.iter()
+			.map(|v| v.id()).collect::<HashSet<_>>();
+		assert_eq!(inputs, HashSet::from([a, b]), "the delegated participation holds A and B");
+	}
+
+	// Refresh B and C interactively. B is shared with the delegated
+	// participation, which must be left untouched until the round settles it.
+	let (b_id, c_id) = (b.to_string(), c.to_string());
+	tokio::join!(
+		srv.trigger_round(),
+		bark.run(["refresh", "--vtxo", &b_id, "--vtxo", &c_id]),
+	);
+
+	// The round took B and C, so the delegated participation lost B and is
+	// resubmitted with only A. The inputs are only marked spent once the
+	// round tx is deeply confirmed, so the sync that settles the round is
+	// the one that records the re-delegation; the next one carries it out.
+	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
+	bark.sync().await;
+	bark.sync().await;
+
+	// The interactive participation stays around until the round tx confirms,
+	// so look for the delegated one specifically.
+	let wallet = bark.client().await;
+	let pending = wallet.pending_round_states().await.unwrap();
+	let delegated = pending.iter()
+		.filter(|p| p.state().flow_kind() == RoundFlowKind::DelegatedPending)
+		.collect::<Vec<_>>();
+	assert_eq!(delegated.len(), 1,
+		"exactly one delegated participation should be pending, got {:?}",
+		pending.iter().map(|p| p.state().flow_kind()).collect::<Vec<_>>(),
+	);
+	let inputs = delegated[0].state().participation().inputs.iter()
+		.map(|v| v.id()).collect::<HashSet<_>>();
+	assert_eq!(inputs, HashSet::from([a]),
+		"only A should be left in the re-delegated participation (A={}, B={}, C={})",
+		a, b, c,
+	);
+
+	// B and C were consumed by the interactive round; A is still untouched.
+	let spendable = wallet.spendable_vtxos().await.unwrap().into_iter()
+		.map(|v| v.vtxo.id()).collect::<HashSet<_>>();
+	assert!(spendable.contains(&a), "A must not have been touched by the round");
+	assert!(!spendable.contains(&b), "B must have been refreshed interactively");
+	assert!(!spendable.contains(&c), "C must have been refreshed interactively");
+}
+
+
 #[tokio::test]
 async fn multiple_round_participations_dont_race() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("bark/multiple_round_participations_dont_race").await;
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;
@@ -410,7 +877,7 @@ async fn multiple_round_participations_dont_race() {
 		.try_into().expect("should have exactly one spendable vtxo");
 	let old_vtxo_id = old_vtxo.vtxo.id();
 
-	// Build participation and join the round once, locking the vtxo.
+	// Build participation and join the round once.
 	let participation = wallet.build_refresh_participation(vec![old_vtxo_id]).await
 		.unwrap().expect("should build participation");
 	wallet.join_next_round(participation, Some(RoundMovement::Refresh)).await.unwrap();
@@ -443,6 +910,10 @@ async fn multiple_round_participations_dont_race() {
 		.try_into().expect("should have exactly one spendable vtxo after refresh");
 	assert_ne!(old_vtxo_id, new_vtxo.vtxo.id(), "old and new vtxo should not be the same");
 
+	// Settle the pool before the offboard, else it can be funded from an
+	// unconfirmed pool issuance tx.
+	srv.wait_for_vtxopool(&ctx).await;
+
 	// Offboard the new vtxo to prove it is spendable
 	let address = ctx.bitcoind().get_new_address();
 	wallet.offboard_all(address.clone()).await.unwrap();
@@ -455,7 +926,7 @@ async fn multiple_round_participations_dont_race() {
 
 #[tokio::test]
 async fn refresh_vtxos_and_participate_ongoing_rounds_dont_race() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("bark/refresh_vtxos_and_participate_ongoing_rounds_dont_race").await;
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;
@@ -502,6 +973,10 @@ async fn refresh_vtxos_and_participate_ongoing_rounds_dont_race() {
 		.try_into().expect("should have exactly one spendable vtxo after refresh");
 	assert_ne!(old_vtxo_id, new_vtxo.vtxo.id(), "old and new vtxo should not be the same");
 
+	// Settle the pool before the offboard, else it can be funded from an
+	// unconfirmed pool issuance tx.
+	srv.wait_for_vtxopool(&ctx).await;
+
 	// Offboard the new vtxo to prove it is spendable
 	let address = ctx.bitcoind().get_new_address();
 	wallet.offboard_all(address.clone()).await.unwrap();
@@ -517,7 +992,7 @@ async fn refresh_vtxos_and_participate_ongoing_rounds_dont_race() {
 /// (participate_ongoing_rounds locks the round state).
 #[tokio::test]
 async fn participate_round_and_progress_pending_dont_race() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("bark/participate_round_and_progress_pending_dont_race").await;
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;
@@ -533,7 +1008,7 @@ async fn participate_round_and_progress_pending_dont_race() {
 		.try_into().expect("should have exactly one spendable vtxo");
 	let old_vtxo_id = old_vtxo.vtxo.id();
 
-	// Build participation and join the round once, locking the vtxo.
+	// Build participation and join the round once.
 	let participation = wallet.build_refresh_participation(vec![old_vtxo_id]).await
 		.unwrap().expect("should build participation");
 	wallet.join_next_round(participation, Some(RoundMovement::Refresh)).await.unwrap();
@@ -581,6 +1056,10 @@ async fn participate_round_and_progress_pending_dont_race() {
 		.try_into().expect("should have exactly one spendable vtxo after refresh");
 	assert_ne!(old_vtxo_id, new_vtxo.vtxo.id(), "old and new vtxo should not be the same");
 
+	// Settle the pool before the offboard, else it can be funded from an
+	// unconfirmed pool issuance tx.
+	srv.wait_for_vtxopool(&ctx).await;
+
 	// Offboard the new vtxo to prove it is spendable
 	let address = ctx.bitcoind().get_new_address();
 	wallet.offboard_all(address.clone()).await.unwrap();
@@ -596,7 +1075,7 @@ async fn participate_round_and_progress_pending_dont_race() {
 /// on the same round state (participate_ongoing_rounds locks the round state).
 #[tokio::test]
 async fn participate_round_and_event_stream_processing_dont_race() {
-	require_bark_version!(> "0.1.4");
+	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("bark/participate_round_and_event_stream_processing_dont_race").await;
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;
@@ -612,7 +1091,7 @@ async fn participate_round_and_event_stream_processing_dont_race() {
 		.try_into().expect("should have exactly one spendable vtxo");
 	let old_vtxo_id = old_vtxo.vtxo.id();
 
-	// Build participation and join the round once, locking the vtxo.
+	// Build participation and join the round once.
 	let participation = wallet.build_refresh_participation(vec![old_vtxo_id]).await
 		.unwrap().expect("should build participation");
 	wallet.join_next_round(participation, Some(RoundMovement::Refresh)).await.unwrap();
@@ -655,6 +1134,10 @@ async fn participate_round_and_event_stream_processing_dont_race() {
 		.try_into().expect("should have exactly one spendable vtxo after refresh");
 	assert_ne!(old_vtxo_id, new_vtxo.vtxo.id(), "old and new vtxo should not be the same");
 
+	// Settle the pool before the offboard, else it can be funded from an
+	// unconfirmed pool issuance tx.
+	srv.wait_for_vtxopool(&ctx).await;
+
 	// Offboard the new vtxo to prove it is spendable
 	let address = ctx.bitcoind().get_new_address();
 	wallet.offboard_all(address.clone()).await.unwrap();
@@ -671,6 +1154,8 @@ async fn participate_round_and_event_stream_processing_dont_race() {
 
 #[tokio::test]
 async fn refresh_consolidates_vtxos() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("bark/refresh_consolidates_vtxos").await;
 
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;

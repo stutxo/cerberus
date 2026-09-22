@@ -3,8 +3,11 @@
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr as _;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
+use bark_runtime::Instant;
 use bdk_core::{BlockId, CheckPoint};
 use bdk_esplora::esplora_client;
 use bitcoin::constants::genesis_block;
@@ -14,11 +17,12 @@ use bitcoin::{
 use log::{debug, info, warn};
 use tokio::sync::RwLock;
 
-use bitcoin_ext::{BlockHeight, BlockRef, FeeRateExt, TxStatus};
+use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef, FeeRateExt, TxStatus};
 use bitcoin_ext::rpc;
 #[cfg(feature = "bitcoind-rpc")]
 use bitcoin_ext::rpc::{
-	BitcoinRpcClient, RPC_INVALID_ADDRESS_OR_KEY, RPC_VERIFY_ALREADY_IN_UTXO_SET,
+	BitcoinAsyncRpcExt, BitcoinRpcClient, RPC_INVALID_ADDRESS_OR_KEY,
+	RPC_VERIFY_ALREADY_IN_UTXO_SET,
 };
 #[cfg(feature = "bitcoind-rpc")]
 use bitcoind_async_client::Client as BitcoindClient;
@@ -27,9 +31,21 @@ use bitcoind_async_client::error::ClientError as BitcoindClientError;
 #[cfg(feature = "bitcoind-rpc")]
 use bitcoind_async_client::traits::{Broadcaster, Reader};
 
+use crate::daemon::tip_watcher::{TipSource, TipWatcher};
+
 const FEE_RATE_TARGET_CONF_FAST: u16 = 1;
 const FEE_RATE_TARGET_CONF_REGULAR: u16 = 3;
 const FEE_RATE_TARGET_CONF_SLOW: u16 = 6;
+
+/// Coalesce bursts of `tip()` calls within the same `Wallet::sync()` cycle
+/// (parallel sub-syncs each fetch tip, and the exit progress state machine
+/// fetches it twice per iteration). Short enough to be invisible to tests
+/// and UI; long enough to dedupe within a single sync burst.
+const TIP_CACHE_TTL: Duration = Duration::from_secs(1);
+
+/// Fee estimates change on the scale of minutes, so refreshing more often
+/// than this buys nothing while costing one HTTP round trip per sync tick.
+const FEE_RATES_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "bitcoind-rpc")]
 const MIN_BITCOIND_VERSION: usize = 290000;
@@ -44,7 +60,8 @@ const MIN_BITCOIND_VERSION: usize = 290000;
 /// [ChainSource::new] along with the expected [Network].
 ///
 /// Notes:
-/// - For [ChainSourceSpec::Bitcoind], authentication must be provided (cookie file or user/pass).
+/// - For [ChainSourceSpec::Bitcoind], authentication must be provided (cookie file or user/pass)
+///   and the node must run with `txindex=1`.
 #[derive(Clone, Debug)]
 pub enum ChainSourceSpec {
 	Bitcoind {
@@ -52,6 +69,9 @@ pub enum ChainSourceSpec {
 		url: String,
 		/// Authentication method for JSON-RPC (cookie file or user/pass).
 		auth: rpc::Auth,
+		/// ZMQ endpoint of the node (e.g. `tcp://127.0.0.1:28332`), used to get
+		/// notified of new blocks. When unset, the chain tip is polled instead.
+		zmq: Option<String>,
 	},
 	Esplora {
 		/// Base URL of the esplora-electrs instance (e.g. <https://esplora.signet.2nd.dev>).
@@ -131,6 +151,7 @@ impl ChainSourceClient {
 /// let spec = ChainSourceSpec::Bitcoind {
 ///     url: "http://localhost:8332".into(),
 ///     auth: Auth::UserPass("user".into(), "password".into()),
+///     zmq: None,
 /// };
 /// let network = Network::Bitcoin;
 /// let fallback_fee = FeeRate::from_sat_per_vb(5);
@@ -143,7 +164,15 @@ impl ChainSourceClient {
 pub struct ChainSource {
 	inner: ChainSourceClient,
 	network: Network,
+	/// The ZMQ endpoint of the bitcoind backend, if one was configured.
+	zmq_endpoint: Option<String>,
 	fee_rates: RwLock<FeeRates>,
+	/// `None` until the first successful (or fallback) `update_fee_rates`.
+	/// `Some(t)` makes subsequent calls within `FEE_RATES_CACHE_TTL` a no-op.
+	fee_rates_fetched_at: RwLock<Option<Instant>>,
+	/// Last observed tip with the time it was fetched, used to short-circuit
+	/// repeat `tip_ref()` / `tip()` calls within `TIP_CACHE_TTL`.
+	tip_cache: RwLock<Option<(BlockRef, Instant)>>,
 }
 
 impl ChainSource {
@@ -217,9 +246,9 @@ impl ChainSource {
 		fallback_fee: Option<FeeRate>,
 		#[cfg(feature = "socks5-proxy")] proxy: Option<&str>,
 	) -> anyhow::Result<Self> {
-		let inner = match spec {
+		let (inner, zmq_endpoint) = match spec {
 			#[cfg(feature = "bitcoind-rpc")]
-			ChainSourceSpec::Bitcoind { url, auth } => {
+			ChainSourceSpec::Bitcoind { url, auth, zmq } => {
 				// `bdk_bitcoind_rpc::Emitter` is sync-only upstream, so we keep
 				// a sync companion to drive it inside `spawn_blocking`. The async
 				// client is used everywhere else. `BitcoinRpcClient` (rather
@@ -240,24 +269,29 @@ impl ChainSource {
 				};
 				let rpc = BitcoindClient::new(url, async_auth, None, None, None)
 					.context("failed to create async bitcoind rpc client")?;
-				ChainSourceClient::Bitcoind { rpc, sync }
+				rpc.require_txindex().await?;
+				(ChainSourceClient::Bitcoind { rpc, sync }, zmq)
 			},
 			#[cfg(not(feature = "bitcoind-rpc"))]
 			ChainSourceSpec::Bitcoind { .. } => bail!(
 				"bitcoind RPC backend is not available: this build was compiled without \
 				 the `bitcoind-rpc` feature (notably the wasm-web build)",
 			),
-			ChainSourceSpec::Esplora { url } => ChainSourceClient::Esplora({
+			ChainSourceSpec::Esplora { url } => (ChainSourceClient::Esplora({
+				let url = crate::utils::url_with_default_https_scheme(&url);
 				// the esplora client doesn't deal well with trailing slash in url
 				let url = url.strip_suffix("/").unwrap_or(&url);
+				#[cfg(feature = "socks5-proxy")]
 				let mut builder = esplora_client::Builder::new(url);
+				#[cfg(not(feature = "socks5-proxy"))]
+				let builder = esplora_client::Builder::new(url);
 				#[cfg(feature = "socks5-proxy")]
 				if let Some(proxy) = proxy {
 					builder = builder.proxy(proxy);
 				}
 				builder.build_async()
 					.with_context(|| format!("failed to create esplora client for url {}", url))?
-			}),
+			}), None),
 		};
 
 		inner.check_network(network).await?;
@@ -265,7 +299,14 @@ impl ChainSource {
 		let fee = fallback_fee.unwrap_or(FeeRate::BROADCAST_MIN);
 		let fee_rates = RwLock::new(FeeRates { fast: fee, regular: fee, slow: fee });
 
-		Ok(Self { inner, network, fee_rates })
+		Ok(Self {
+			inner,
+			network,
+			zmq_endpoint,
+			fee_rates,
+			fee_rates_fetched_at: RwLock::new(None),
+			tip_cache: RwLock::new(None),
+		})
 	}
 
 	async fn fetch_fee_rates(&self) -> anyhow::Result<FeeRates> {
@@ -313,32 +354,86 @@ impl ChainSource {
 		}
 	}
 
-	pub async fn tip(&self) -> anyhow::Result<BlockHeight> {
+	/// The ZMQ endpoint of the bitcoind backend, if one was configured.
+	///
+	/// Always `None` for the Esplora backend.
+	pub fn zmq_endpoint(&self) -> Option<&str> {
+		self.zmq_endpoint.as_deref()
+	}
+
+	async fn fetch_tip(&self) -> anyhow::Result<BlockHeight> {
 		match self.inner() {
 			#[cfg(feature = "bitcoind-rpc")]
 			ChainSourceClient::Bitcoind { rpc, .. } => {
-				let count = rpc.get_block_count().await?;
-				Ok(count as BlockHeight)
+				Ok(BlockHeight::new(rpc.get_block_count().await? as u32))
 			},
 			ChainSourceClient::Esplora(client) => {
-				Ok(client.get_height().await?)
+				Ok(client.get_height().await?.into())
 			},
 		}
 	}
 
 	pub async fn tip_ref(&self) -> anyhow::Result<BlockRef> {
-		self.block_ref(self.tip().await?).await
+		if let Some((block_ref, fetched_at)) = *self.tip_cache.read().await {
+			if fetched_at.elapsed() < TIP_CACHE_TTL {
+				return Ok(block_ref);
+			}
+		}
+		let block_ref = self.tip_ref_uncached().await?;
+		self.record_observed_tip(block_ref).await;
+		Ok(block_ref)
+	}
+
+	pub async fn tip(&self) -> anyhow::Result<BlockHeight> {
+		Ok(self.tip_ref().await?.height)
+	}
+
+	/// Store an observed tip as the current `tip_cache` entry.
+	async fn record_observed_tip(&self, block_ref: BlockRef) {
+		*self.tip_cache.write().await = Some((block_ref, Instant::now()));
+	}
+
+	/// Drop the cached tip and fee-rate values, forcing the next call to
+	/// `tip()` or `update_fee_rates()` to round-trip the backend. Useful
+	/// in tests that fabricate chain changes faster than the TTL so the
+	/// next observation is deterministic without sleeping.
+	pub async fn invalidate_caches(&self) {
+		*self.tip_cache.write().await = None;
+		*self.fee_rates_fetched_at.write().await = None;
+	}
+
+	/// The current tip, always round-tripping the backend instead of serving
+	/// the `TIP_CACHE_TTL` cache. Used by the tip watcher, which only fetches
+	/// when there is reason to believe the tip changed.
+	pub(crate) async fn tip_ref_uncached(&self) -> anyhow::Result<BlockRef> {
+		self.block_ref(self.fetch_tip().await?).await
+	}
+
+	/// Starts a [TipWatcher] tracking the chain tip of this source.
+	///
+	/// When this source has a ZMQ endpoint configured, block notifications
+	/// wake the watcher and `poll_interval` becomes the reconcile interval;
+	/// otherwise the tip is polled at `poll_interval`.
+	pub async fn tip_watcher(
+		self: &Arc<Self>,
+		poll_interval: Duration,
+	) -> anyhow::Result<TipWatcher> {
+		#[cfg(all(feature = "bitcoind-rpc", not(target_arch = "wasm32")))]
+		if let Some(zmq) = self.zmq_endpoint() {
+			return TipWatcher::start_zmq(self.clone(), zmq, poll_interval).await;
+		}
+		TipWatcher::start_poll(self.clone(), poll_interval).await
 	}
 
 	pub async fn block_ref(&self, height: BlockHeight) -> anyhow::Result<BlockRef> {
 		match self.inner() {
 			#[cfg(feature = "bitcoind-rpc")]
 			ChainSourceClient::Bitcoind { rpc, .. } => {
-				let hash = rpc.get_block_hash(height as u64).await?;
+				let hash = rpc.get_block_hash(height.into()).await?;
 				Ok(BlockRef { height, hash })
 			},
 			ChainSourceClient::Esplora(client) => {
-				let hash = client.get_block_hash(height).await?;
+				let hash = client.get_block_hash(height.into()).await?;
 				Ok(BlockRef { height, hash })
 			},
 		}
@@ -437,10 +532,10 @@ impl ChainSource {
 			#[cfg(feature = "bitcoind-rpc")]
 			ChainSourceClient::Bitcoind { sync, .. } => {
 				// We must offset the height to account for the fact we iterate using next_block()
-				let start = block_scan_start.saturating_sub(1);
+				let start = block_scan_start.saturating_sub(BlockDelta::new(1));
 				let block_ref = self.block_ref(start).await?;
 				let cp = CheckPoint::new(BlockId {
-					height: block_ref.height,
+					height: block_ref.height.into(),
 					hash: block_ref.hash,
 				});
 
@@ -470,7 +565,7 @@ impl ChainSource {
 										txin.previous_output.clone(),
 										tx.compute_txid(),
 										TxStatus::Confirmed(BlockRef {
-											height: em.block_height(),
+											height: em.block_height().into(),
 											hash: em.block.block_hash().clone(),
 										}),
 									);
@@ -512,7 +607,7 @@ impl ChainSource {
 								let status = output_status.status.expect("Status should be valid if an outpoint is spent");
 								if status.confirmed {
 									TxStatus::Confirmed(BlockRef {
-										height: status.block_height.expect("Confirmed transaction missing block_height"),
+										height: status.block_height.expect("Confirmed transaction missing block_height").into(),
 										hash: status.block_hash.expect("Confirmed transaction missing block_hash"),
 									})
 								} else {
@@ -534,7 +629,7 @@ impl ChainSource {
 		match self.inner() {
 			#[cfg(feature = "bitcoind-rpc")]
 			ChainSourceClient::Bitcoind { rpc, .. } => {
-				match rpc.send_raw_transaction(tx).await {
+				match rpc.send_raw_transaction(tx, None).await {
 					Ok(_) => Ok(()),
 					Err(e) if is_in_utxo_set(&e) => Ok(()),
 					Err(e) => Err(e.into()),
@@ -547,35 +642,39 @@ impl ChainSource {
 		}
 	}
 
-	pub async fn broadcast_package(&self, txs: &[impl Borrow<Transaction>]) -> anyhow::Result<()> {
+	pub async fn broadcast_package(&self, txs: &[impl Borrow<Transaction>]) -> Result<(), BroadcastError> {
+		let package_order = txs.iter()
+			.map(|t| t.borrow().compute_txid())
+			.collect::<Vec<_>>();
 		match self.inner() {
 			#[cfg(feature = "bitcoind-rpc")]
 			ChainSourceClient::Bitcoind { rpc, .. } => {
 				let hexes: Vec<String> = txs.iter()
 					.map(|t| bitcoin::consensus::encode::serialize_hex(t.borrow()))
 					.collect();
-				let res: rpc::SubmitPackageResult =
-					rpc.call_raw("submitpackage", &[hexes.into()]).await?;
+				let res: rpc::SubmitPackageResult = rpc.call_raw("submitpackage", &[hexes.into()])
+					.await
+					.map_err(|e| BroadcastError::Other(e.to_string()))?;
 				if res.package_msg != "success" {
-					let errors = res.tx_results.values()
-						.map(|t| format!("tx {}: {}",
-							t.txid, t.error.as_ref().map(|s| s.as_str()).unwrap_or("(no error)"),
-						))
-						.collect::<Vec<_>>();
-					bail!("msg: '{}', errors: {:?}", res.package_msg, errors);
+					return Err(classify_submit_package_errors(
+						&res.package_msg,
+						res.tx_results.values().map(|t| (t.txid, t.error.as_deref())),
+						&package_order,
+					));
 				}
 				Ok(())
 			},
 			ChainSourceClient::Esplora(client) => {
 				let txs = txs.iter().map(|t| t.borrow().clone()).collect::<Vec<_>>();
-				let res = client.submit_package(&txs, None, None).await?;
+				let res = client.submit_package(&txs, None, None)
+					.await
+					.map_err(|e| BroadcastError::Other(e.to_string()))?;
 				if res.package_msg != "success" {
-					let errors = res.tx_results.values()
-						.map(|t| format!("tx {}: {}",
-							t.txid, t.error.as_ref().map(|s| s.as_str()).unwrap_or("(no error)"),
-						))
-						.collect::<Vec<_>>();
-					bail!("msg: '{}', errors: {:?}", res.package_msg, errors);
+					return Err(classify_submit_package_errors(
+						&res.package_msg,
+						res.tx_results.values().map(|t| (t.txid, t.error.as_deref())),
+						&package_order,
+					));
 				}
 
 				Ok(())
@@ -613,7 +712,7 @@ impl ChainSource {
 				match esplora.get_tx_info(&txid).await? {
 					Some(info) => match (info.status.block_height, info.status.block_hash) {
 						(Some(block_height), Some(block_hash)) => Ok(TxStatus::Confirmed(BlockRef {
-							height: block_height,
+							height: block_height.into(),
 							hash: block_hash,
 						} )),
 						_ => Ok(TxStatus::Mempool),
@@ -641,22 +740,76 @@ impl ChainSource {
 		Ok(tx.output.get(outpoint.vout as usize).context("outpoint vout out of range")?.value)
 	}
 
+	/// Whether `outpoint` has been spent by a transaction that is confirmed, i.e.
+	/// whether any transaction spending it can still be mined.
+	///
+	/// A spend sitting only in the mempool reports `false`: it can still be
+	/// replaced, so it decides nothing.
+	///
+	/// The caller must know `outpoint`'s own transaction is confirmed. `gettxout`
+	/// reads the confirmed utxo set, so it cannot tell an output spent on-chain
+	/// apart from one whose transaction has yet to be mined.
+	pub async fn outpoint_spent_confirmed(&self, outpoint: OutPoint) -> anyhow::Result<bool> {
+		match self.inner() {
+			#[cfg(feature = "bitcoind-rpc")]
+			ChainSourceClient::Bitcoind { rpc, .. } => {
+				// `include_mempool: false` keeps a mempool-only spend out of the
+				// answer: the output stays in the confirmed set until its spender is
+				// mined.
+				let utxo = rpc.try_get_tx_out(outpoint, false).await
+					.with_context(|| format!("gettxout {} failed", outpoint))?;
+				Ok(utxo.is_none())
+			},
+			ChainSourceClient::Esplora(client) => {
+				let status = client.get_output_status(&outpoint.txid, outpoint.vout as u64).await
+					.with_context(|| format!("outspend lookup for {} failed", outpoint))?;
+				Ok(status.is_some_and(|s| {
+					s.spent && s.status.is_some_and(|s| s.confirmed)
+				}))
+			},
+		}
+	}
+
 	/// Gets the current fee rates from the chain source, falling back to user-specified values if
-	/// necessary
+	/// necessary.
+	///
+	/// No-ops if a previous successful call ran within `FEE_RATES_CACHE_TTL`.
+	/// The fallback path overwrites the cached rates but deliberately does
+	/// not advance the cache timestamp, so the next call retries the backend
+	/// instead of serving the fallback for another full TTL.
 	pub async fn update_fee_rates(&self, fallback_fee: Option<FeeRate>) -> anyhow::Result<()> {
-		let fee_rates = match (self.fetch_fee_rates().await, fallback_fee) {
-			(Ok(fee_rates), _) => Ok(fee_rates),
-			(Err(e), None) => Err(e),
+		if let Some(fetched_at) = *self.fee_rates_fetched_at.read().await {
+			if fetched_at.elapsed() < FEE_RATES_CACHE_TTL {
+				return Ok(());
+			}
+		}
+		let (fee_rates, used_fallback) = match (self.fetch_fee_rates().await, fallback_fee) {
+			(Ok(fee_rates), _) => (fee_rates, false),
+			(Err(e), None) => return Err(e),
 			(Err(e), Some(fallback)) => {
 				warn!("Error getting fee rates, falling back to {} sat/kvB: {}",
 					fallback.to_btc_per_kvb(), e,
 				);
-				Ok(FeeRates { fast: fallback, regular: fallback, slow: fallback })
+				(FeeRates { fast: fallback, regular: fallback, slow: fallback }, true)
 			}
-		}?;
+		};
 
 		*self.fee_rates.write().await = fee_rates;
+		if !used_fallback {
+			*self.fee_rates_fetched_at.write().await = Some(Instant::now());
+		}
 		Ok(())
+	}
+}
+
+impl TipSource for ChainSource {
+	async fn tip_ref(&self) -> anyhow::Result<BlockRef> {
+		let block_ref = ChainSource::tip_ref_uncached(self).await?;
+		// The tip watcher observes new blocks before any subscriber
+		// reacts. Refresh `tip_cache` here so callers of `tip()` cannot
+		// serve a height older than what the watcher already knows.
+		self.record_observed_tip(block_ref).await;
+		Ok(block_ref)
 	}
 }
 
@@ -700,7 +853,7 @@ async fn bitcoind_tx_status(
 	).await?;
 	if header.confirmations > 0 {
 		Ok(TxStatus::Confirmed(BlockRef {
-			height: header.height as BlockHeight,
+			height: BlockHeight::new(header.height as u32),
 			hash: header.hash,
 		}))
 	} else {
@@ -779,5 +932,152 @@ impl TxsSpendingInputsResult {
 			.iter()
 			.filter(|(_, (_, status))| matches!(status, TxStatus::Mempool))
 			.map(|(_, (txid, _))| *txid)
+	}
+}
+
+/// Classified failure modes when broadcasting a transaction package.
+///
+/// The reject reasons covered by the typed variants are stable Bitcoin Core mempool policy
+/// constants (`txn-already-known`, `bad-txns-inputs-missingorspent`, `insufficient fee, rejecting
+/// replacement`). Esplora forwards bitcoind's reject reasons verbatim, so the same matching works
+/// for both backends.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BroadcastError {
+	/// The transaction is already in the mempool. Treated as success for retry-safety.
+	#[error("transaction already known to the mempool")]
+	AlreadyKnown,
+	/// Inputs are missing or already spent — typically a conflicting replacement is in the mempool.
+	#[error("transaction inputs are missing or already spent")]
+	MissingOrSpentInputs,
+	/// The replacement fee is insufficient under RBF policy.
+	#[error("insufficient fee, rejecting replacement")]
+	InsufficientReplacementFee,
+	/// Any other failure (unrecognized reject reason, RPC/transport error, etc.).
+	#[error("{0}")]
+	Other(String),
+}
+
+impl BroadcastError {
+	/// True if the error means the transaction (or an equivalent one) is already known to the
+	/// network — i.e., not a sign that our transaction is invalid.
+	pub fn is_mempool_conflict(&self) -> bool {
+		matches!(
+			self,
+			BroadcastError::AlreadyKnown
+				| BroadcastError::MissingOrSpentInputs
+				| BroadcastError::InsufficientReplacementFee,
+		)
+	}
+}
+
+fn classify_submit_package_errors<'a>(
+	package_msg: &str,
+	tx_results: impl Iterator<Item = (Txid, Option<&'a str>)>,
+	package_order: &[Txid],
+) -> BroadcastError {
+	// `submitpackage` returns tx_results keyed (and thus iterated) by wtxid, not in
+	// package order. Within a package, rejections only cascade downstream: when an
+	// ancestor is rejected, every descendant necessarily fails with
+	// bad-txns-inputs-missingorspent because the output it spends never came into
+	// existence.
+	let mut results: Vec<(Txid, Option<&'a str>)> = tx_results.collect();
+	results.sort_by_key(|(txid, _)| {
+		package_order.iter().position(|t| t == txid).unwrap_or(usize::MAX)
+	});
+
+	let mut saw_already_known = false;
+	let mut root_cause = None;
+	for (_, err) in &results {
+		if let Some(err) = err {
+			if err.contains("txn-already-known") {
+				// Effectively success for this tx; keep looking for a real failure.
+				saw_already_known = true;
+				continue;
+			}
+			root_cause = Some(*err);
+			break;
+		} else {
+			continue;
+		}
+	}
+
+	match root_cause {
+		Some(e) if e.contains("bad-txns-inputs-missingorspent") => {
+			BroadcastError::MissingOrSpentInputs
+		},
+		Some(e) if e.contains("insufficient fee, rejecting replacement") => {
+			BroadcastError::InsufficientReplacementFee
+		},
+		Some(_) => {
+			let combined = results.iter()
+				.map(|(txid, e)| format!("tx {}: {}", txid, e.unwrap_or("(no error)")))
+				.collect::<Vec<_>>()
+				.join(", ");
+			BroadcastError::Other(format!("msg: '{}', errors: [{}]", package_msg, combined))
+		},
+		None if saw_already_known => BroadcastError::AlreadyKnown,
+		None => BroadcastError::Other(format!("msg: '{}', no tx errors", package_msg)),
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+	use std::str::FromStr;
+
+	#[test]
+	fn classify_package_errors_attributes_root_cause_in_package_order() {
+		let parent = Txid::from_str(
+			"1111111111111111111111111111111111111111111111111111111111111111").unwrap();
+		let child = Txid::from_str(
+			"2222222222222222222222222222222222222222222222222222222222222222").unwrap();
+		let order = [parent, child];
+
+		// Only the child fails: its own (non-package) input is spent. This is the
+		// genuine dead-CPFP case and must classify as MissingOrSpentInputs.
+		let res = classify_submit_package_errors("transaction failed", [
+			(parent, None),
+			(child, Some("bad-txns-inputs-missingorspent")),
+		].into_iter(), &order);
+		assert_eq!(res, BroadcastError::MissingOrSpentInputs);
+
+		// The parent fails for an unrelated reason; the child's missingorspent is only
+		// the cascade of the parent never existing. The parent's error is the root
+		// cause, so this must NOT classify as MissingOrSpentInputs. Results are fed in
+		// wtxid order (child first) to mimic submitpackage's map ordering.
+		let res = classify_submit_package_errors("transaction failed", [
+			(child, Some("bad-txns-inputs-missingorspent")),
+			(parent, Some("version")),
+		].into_iter(), &order);
+		assert!(matches!(res, BroadcastError::Other(_)), "got {:?}", res);
+
+		// The parent being already known is success for the parent, not the root
+		// cause: the child's failure must win over it.
+		let res = classify_submit_package_errors("transaction failed", [
+			(parent, Some("txn-already-known")),
+			(child, Some("bad-txns-inputs-missingorspent")),
+		].into_iter(), &order);
+		assert_eq!(res, BroadcastError::MissingOrSpentInputs);
+
+		// Everything already known: the package is effectively in the mempool.
+		let res = classify_submit_package_errors("transaction failed", [
+			(parent, Some("txn-already-known")),
+			(child, Some("txn-already-known")),
+		].into_iter(), &order);
+		assert_eq!(res, BroadcastError::AlreadyKnown);
+
+		// RBF rejection on the child with a clean parent.
+		let res = classify_submit_package_errors("transaction failed", [
+			(parent, None),
+			(child, Some("insufficient fee, rejecting replacement")),
+		].into_iter(), &order);
+		assert_eq!(res, BroadcastError::InsufficientReplacementFee);
+
+		// No per-tx errors at all: fall back to the package message.
+		let res = classify_submit_package_errors("package-mempool-limits", [
+			(parent, None),
+			(child, None),
+		].into_iter(), &order);
+		assert!(matches!(res, BroadcastError::Other(ref s) if s.contains("package-mempool-limits")));
 	}
 }

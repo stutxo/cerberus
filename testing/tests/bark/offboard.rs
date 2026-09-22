@@ -1,16 +1,19 @@
+
 use bitcoin::Amount;
 use bitcoin_ext::P2TR_DUST_SAT;
 
 use bark_json::movements::{MovementDestination, PaymentMethod};
 
-use ark_testing::{btc, sat, TestContext};
+use ark_testing::{btc, is_bark_version, sat, TestContext, require_bark_version};
 use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
 use ark_testing::util::ToAltString;
 
 #[tokio::test]
 async fn offboard_all() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("bark/offboard_all").await;
-	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+	let srv = ctx.captaind("server").no_vtxo_pool().funded(btc(10)).create().await;
 	let bark1 = ctx.bark("bark1", &srv).funded(sat(1_000_000)).create().await;
 	let bark2 = ctx.bark("bark2", &srv).funded(sat(1_000_000)).create().await;
 
@@ -30,10 +33,7 @@ async fn offboard_all() {
 	let init_balance = bark1.spendable_balance().await;
 	assert_eq!(init_balance, sat(830_000));
 
-	tokio::join!(
-		srv.trigger_round(),
-		bark1.offboard_all(&address),
-	);
+	bark1.offboard_all(&address).await;
 
 	// We check that all vtxos have been offboarded
 	assert_eq!(Amount::ZERO, bark1.spendable_balance().await);
@@ -59,8 +59,10 @@ async fn offboard_all() {
 
 #[tokio::test]
 async fn offboard_vtxos() {
+	require_bark_version!(> "0.5.0");
+
 	let ctx = TestContext::new("bark/offboard_vtxos").await;
-	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+	let srv = ctx.captaind("server").no_vtxo_pool().funded(btc(10)).create().await;
 	let bark1 = ctx.bark("bark1", &srv).funded(sat(1_000_000)).create().await;
 	let bark2 = ctx.bark("bark2", &srv).funded(sat(1_000_000)).create().await;
 
@@ -85,10 +87,7 @@ async fn offboard_vtxos() {
 	let address = ctx.bitcoind().get_new_address();
 	let vtxo_to_offboard = &vtxos[1];
 
-	tokio::join!(
-		srv.trigger_round(),
-		bark1.offboard_vtxo(vtxo_to_offboard.id, &address),
-	);
+	bark1.offboard_vtxo(vtxo_to_offboard.id, &address).await;
 
 	// We check that only selected vtxo has been touched
 	let updated_vtxos = bark1.vtxos().await
@@ -122,7 +121,7 @@ async fn offboard_vtxos() {
 #[tokio::test]
 async fn bark_send_onchain() {
 	let ctx = TestContext::new("bark/bark_send_onchain").await;
-	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+	let srv = ctx.captaind("server").no_vtxo_pool().funded(btc(10)).create().await;
 	let bark1 = ctx.bark("bark1", &srv).funded(sat(1_000_000)).create().await;
 	let bark2 = ctx.bark("bark2", &srv).create().await;
 
@@ -136,8 +135,12 @@ async fn bark_send_onchain() {
 	ctx.generate_blocks(2).await;
 
 	let offboard_fee = sat(938);
-	let [change_vtxo] = bark1.vtxos().await.try_into().expect("should have one vtxo");
-	assert_eq!(change_vtxo.amount, input_vtxo.amount - send_amount - offboard_fee);
+	// bark > 0.6.1 splits change in two
+	let nb_change = if is_bark_version!(> "0.6.1") { 2 } else { 1 };
+	let change_vtxos = bark1.vtxos().await;
+	assert_eq!(change_vtxos.len(), nb_change);
+	let change_total = change_vtxos.iter().map(|v| v.amount).sum::<Amount>();
+	assert_eq!(change_total, input_vtxo.amount - send_amount - offboard_fee);
 
 	let movements = bark1.history().await;
 	let send_movement = movements.last().unwrap();
@@ -199,7 +202,12 @@ async fn bark_rejects_offboarding_dust_amount() {
 	let addr = bark2.get_onchain_address().await;
 
 	let err = bark1.try_send_onchain(&addr, sat(P2TR_DUST_SAT - 1)).await.unwrap_err();
-	assert!(err.to_alt_string().contains(
-		"it doesn't make sense to send dust",
-	), "err: {err}");
+	let err = err.to_alt_string();
+	assert!(
+		// current wallet
+		err.contains("the minimum you can send")
+		// bark <= 0.2.x under the backward-compat jobs
+		|| err.contains("it doesn't make sense to send dust"),
+		"err: {err}",
+	);
 }

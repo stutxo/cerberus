@@ -2,8 +2,10 @@
 use std::fmt;
 
 use anyhow::Context;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -99,6 +101,20 @@ macro_rules! badarg {
 }
 pub(crate) use badarg;
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UnprocessableEntityError {
+	pub message: String,
+}
+
+macro_rules! unprocessable {
+	($($arg:tt)*) => {
+		return Err($crate::error::ErrorResponse::UnprocessableEntity($crate::error::UnprocessableEntityError {
+			message: format!($($arg)*),
+		}))
+	};
+}
+pub(crate) use unprocessable;
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UnauthorizedError {
@@ -126,6 +142,7 @@ pub struct InternalServerError {
 pub enum ErrorResponse {
 	Unauthorized(UnauthorizedError),
 	BadRequest(BadRequestError),
+	UnprocessableEntity(UnprocessableEntityError),
 	NotFound(NotFoundError),
 	Internal(InternalServerError),
 }
@@ -135,9 +152,26 @@ impl ErrorResponse {
 		match self {
 			Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
 			Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+			Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
 			Self::NotFound(_) => StatusCode::NOT_FOUND,
 			Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
 		}
+	}
+
+	pub fn message(&self) -> &str {
+		match self {
+			Self::Unauthorized(e) => &e.message,
+			Self::BadRequest(e) => &e.message,
+			Self::UnprocessableEntity(e) => &e.message,
+			Self::NotFound(e) => &e.message,
+			Self::Internal(e) => &e.message,
+		}
+	}
+}
+
+impl fmt::Display for ErrorResponse {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "{}: {}", self.status_code(), self.message())
 	}
 }
 
@@ -160,10 +194,36 @@ impl From<anyhow::Error> for ErrorResponse {
 	}
 }
 
+/// Response extension so [log_errors] can report the message without
+/// having to read the response body.
+#[derive(Clone)]
+struct ErrorMessage(String);
+
 impl IntoResponse for ErrorResponse {
-	fn into_response(self) -> axum::response::Response {
-		(self.status_code(), Json(self)).into_response()
+	fn into_response(self) -> Response {
+		let message = ErrorMessage(self.message().to_owned());
+		let mut response = (self.status_code(), Json(self)).into_response();
+		response.extensions_mut().insert(message);
+		response
 	}
+}
+
+/// Log requests that failed with a server error, as they are otherwise only
+/// visible to the caller.
+pub async fn log_errors(req: Request<Body>, next: Next) -> Response {
+	let method = req.method().clone();
+	let path = req.uri().path().to_owned();
+
+	let response = next.run(req).await;
+
+	if response.status().is_server_error() {
+		let message = response.extensions().get::<ErrorMessage>()
+			.map(|m| m.0.as_str())
+			.unwrap_or("no message");
+		log::warn!("{} {} failed with {}: {}", method, path, response.status(), message);
+	}
+
+	response
 }
 
 /// Extension trait for adding bark-server-specific error info.
@@ -202,7 +262,7 @@ where
 
 // 404 handler for unmatched routes
 pub async fn route_not_found(path: String) -> (StatusCode, Json<String>) {
-	(StatusCode::NOT_FOUND, Json(format!("path not round: {}", path)))
+	(StatusCode::NOT_FOUND, Json(format!("path not found: {}", path)))
 }
 
 // Convenience type alias for handlers that return anyhow::Result

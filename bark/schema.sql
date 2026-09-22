@@ -35,7 +35,7 @@ CREATE TABLE bark_exit_states (
 				vtxo_id TEXT PRIMARY KEY,
 				state TEXT NOT NULL,
 				history TEXT NOT NULL
-			);
+			, movement_id INTEGER REFERENCES bark_movements(id));
 CREATE TABLE bark_vtxo_key (
 				public_key TEXT NOT NULL PRIMARY KEY,
 				idx INTEGER NOT NULL UNIQUE
@@ -86,7 +86,7 @@ CREATE TABLE bark_vtxo (
 				expiry_height INTEGER,
 				amount_sat INTEGER,
 				created_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
-			, raw_bare BLOB, raw_genesis BLOB, exit_depth INTEGER, exit_tx_weight INTEGER);
+			, raw_bare BLOB, raw_genesis BLOB, exit_depth INTEGER, exit_tx_weight INTEGER, registered INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS "bark_movements" (
 					id                INTEGER  PRIMARY KEY AUTOINCREMENT NOT NULL UNIQUE,
 					status            TEXT     NOT NULL,
@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS "bark_movements" (
 					created_at        DATETIME NOT NULL,
 					updated_at        DATETIME NOT NULL,
 					completed_at      DATETIME
-				);
+				, action_id TEXT);
 CREATE TABLE bark_movements_input_vtxos (
 					movement_id INTEGER NOT NULL REFERENCES bark_movements(id),
 					vtxo_id     TEXT    NOT NULL,
@@ -119,14 +119,6 @@ CREATE TABLE bark_mailbox_checkpoint (
 				id INTEGER PRIMARY KEY CHECK (id = 1),
 				checkpoint INTEGER NOT NULL,
 				updated_at DATETIME NOT NULL
-			);
-CREATE TABLE bark_pending_offboard (
-				movement_id INTEGER PRIMARY KEY,
-				offboard_txid TEXT NOT NULL,
-				offboard_tx BLOB NOT NULL,
-				vtxo_ids TEXT NOT NULL,
-				created_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
-				destination TEXT NOT NULL
 			);
 CREATE TABLE IF NOT EXISTS "bark_movements_sent_to" (
 				movement_id      INTEGER NOT NULL REFERENCES bark_movements(id),
@@ -192,6 +184,26 @@ CREATE INDEX movements_sent_to_idx
 				ON bark_movements_sent_to (destination_type, destination_value);
 CREATE INDEX movements_received_on_idx
 				ON bark_movements_received_on (destination_type, destination_value);
+CREATE TABLE bark_wallet_action_checkpoint (
+				id         TEXT PRIMARY KEY,
+				payload    BLOB NOT NULL,
+				created_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
+				updated_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+			);
+CREATE TABLE bark_paid_invoice (
+				payment_hash TEXT PRIMARY KEY,
+				preimage     TEXT NOT NULL,
+				paid_at      DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+			);
+CREATE TABLE bark_settled_lightning_receive (
+				payment_hash TEXT PRIMARY KEY,
+				preimage     TEXT NOT NULL,
+				invoice      TEXT NOT NULL,
+				amount_sat   INTEGER NOT NULL,
+				settled_at   DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+			);
+CREATE UNIQUE INDEX idx_bark_movements_action_id
+				ON bark_movements (action_id) WHERE action_id IS NOT NULL;
 CREATE VIEW vtxo_view AS
 			SELECT
 				v.id,
@@ -200,6 +212,7 @@ CREATE VIEW vtxo_view AS
 				v.raw_bare,
 				v.exit_depth,
 				v.exit_tx_weight,
+				v.registered,
 				v.created_at,
 				vs.state,
 				vs.state_kind,
@@ -207,4 +220,4 @@ CREATE VIEW vtxo_view AS
 			FROM bark_vtxo as v
 			JOIN most_recent_vtxo_state as vs
 				ON v.id = vs.vtxo_id
-/* vtxo_view(id,expiry_height,amount_sat,raw_bare,exit_depth,exit_tx_weight,created_at,state,state_kind,last_updated_at) */;
+/* vtxo_view(id,expiry_height,amount_sat,raw_bare,exit_depth,exit_tx_weight,registered,created_at,state,state_kind,last_updated_at) */;

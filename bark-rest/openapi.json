@@ -11,7 +11,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.1.4"
+    "version": "0.7.1"
   },
   "paths": {
     "/api/v1/bitcoin/tip": {
@@ -148,6 +148,69 @@
         }
       }
     },
+    "/api/v1/exits/cancel/{vtxo_id}": {
+      "post": {
+        "tags": [
+          "exits"
+        ],
+        "summary": "Cancel an exit",
+        "description": "Aborts an in-progress emergency exit while it is still safe to do so—before its final transaction has been broadcast. Exit transactions are ordered topologically and only the final one moves the VTXO on-chain, so an exit can still be canceled even after its shared ancestor transactions are in the mempool or a block. Canceling leaves the VTXO spendable, so a fresh exit can be started for it later. Before canceling, the endpoint verifies directly against the chain that the final transaction hasn't been broadcast; nothing is rebroadcast in the process. Canceling an already-canceled exit succeeds as a no-op, so retries are safe. Note the daemon auto-progresses exits at the cadence defined by `SLOW_INTERVAL`, so cancel promptly once an exit reaches a state you no longer wish to pursue.",
+        "operationId": "exit_cancel",
+        "parameters": [
+          {
+            "name": "vtxo_id",
+            "in": "path",
+            "description": "The VTXO whose unilateral exit should be canceled",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exit canceled successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExitCancelResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The VTXO ID is invalid, or the exit can no longer be canceled because its final transaction has already been broadcast",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The VTXO has no exit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/exits/claim/all": {
       "post": {
         "tags": [
@@ -252,13 +315,86 @@
         }
       }
     },
+    "/api/v1/exits/fee": {
+      "get": {
+        "tags": [
+          "exits"
+        ],
+        "summary": "Estimate emergency exit fee",
+        "description": "Estimates the on-chain cost of unilaterally (emergency) exiting a set of VTXOs without server cooperation. The breakdown separates the broadcast cost—CPFP-bumping every not-yet-confirmed transaction in each VTXO's exit tree, paid now from confirmed on-chain funds—from the claim cost of the single batched transaction that later drains the matured outputs. The estimate reflects current chain state, so exit transactions already confirmed cost nothing. `fundable` is false when the wallet's confirmed on-chain balance can't cover the full broadcast walk, which would stall the exit midway.",
+        "operationId": "emergency_exit_fee",
+        "parameters": [
+          {
+            "name": "vtxo_ids",
+            "in": "query",
+            "description": "Comma-separated VTXO ids to exit; omit to exit the entire wallet",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "fee_rate_sat_per_vb",
+            "in": "query",
+            "description": "Fee rate in sat/vB applied to both legs; omit to price the broadcast leg at the current fast rate and the claim leg at the regular rate",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "destination",
+            "in": "query",
+            "description": "Claim destination address; omit to use a placeholder for weighing",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Returns the emergency exit fee breakdown",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmergencyExitFeeEstimateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A VTXO is unknown, dust, already exited, or already spent, or a parameter is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/exits/progress": {
       "post": {
         "tags": [
           "exits"
         ],
         "summary": "Progress exits",
-        "description": "Triggers all in-progress exits to advance by one step. The daemon already progresses exits automatically in the background—use this endpoint when you want immediate progress rather than waiting for the next automatic cycle. On each call, the endpoint checks whether previously broadcast transactions have confirmed and, if so, creates and broadcasts the next transaction in the sequence. The on-chain wallet must have sufficient bitcoin to cover transaction fees.",
+        "description": "Triggers all in-progress exits to advance. The daemon already progresses exits automatically in the background—use this endpoint when you want immediate progress rather than waiting for the next automatic cycle. On each call, the endpoint syncs transaction statuses, advances the exit state machine, and creates or fee-bumps CPFP children for any exit transactions that need them. The on-chain wallet must have sufficient bitcoin to cover transaction fees.",
         "operationId": "exit_progress",
         "requestBody": {
           "content": {
@@ -393,8 +529,24 @@
         "tags": [
           "exits"
         ],
+        "summary": "List all exit statuses (deprecated)",
+        "description": "Deprecated: redirects to `GET /exits/status/all`.",
+        "operationId": "get_all_exit_status_deprecated",
+        "responses": {
+          "308": {
+            "description": "Permanent redirect to `/exits/status/all`"
+          }
+        },
+        "deprecated": true
+      }
+    },
+    "/api/v1/exits/status/all": {
+      "get": {
+        "tags": [
+          "exits"
+        ],
         "summary": "List all exit statuses",
-        "description": "Returns the current state of every emergency exit in the wallet. Each entry includes which phase the exit is in (start, processing, awaiting-delta, claimable, claim-in-progress, or claimed), and optionally the full state transition history and the exit transaction packages with their CPFP children.",
+        "description": "Returns every exit, live and finished. Optionally includes each exit's state history and its transactions with their CPFP children.",
         "operationId": "get_all_exit_status",
         "parameters": [
           {
@@ -443,13 +595,123 @@
         }
       }
     },
-    "/api/v1/exits/status/{vtxo_id}": {
+    "/api/v1/exits/status/finished": {
       "get": {
         "tags": [
           "exits"
         ],
-        "summary": "Get exit status",
-        "description": "Returns the current state of an emergency exit for the specified VTXO, including which phase the exit is in (start, processing, awaiting-delta, claimable, claim-in-progress, or claimed). Optionally includes the full state transition history and the exit transaction packages with their CPFP children.",
+        "summary": "List finished exits",
+        "description": "Returns exits that reached a terminal state: claimed, aborted because the VTXO was already spent, or canceled. Finished exits are dropped from active tracking—they are never progressed—but they're retained for auditing and surfaced here.",
+        "operationId": "get_finished_exits",
+        "parameters": [
+          {
+            "name": "history",
+            "in": "query",
+            "description": "Whether to include the detailed state history of each finished exit",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "transactions",
+            "in": "query",
+            "description": "Whether to include the exit transactions and their CPFP children",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Returns the finished exits",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ExitTransactionStatus"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/exits/status/live": {
+      "get": {
+        "tags": [
+          "exits"
+        ],
+        "summary": "List live exit statuses",
+        "description": "Returns exits that are still progressing. Optionally includes each exit's state history and its transactions with their CPFP children.",
+        "operationId": "get_live_exit_status",
+        "parameters": [
+          {
+            "name": "history",
+            "in": "query",
+            "description": "Whether to include the detailed history of the exit process",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "transactions",
+            "in": "query",
+            "description": "Whether to include the exit transactions and their CPFP children",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Returns the live exit statuses",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ExitTransactionStatus"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/exits/status/vtxo/{vtxo_id}": {
+      "get": {
+        "tags": [
+          "exits"
+        ],
+        "summary": "Get VTXO exit status",
+        "description": "Returns the exit status for the given VTXO, live or finished. Optionally includes the state history and the exit transactions with their CPFP children.",
         "operationId": "get_exit_status_by_vtxo_id",
         "parameters": [
           {
@@ -512,6 +774,78 @@
             }
           }
         }
+      }
+    },
+    "/api/v1/exits/status/{vtxo_id}": {
+      "get": {
+        "tags": [
+          "exits"
+        ],
+        "summary": "Get exit status (deprecated)",
+        "description": "Deprecated: use `GET /exits/status/vtxo/{vtxo_id}` instead.",
+        "operationId": "get_exit_status_by_vtxo_id_deprecated",
+        "parameters": [
+          {
+            "name": "vtxo_id",
+            "in": "path",
+            "description": "The VTXO to check the exit status of",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "history",
+            "in": "query",
+            "description": "Whether to include the detailed history of the exit process",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "transactions",
+            "in": "query",
+            "description": "Whether to include the exit transactions and their CPFP children",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Returns the exit status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExitTransactionStatus"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "VTXO wasn't found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        },
+        "deprecated": true
       }
     },
     "/api/v1/fees/board": {
@@ -679,6 +1013,68 @@
         }
       }
     },
+    "/api/v1/fees/offboard": {
+      "post": {
+        "tags": [
+          "fees"
+        ],
+        "summary": "Estimate offboard fee",
+        "description": "Estimates the fee for offboarding a specific set of VTXOs to the given on-chain address. Each VTXO is offboarded in full. The gross amount is the total value of the selected VTXOs, and the net amount is what the user receives on-chain after fees. The fee depends on the destination address type, current fee rates, and VTXO expiry.",
+        "operationId": "offboard_fee",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OffboardFeeEstimateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Returns the fee estimate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeeEstimateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No VTXO IDs provided, or an invalid VTXO id or address",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "One of the VTXOs wasn't found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/fees/offboard-all": {
       "get": {
         "tags": [
@@ -828,6 +1224,118 @@
         }
       }
     },
+    "/api/v1/history": {
+      "get": {
+        "tags": [
+          "history"
+        ],
+        "summary": "Get wallet history",
+        "description": "Returns the history of wallet movements ordered from newest to oldest. A movement represents any wallet operation that affects VTXOs—an arkoor send or receive, Lightning send or receive, board, offboard, or refresh. Each entry records which VTXOs were consumed and produced, the effective balance change (if any), fees paid, and the operation status. Supplying the `type` and `value` query parameters (together) restricts the result to movements involving that single payment method, such as all payments sent to one address.",
+        "operationId": "list",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Payment method type tag to filter by, e.g. `ark`, `bitcoin`, `output-script`, `invoice`, `offer`, `lightning-address`, `lnurl` or `custom`. Must be supplied together with `value`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "value",
+            "in": "query",
+            "description": "Payment method value to filter by, e.g. the destination address or invoice. Must be supplied together with `type`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Returns the wallet history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Movement"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/history/{id}/metadata": {
+      "post": {
+        "tags": [
+          "history"
+        ],
+        "summary": "Patch movement metadata",
+        "description": "Applies an [RFC 7396](https://www.rfc-editor.org/rfc/rfc7396) JSON Merge Patch to a movement's metadata. Use this to annotate history entries after the fact (e.g. refund notes, counterparty info). Keys set to `null` are removed; other values are recursively merged.",
+        "operationId": "update_metadata",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Movement identifier.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "RFC 7396 JSON Merge Patch. The body is applied directly to the movement's metadata object: any field with value `null` is removed, every other field is recursively merged.",
+          "content": {
+            "application/merge-patch+json": {
+              "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Metadata updated"
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/lightning/pay": {
       "post": {
         "tags": [
@@ -957,6 +1465,58 @@
         }
       }
     },
+    "/api/v1/lightning/receives/invoice/for-address": {
+      "post": {
+        "tags": [
+          "lightning"
+        ],
+        "summary": "Create a BOLT11 invoice for an Ark address",
+        "description": "Generates a new BOLT11 invoice. When paid, the wallet claims the Lightning receive and forwards the resulting Ark VTXO to the supplied Ark address mailbox.",
+        "operationId": "generate_invoice_for_address",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LightningInvoiceForAddressRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Returns the created invoice",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvoiceInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/lightning/receives/{identifier}": {
       "get": {
         "tags": [
@@ -1057,6 +1617,217 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/lightning/sends/{identifier}": {
+      "get": {
+        "tags": [
+          "lightning"
+        ],
+        "summary": "Get send status",
+        "description": "Returns the status of a specified outgoing Lightning payment, identified by its payment hash or invoice string. The `state` field tracks the payment lifecycle from `start` through `paid`; the preimage is included once the payment succeeded. If the wallet does not recognize the payment hash, it will return `unknown`. This is a read on the status in the db, so it does not trigger any `sync` before checking the state.",
+        "operationId": "get_send_status",
+        "parameters": [
+          {
+            "name": "identifier",
+            "in": "path",
+            "description": "Payment hash or invoice string to search for",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Returns the Lightning send status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LightningSendInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/message/sign": {
+      "post": {
+        "tags": [
+          "message"
+        ],
+        "summary": "Sign a message",
+        "description": "Signs an arbitrary message with a BIP-340 Schnorr signature over a prefixed hash (`SHA256(\"bark/message\" || message)`) of the UTF-8 message bytes. The message is signed with the key of the given Ark address, which must be one of the wallet's own addresses; addresses that do not belong to the wallet are rejected. The resulting signature can be checked with the `/message/verify` endpoint.",
+        "operationId": "sign_message",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Returns the signature over the message",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignedMessage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid ark address or address not owned by this wallet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/message/verify": {
+      "post": {
+        "tags": [
+          "message"
+        ],
+        "summary": "Verify a signed message",
+        "description": "Verifies a BIP-340 Schnorr signature over a prefixed hash (`SHA256(\"bark/message\" || message)`) of the UTF-8 message bytes, as created by the `/message/sign` endpoint. The signature is checked against a public key (`pubkey`) or against the user public key of an Ark address (`address`); exactly one of the two must be set. Verification is stateless and works for signatures made by any wallet, not just this one.",
+        "operationId": "verify_message",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Returns whether the signature is valid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageVerification"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid signature, pubkey or address encoding, or not exactly one of pubkey and address set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/notifications/wait": {
+      "get": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "Long-poll for wallet notifications",
+        "description": "Long-polls for wallet notifications. Returns all notifications received since the given timestamp. If no timestamp is provided, returns all notifications in the buffer. Returned notifications are sorted by timestamp in ascending order.",
+        "operationId": "wait_notification",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "description": "The timestamp to start waiting for notifications from. If not provided, returns all notifications in the buffer.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Returns notifications received during the long-poll window if any. Otherwise returns an empty array with provided `since` argument as `last_pushed_at` field",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WaitNotificationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query parameters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -1424,6 +2195,8 @@
         "tags": [
           "wallet"
         ],
+        "summary": "Delete the wallet",
+        "description": "Stops the wallet and removes every wallet file from the datadir; barkd's own files survive. Requires `dangerous: true` and, while a wallet is loaded, the wallet's fingerprint. With no wallet loaded, the call still removes any leftover wallet files. A retry completes an interrupted deletion.",
         "operationId": "wallet_delete",
         "requestBody": {
           "content": {
@@ -1620,6 +2393,69 @@
         }
       }
     },
+    "/api/v1/wallet/bip321": {
+      "post": {
+        "tags": [
+          "wallet"
+        ],
+        "summary": "Build a BIP 321 payment URI",
+        "description": "Builds a single BIP 321 `bitcoin:` URI bundling multiple ways to receive the same payment, so one call prepares everything needed for an incoming payment. A fresh Ark address is always included. When `amount_sat` is given, a BOLT11 invoice for that amount is generated and the amount is embedded in the URI. When `onchain` is `true`, a fresh on-chain address is added (placed in the URI body on mainnet, as a `tb=` parameter on test networks). Set the `uppercase` query parameter to upper-case the `bip321` URI so QR encoders can use the compact alphanumeric mode; this fails if the URI carries case-sensitive data. The individual `ark`, `bolt11`, and `onchain` destinations are always returned in their natural case for direct use.",
+        "operationId": "bip321_uri",
+        "parameters": [
+          {
+            "name": "uppercase",
+            "in": "query",
+            "description": "Upper-case the returned `bip321` URI for compact QR encoding. Defaults to false. Fails with 400 if the URI carries case-sensitive data (a label, message, or base58 address).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Bip321UriRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Returns the BIP 321 URI and its destinations",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Bip321UriResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Requested an upper-case URI that carries case-sensitive data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/wallet/connected": {
       "get": {
         "tags": [
@@ -1699,8 +2535,8 @@
         "tags": [
           "wallet"
         ],
-        "summary": "Get wallet history",
-        "description": "Returns the full history of wallet movements ordered from newest to oldest. A movement represents any wallet operation that affects VTXOs—an arkoor send or receive, Lightning send or receive, board, offboard, or refresh. Each entry records which VTXOs were consumed and produced, the effective balance change (if any), fees paid, and the operation status.",
+        "summary": "Get wallet history (deprecated)",
+        "description": "Deprecated: use `GET /api/v1/history` instead.",
         "operationId": "history",
         "responses": {
           "200": {
@@ -1726,7 +2562,8 @@
               }
             }
           }
-        }
+        },
+        "deprecated": true
       }
     },
     "/api/v1/wallet/import-vtxo": {
@@ -1735,7 +2572,7 @@
           "wallet"
         ],
         "summary": "Import a VTXO",
-        "description": "Imports hex-encoded serialized VTXOs into the wallet. Validates that each VTXO is anchored on-chain, owned by this wallet, and has not expired. Useful for restoring VTXOs after database loss or re-importing from the server mailbox. The operation is idempotent.",
+        "description": "Imports the hex-encoded serialized VTXOs in the request body into the wallet; it does not read them from the server mailbox. Validates that each VTXO is anchored on-chain and owned by this wallet. Useful for restoring VTXOs after database loss, or for re-importing ones obtained elsewhere. Ownership is resolved by scanning the seed-derived key space, bounded by `gap_limit` or the wallet's configured gap limit; a key the scan does not reach is a 400. Only VTXOs the server reports as spendable or spent are stored, in that state, so one that has already been spent is recorded as spent rather than rejected. A VTXO still in flight (unclaimed, unregistered, or awaiting a preimage) is rejected with a 422, because it becomes importable once that flow finishes. Pass `skip_status_check` to store them as spendable without asking the server. Expiry is not checked. The VTXOs are imported together, in one key scan and one transaction, so a rejected VTXO leaves none of them stored; pass `allow_partial` to keep the VTXOs that did import, and the response then lists only those. Already-imported VTXOs are skipped, so the operation is idempotent and a failed request can be retried.",
         "operationId": "import_vtxo",
         "requestBody": {
           "content": {
@@ -1762,11 +2599,63 @@
             }
           },
           "400": {
-            "description": "Invalid VTXO hex or VTXO not owned by wallet",
+            "description": "Invalid VTXO hex, a VTXO that does not match the chain, or a VTXO whose user pubkey is not derivable from this seed within the gap limit",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The VTXO is neither spendable nor spent, so it cannot be imported yet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnprocessableEntityError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wallet/mnemonic": {
+      "get": {
+        "tags": [
+          "wallet"
+        ],
+        "summary": "Get wallet mnemonic",
+        "description": "Returns the BIP-39 mnemonic phrase backing the wallet. Returns 404 when mnemonic exposure is disabled. Exposure is off by default; the endpoint returns 404 unless barkd is started with the `--expose-mnemonic` flag.",
+        "operationId": "mnemonic",
+        "responses": {
+          "200": {
+            "description": "Returns the wallet's BIP-39 mnemonic phrase",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MnemonicResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Mnemonic retrieval is disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
                 }
               }
             }
@@ -2012,6 +2901,68 @@
           },
           "404": {
             "description": "There is no VTXO to refresh",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wallet/refresh/delegated/vtxos": {
+      "post": {
+        "tags": [
+          "wallet"
+        ],
+        "summary": "Refresh VTXOs in delegated mode",
+        "description": "Registers the specified VTXOs for refresh as a delegated participation: the wallet hands the server a signed participation and the server carries it through the round, so the wallet doesn't need to follow the round interactively. The input VTXOs are locked immediately and will be forfeited once the round completes, yielding new VTXOs with a fresh expiry.\n\nSet `height` to schedule the refresh for a future block height: the refresh fee is priced at that height and the server includes the participation in the first round once the chain tip reaches it. When `height` is omitted, the participation is eligible for the next round. Use the `rounds` endpoint to track progress.",
+        "operationId": "refresh_delegated",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DelegatedRefreshRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Returns the refresh result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingRoundInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No VTXO IDs provided, or one of the provided VTXO IDs is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "One the VTXOs wasn't found",
             "content": {
               "application/json": {
                 "schema": {
@@ -2493,7 +3444,6 @@
           "round_interval",
           "nb_round_nonces",
           "vtxo_exit_delta",
-          "vtxo_expiry_delta",
           "htlc_send_expiry_delta",
           "htlc_expiry_delta",
           "max_vtxo_amount",
@@ -2503,7 +3453,9 @@
           "offboard_feerate_sat_per_kvb",
           "ln_receive_anti_dos_required",
           "fees",
-          "max_vtxo_exit_depth"
+          "max_vtxo_exit_depth",
+          "max_offboard_inputs",
+          "vtxo_expiry_delta"
         ],
         "properties": {
           "fees": {
@@ -2511,12 +3463,16 @@
             "description": "The fee schedule outlining any fees that must be paid to interact with the Ark server."
           },
           "htlc_expiry_delta": {
-            "$ref": "#/components/schemas/u16",
-            "description": "The number of blocks to keep between Lightning and Ark HTLCs expiries"
+            "type": "integer",
+            "format": "int32",
+            "description": "The number of blocks to keep between Lightning and Ark HTLCs expiries",
+            "minimum": 0
           },
           "htlc_send_expiry_delta": {
-            "$ref": "#/components/schemas/u16",
-            "description": "The number of blocks after which an HTLC-send VTXO expires once granted."
+            "type": "integer",
+            "format": "int32",
+            "description": "The number of blocks after which an HTLC-send VTXO expires once granted.",
+            "minimum": 0
           },
           "ln_receive_anti_dos_required": {
             "type": "boolean",
@@ -2525,6 +3481,11 @@
           "mailbox_pubkey": {
             "type": "string",
             "description": "The pubkey used for blinding unified mailbox IDs"
+          },
+          "max_offboard_inputs": {
+            "type": "integer",
+            "description": "The maximum number of inputs for an offboard",
+            "minimum": 0
           },
           "max_user_invoice_cltv_delta": {
             "type": "integer",
@@ -2578,13 +3539,31 @@
             "type": "string",
             "description": "The Ark server pubkey"
           },
+          "tos_link": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Link to the server's terms of service, if any."
+          },
           "vtxo_exit_delta": {
-            "$ref": "#/components/schemas/u16",
-            "description": "Delta between exit confirmation and coins becoming spendable"
+            "type": "integer",
+            "format": "int32",
+            "description": "Delta between exit confirmation and coins becoming spendable",
+            "minimum": 0
           },
           "vtxo_expiry_delta": {
-            "$ref": "#/components/schemas/u16",
-            "description": "Expiration delta of the VTXO"
+            "type": "integer",
+            "format": "int32",
+            "description": "The number of blocks a VTXO lives before it expires.\n\n**Deprecated**: renamed to `vtxo_lifetime`. This field is still\npopulated with the same value for backwards compatibility and will\nbe removed in a future release.",
+            "deprecated": true,
+            "minimum": 0
+          },
+          "vtxo_lifetime": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The number of blocks a VTXO lives before it expires",
+            "minimum": 0
           }
         }
       },
@@ -2628,7 +3607,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Sats in VTXOs undergoing an emergency exit back on-chain.\n`null` if the exit subsystem is unavailable.",
+            "description": "Sats held in VTXOs whose unilateral exit chain is confirmed on-chain but which\nhaven't yet been drained to the onchain wallet. Equivalent to the sum of\n`Exited` VTXOs whose exit state hasn't reached `Claimed`.\n`null` if the exit subsystem is unavailable.",
             "minimum": 0
           },
           "pending_in_round_sat": {
@@ -2660,6 +3639,89 @@
           "mutinynet",
           "regtest"
         ]
+      },
+      "Bip321UriQuery": {
+        "type": "object",
+        "description": "Query parameters for building a BIP 321 URI.",
+        "properties": {
+          "uppercase": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether to upper-case the returned `bip321` URI so QR encoders can use\nthe compact alphanumeric mode. Defaults to `false`.\nRequesting an upper-case URI fails when it carries case-sensitive data\n(a label or message with lowercase characters, or base58 address) that\ncannot be upper-cased."
+          }
+        }
+      },
+      "Bip321UriRequest": {
+        "type": "object",
+        "description": "Request to build a BIP 321 unified payment URI.\n\nAn Ark address is always included. A BOLT11 invoice is only included when\n`amount_sat` is given (an amount is required to create one). An on-chain\naddress is included only when `onchain` is `true`.",
+        "properties": {
+          "amount_sat": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Optional amount (in satoshis) to request. When set, it is embedded in\nthe URI and used to create the BOLT11 invoice. Any server-configured\n[LightningReceiveFees](crate::cli::fees::LightningReceiveFees) are\ndeducted from the amount the client ultimately receives over Lightning.",
+            "minimum": 0
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional label describing the payment, recorded in the URI's `label`."
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional message describing the payment, recorded in the URI's `message`."
+          },
+          "onchain": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether to include a fresh on-chain address as a payment destination.\nDefaults to `false`."
+          }
+        }
+      },
+      "Bip321UriResponse": {
+        "type": "object",
+        "description": "A BIP 321 unified payment URI together with its individual destinations.\n\nThe `bip321` field is the combined `bitcoin:` URI; the other fields expose\neach generated destination separately for convenience. A field is `null`\nwhen that destination was not requested or could not be produced.",
+        "required": [
+          "bip321"
+        ],
+        "properties": {
+          "ark": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The generated Ark address, if any."
+          },
+          "bip321": {
+            "type": "string",
+            "description": "The combined BIP 321 `bitcoin:` URI."
+          },
+          "bolt11": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The generated BOLT11 invoice, included only when an amount was given."
+          },
+          "onchain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The generated on-chain address, included only when `onchain` was set."
+          }
+        }
       },
       "BitcoindAuth": {
         "oneOf": [
@@ -2723,7 +3785,9 @@
             "type": "string"
           },
           "height": {
-            "$ref": "#/components/schemas/u32"
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         }
       },
@@ -2828,6 +3892,16 @@
           "origin"
         ],
         "properties": {
+          "fee_info": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FeeInfo"
+              }
+            ]
+          },
           "info": {
             "$ref": "#/components/schemas/TransactionInfo"
           },
@@ -2859,14 +3933,15 @@
               "string",
               "null"
             ],
-            "description": "The Ark server to use for the wallet.\nOptional when a config.toml already exists in the datadir."
+            "description": "The Ark server to use for the wallet.\nOptional when a config.toml already exists in the datadir or when\nthe network has a default Ark server (mainnet and signet)."
           },
           "ark_server_access_token": {
             "type": [
               "string",
               "null"
             ],
-            "description": "An access token for a private Ark server"
+            "description": "An access token for a private Ark server.\n\n**Deprecated**: access tokens are no longer enforced by the server;\nthis field will be removed in a future release.",
+            "deprecated": true
           },
           "birthday_height": {
             "type": [
@@ -2884,9 +3959,23 @@
               },
               {
                 "$ref": "#/components/schemas/ChainSourceConfig",
-                "description": "The chain source to use for the wallet.\nOptional when a config.toml already exists in the datadir."
+                "description": "The chain source to use for the wallet.\nOptional when a config.toml already exists in the datadir or when\nthe network has a default chain source (mainnet, signet and\nmutinynet)."
               }
             ]
+          },
+          "force": {
+            "type": "boolean",
+            "description": "Proceed even if the datadir contains unexpected files"
+          },
+          "gap_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "How many consecutive unused key indices a VTXO key scan may cross before\nit concludes the wallet doesn't own a recovered/imported VTXO.",
+            "maximum": 100000,
+            "minimum": 0
           },
           "mnemonic": {
             "type": [
@@ -2909,6 +3998,106 @@
         "properties": {
           "fingerprint": {
             "type": "string"
+          }
+        }
+      },
+      "DelegatedRefreshRequest": {
+        "type": "object",
+        "required": [
+          "vtxos"
+        ],
+        "properties": {
+          "height": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Optional block height to schedule the refresh at. When set, the refresh fee is priced at\nthat height and the server includes the participation in the first round once the chain\ntip reaches it; when omitted, the participation is eligible for the next round.",
+            "minimum": 0
+          },
+          "vtxos": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "List of VTXO IDs to refresh. The sum of the VTXOs being refreshed must be\n>= [P2TR_DUST](bitcoin_ext::P2TR_DUST). Keep in mind that fees set out in\n[RefreshFees](crate::cli::fees::RefreshFees) will be deducted from the newly created VTXO, this\nvalue must also be >= [P2TR_DUST](bitcoin_ext::P2TR_DUST)."
+          }
+        }
+      },
+      "EmergencyExitFeeEstimateQuery": {
+        "type": "object",
+        "description": "Query parameters for emergency (unilateral) exit fee estimates.",
+        "properties": {
+          "destination": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The destination address for the claim. Only affects the claim-fee weight; when omitted a\nplaceholder of the configured network is used."
+          },
+          "fee_rate_sat_per_vb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The fee rate to price the estimate at, in sat/vB. Applied to both the broadcast and claim\nlegs. When omitted, the broadcast leg uses the current `fast` rate and the claim leg the\n`regular` rate.",
+            "minimum": 0
+          },
+          "vtxo_ids": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Comma-separated VTXO ids to estimate the exit for. When omitted, every spendable VTXO in\nthe wallet is used (i.e. exit the entire wallet)."
+          }
+        }
+      },
+      "EmergencyExitFeeEstimateResponse": {
+        "type": "object",
+        "description": "A fee breakdown for unilaterally (emergency) exiting a set of VTXOs.",
+        "required": [
+          "exit_broadcast_fee_sat",
+          "claim_fee_sat",
+          "total_fee_sat",
+          "fee_rate_sat_per_vb",
+          "txs_to_broadcast",
+          "fundable"
+        ],
+        "properties": {
+          "claim_fee_sat": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The fee for the single batched transaction that drains the matured exit outputs (in\nsatoshis). Paid later out of the recovered value.",
+            "minimum": 0
+          },
+          "exit_broadcast_fee_sat": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The CPFP fees to broadcast every not-yet-confirmed exit transaction (in satoshis). Paid now\nfrom confirmed on-chain funds.",
+            "minimum": 0
+          },
+          "fee_rate_sat_per_vb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The fee rate the exit-broadcast leg was priced at (sat/vB). Unless an explicit fee rate was\nsupplied, the claim leg is priced separately at the chain's `regular` rate.",
+            "minimum": 0
+          },
+          "fundable": {
+            "type": "boolean",
+            "description": "Whether the wallet's current on-chain balance covers the full serial exit-broadcast walk."
+          },
+          "total_fee_sat": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The sum of the broadcast and claim fees (in satoshis).",
+            "minimum": 0
+          },
+          "txs_to_broadcast": {
+            "type": "integer",
+            "description": "The number of exit transactions that still need to be broadcast and CPFP-bumped.",
+            "minimum": 0
           }
         }
       },
@@ -2938,13 +4127,42 @@
         ],
         "properties": {
           "claimable_height": {
-            "$ref": "#/components/schemas/u32"
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           },
           "confirmed_block": {
             "$ref": "#/components/schemas/BlockRef"
           },
           "tip_height": {
-            "$ref": "#/components/schemas/u32"
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "ExitCancelResponse": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "ExitCanceledState": {
+        "type": "object",
+        "description": "JSON mirror of [bark::exit::ExitCanceledState].",
+        "required": [
+          "tip_height"
+        ],
+        "properties": {
+          "tip_height": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         }
       },
@@ -2984,7 +4202,9 @@
             "$ref": "#/components/schemas/BlockRef"
           },
           "tip_height": {
-            "$ref": "#/components/schemas/u32"
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         }
       },
@@ -3049,7 +4269,9 @@
             ]
           },
           "tip_height": {
-            "$ref": "#/components/schemas/u32"
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         }
       },
@@ -3065,7 +4287,9 @@
             "$ref": "#/components/schemas/BlockRef"
           },
           "tip_height": {
-            "$ref": "#/components/schemas/u32"
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           },
           "txid": {
             "type": "string"
@@ -3108,13 +4332,37 @@
                 "type": "string"
               },
               "height": {
-                "$ref": "#/components/schemas/u32"
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
               },
               "type": {
                 "type": "string",
                 "enum": [
                   "block-retrieval-failure"
                 ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "vtxo",
+              "state",
+              "type"
+            ],
+            "properties": {
+              "state": {
+                "$ref": "#/components/schemas/ExitStateKind"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "cannot-cancel-exit"
+                ]
+              },
+              "vtxo": {
+                "type": "string"
               }
             }
           },
@@ -3255,11 +4503,35 @@
           {
             "type": "object",
             "required": [
+              "error",
+              "type"
+            ],
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "database-child-store-failure"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "vtxo",
+              "amount",
               "dust",
               "type"
             ],
             "properties": {
+              "amount": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
               "dust": {
                 "type": "integer",
                 "format": "int64",
@@ -3272,9 +4544,7 @@
                 ]
               },
               "vtxo": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
+                "type": "string"
               }
             }
           },
@@ -3343,6 +4613,28 @@
           {
             "type": "object",
             "required": [
+              "vtxo",
+              "txid",
+              "type"
+            ],
+            "properties": {
+              "txid": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "exit-tx-already-broadcast"
+                ]
+              },
+              "vtxo": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "needed",
               "available",
               "type"
@@ -3362,45 +4654,6 @@
                 "type": "string",
                 "enum": [
                   "insufficient-confirmed-funds"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "balance",
-              "total_fee",
-              "fee_rate_sat_per_kvb",
-              "fee_rate_kwu",
-              "type"
-            ],
-            "properties": {
-              "balance": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "fee_rate_kwu": {
-                "type": "integer",
-                "format": "int64",
-                "deprecated": true,
-                "minimum": 0
-              },
-              "fee_rate_sat_per_kvb": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "total_fee": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "insufficient-fee-to-start"
                 ]
               }
             }
@@ -3461,7 +4714,9 @@
                 "type": "string"
               },
               "tip": {
-                "$ref": "#/components/schemas/u32"
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
               },
               "type": {
                 "type": "string",
@@ -3528,6 +4783,28 @@
           {
             "type": "object",
             "required": [
+              "vtxo",
+              "error",
+              "type"
+            ],
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "non-standard-vtxo"
+                ]
+              },
+              "vtxo": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "error",
               "type"
             ],
@@ -3540,6 +4817,24 @@
                 "enum": [
                   "movement-registration-failure"
                 ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "vtxo",
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "not-exiting"
+                ]
+              },
+              "vtxo": {
+                "type": "string"
               }
             }
           },
@@ -3604,6 +4899,60 @@
           {
             "type": "object",
             "required": [
+              "vtxo",
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "unknown-vtxo"
+                ]
+              },
+              "vtxo": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "vtxo",
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "vtxo-already-exited"
+                ]
+              },
+              "vtxo": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "vtxo",
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "vtxo-already-spent"
+                ]
+              },
+              "vtxo": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "error",
               "type"
             ],
@@ -3629,7 +4978,9 @@
         ],
         "properties": {
           "tip_height": {
-            "$ref": "#/components/schemas/u32"
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           },
           "transactions": {
             "type": "array",
@@ -3679,6 +5030,17 @@
           "done": {
             "type": "boolean",
             "description": "Whether all transactions have been confirmed"
+          },
+          "error": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ExitError",
+                "description": "Top-level error that prevented progress from running cleanly this round. Per-exit\nproblems live on each `ExitProgressStatus`; this slot is for failures that can't\nbe attributed to a specific VTXO (e.g. the chain source becoming unavailable, or\nthe exit manager failing to refresh its view of pending transactions)."
+              }
+            ]
           },
           "exits": {
             "type": "array",
@@ -3750,7 +5112,9 @@
         ],
         "properties": {
           "tip_height": {
-            "$ref": "#/components/schemas/u32"
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         }
       },
@@ -3881,9 +5245,65 @@
                 }
               }
             ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ExitVtxoAlreadySpentState"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "vtxo-already-spent"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ExitCanceledState"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "canceled"
+                    ]
+                  }
+                }
+              }
+            ]
           }
         ],
         "description": "A utility type to wrap ExitState children so they can be easily serialized. This also helps with\ndebugging a lot!"
+      },
+      "ExitStateKind": {
+        "type": "string",
+        "description": "A flat, data-free discriminator for [ExitState]. The serde representation matches\n[ExitState]'s `type` tag (kebab-case).",
+        "enum": [
+          "start",
+          "processing",
+          "awaiting-delta",
+          "claimable",
+          "claim-in-progress",
+          "claimed",
+          "vtxo-already-spent",
+          "canceled"
+        ]
       },
       "ExitStatusRequest": {
         "type": "object",
@@ -4005,30 +5425,9 @@
           {
             "type": "object",
             "required": [
-              "fee_rate_sat_per_kvb",
-              "fee_rate",
-              "total_fee",
               "type"
             ],
             "properties": {
-              "fee_rate": {
-                "type": "integer",
-                "format": "int64",
-                "deprecated": true,
-                "minimum": 0
-              },
-              "fee_rate_sat_per_kvb": {
-                "type": "integer",
-                "format": "int64",
-                "description": "This is the effective fee rate of the transaction (including CPFP ancestors)",
-                "minimum": 0
-              },
-              "total_fee": {
-                "type": "integer",
-                "format": "int64",
-                "description": "This includes the fees of the CPFP ancestors",
-                "minimum": 0
-              },
               "type": {
                 "type": "string",
                 "enum": [
@@ -4103,40 +5502,7 @@
               "type": {
                 "type": "string",
                 "enum": [
-                  "needs-signed-package"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "min_fee_rate_sat_per_kvb",
-              "min_fee_rate_kwu",
-              "min_fee",
-              "type"
-            ],
-            "properties": {
-              "min_fee": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "min_fee_rate_kwu": {
-                "type": "integer",
-                "format": "int64",
-                "deprecated": true,
-                "minimum": 0
-              },
-              "min_fee_rate_sat_per_kvb": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "needs-replacement-package"
+                  "awaiting-cpfp-broadcast"
                 ]
               }
             }
@@ -4158,29 +5524,7 @@
               "type": {
                 "type": "string",
                 "enum": [
-                  "needs-broadcasting"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "child_txid",
-              "origin",
-              "type"
-            ],
-            "properties": {
-              "child_txid": {
-                "type": "string"
-              },
-              "origin": {
-                "$ref": "#/components/schemas/ExitTxOrigin"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "broadcast-with-cpfp"
+                  "awaiting-confirmation"
                 ]
               }
             }
@@ -4212,6 +5556,20 @@
             }
           }
         ]
+      },
+      "ExitVtxoAlreadySpentState": {
+        "type": "object",
+        "description": "JSON mirror of [bark::exit::ExitVtxoAlreadySpentState].",
+        "required": [
+          "tip_height"
+        ],
+        "properties": {
+          "tip_height": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
       },
       "FeeEstimateQuery": {
         "type": "object",
@@ -4265,6 +5623,28 @@
           }
         }
       },
+      "FeeInfo": {
+        "type": "object",
+        "description": "Contains the data required to bump the fee for a given transaction (including ancestors).",
+        "required": [
+          "fee_rate_sat_per_kvb",
+          "total_fee_sat"
+        ],
+        "properties": {
+          "fee_rate_sat_per_kvb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The effective fee rate of the transaction (including unconfirmed CPFP ancestors), in\nsats per kvB. `kvb` matches the unit used elsewhere in `bark-json`\n(e.g. `offboard_feerate_sat_per_kvb`).",
+            "minimum": 0
+          },
+          "total_fee_sat": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sum of the transaction's own fee plus the fee of each of its unconfirmed ancestors.",
+            "minimum": 0
+          }
+        }
+      },
       "FeeSchedule": {
         "type": "object",
         "description": "Complete fee schedule for all operations.",
@@ -4299,6 +5679,24 @@
           "vtxos"
         ],
         "properties": {
+          "allow_partial": {
+            "type": "boolean",
+            "description": "Keep the VTXOs that import successfully even when another one in the\nrequest fails. The response lists the VTXOs that were kept.\n\nWithout it, a single failure discards the whole request."
+          },
+          "gap_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "How many consecutive unused key indices to scan for each VTXO's user\npubkey. Overrides the wallet's configured gap limit.",
+            "maximum": 100000,
+            "minimum": 0
+          },
+          "skip_status_check": {
+            "type": "boolean",
+            "description": "Import as spendable without asking the server for each VTXO's state.\n\nUse it when you already know it's spendable or when the server can't be reached,\nas it can leave the wallet in an inconsistent state."
+          },
           "vtxos": {
             "type": "array",
             "items": {
@@ -4331,6 +5729,32 @@
           }
         }
       },
+      "LightningInvoiceForAddressRequest": {
+        "type": "object",
+        "required": [
+          "amount_sat",
+          "address"
+        ],
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Ark address that will receive the claimed VTXO."
+          },
+          "amount_sat": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The amount to create invoice for (in satoshis).",
+            "minimum": 0
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description embedded in the invoice as its memo."
+          }
+        }
+      },
       "LightningInvoiceRequest": {
         "type": "object",
         "required": [
@@ -4349,6 +5773,13 @@
               "null"
             ],
             "description": "Optional description embedded in the invoice as its memo."
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional lightning receive token for authentication of the claim, if\nthe server requires one and there are no existing spendable VTXOs to\nprove ownership of."
           }
         }
       },
@@ -4389,6 +5820,13 @@
           "message": {
             "type": "string",
             "description": "Success message"
+          },
+          "payment_hash": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The payment hash of the lightning payment. Can be used to poll the\npayment status."
           }
         }
       },
@@ -4417,17 +5855,18 @@
       "LightningReceiveInfo": {
         "type": "object",
         "required": [
-          "amount_sat",
           "payment_hash",
-          "payment_preimage",
+          "state",
           "invoice",
+          "amount_sat",
+          "htlc_vtxo_ids",
           "htlc_vtxos"
         ],
         "properties": {
           "amount_sat": {
             "type": "integer",
             "format": "int64",
-            "description": "The amount of the lightning receive",
+            "description": "The amount of the lightning receive, if known.",
             "minimum": 0
           },
           "finished_at": {
@@ -4436,26 +5875,38 @@
               "null"
             ],
             "format": "date-time",
-            "description": "The timestamp at which the lightning receive was finished"
+            "description": "The timestamp at which the lightning receive was finished.",
+            "deprecated": true
+          },
+          "htlc_vtxo_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "IDs of the HTLC-recv VTXOs granted by the server, if any.\n\nEmpty until the inbound HTLC has been received and prepared."
           },
           "htlc_vtxos": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/WalletVtxoInfo"
             },
-            "description": "The HTLC VTXOs granted by the server for the lightning receive\n\nEmpty if the lightning HTLC has not yet been received by the server."
+            "description": "The HTLC VTXOs granted by the server for the lightning receive.",
+            "deprecated": true
           },
           "invoice": {
             "type": "string",
-            "description": "The invoice string"
+            "description": "The invoice string, if known."
           },
           "payment_hash": {
             "type": "string",
-            "description": "The payment hash linked to the lightning receive info"
+            "description": "The payment hash linked to the lightning receive"
           },
           "payment_preimage": {
-            "type": "string",
-            "description": "The payment preimage linked to the lightning receive info"
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The payment preimage, if known."
           },
           "preimage_revealed_at": {
             "type": [
@@ -4463,7 +5914,20 @@
               "null"
             ],
             "format": "date-time",
-            "description": "The timestamp at which the preimage was revealed"
+            "description": "The timestamp at which the preimage was revealed.",
+            "deprecated": true
+          },
+          "settled_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "The timestamp at which the receive settled, if it has."
+          },
+          "state": {
+            "type": "string",
+            "description": "Lifecycle phase of the receive: `awaiting-payment`, `htlcs-ready`,\n`preimage-revealed`, `delivering`, or `settled`."
           }
         }
       },
@@ -4497,6 +5961,37 @@
           }
         }
       },
+      "LightningSendInfo": {
+        "type": "object",
+        "required": [
+          "payment_hash",
+          "state"
+        ],
+        "properties": {
+          "invoice": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The invoice string, if known."
+          },
+          "payment_hash": {
+            "type": "string",
+            "description": "The payment hash of the outgoing lightning payment"
+          },
+          "preimage": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The payment preimage, revealed once the payment succeeded."
+          },
+          "state": {
+            "type": "string",
+            "description": "Lifecycle phase of the send: `unknown`, `start`, `htlc-received`,\n`payment-initiated`, `revocable-htlcs`, `revocation-stuck`, or `paid`."
+          }
+        }
+      },
       "MailboxSyncResponse": {
         "type": "object",
         "required": [
@@ -4508,6 +6003,31 @@
             "format": "int64",
             "description": "The mailbox checkpoint (tip) the wallet has consumed up to after\nthe sync. Monotonically non-decreasing across successful syncs.",
             "minimum": 0
+          }
+        }
+      },
+      "MessageVerification": {
+        "type": "object",
+        "description": "The result of verifying a signed message",
+        "required": [
+          "valid"
+        ],
+        "properties": {
+          "valid": {
+            "type": "boolean",
+            "description": "Whether the signature is valid for the given message and key"
+          }
+        }
+      },
+      "MnemonicResponse": {
+        "type": "object",
+        "required": [
+          "mnemonic"
+        ],
+        "properties": {
+          "mnemonic": {
+            "type": "string",
+            "description": "The BIP-39 mnemonic phrase backing the wallet."
           }
         }
       },
@@ -4742,6 +6262,27 @@
           }
         }
       },
+      "OffboardFeeEstimateRequest": {
+        "type": "object",
+        "description": "Request body for estimating the fee of offboarding a specific set of VTXOs.",
+        "required": [
+          "address",
+          "vtxos"
+        ],
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "The destination Bitcoin address. The fee depends on its script type."
+          },
+          "vtxos": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The IDs of the VTXOs to offboard. Each is offboarded in full."
+          }
+        }
+      },
       "OffboardFees": {
         "type": "object",
         "description": "Fees for offboarding from the ark.",
@@ -4956,6 +6497,7 @@
               "invoice",
               "offer",
               "lightning-address",
+              "lnurl",
               "custom"
             ]
           },
@@ -5005,6 +6547,7 @@
         "required": [
           "id",
           "status",
+          "state",
           "participation",
           "unlock_hash",
           "funding_txid"
@@ -5032,6 +6575,19 @@
           "participation": {
             "$ref": "#/components/schemas/RoundParticipationInfo",
             "description": "the round participation details"
+          },
+          "scheduled_height": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The block height a delegated participation is scheduled for, if any",
+            "minimum": 0
+          },
+          "state": {
+            "$ref": "#/components/schemas/RoundFlowState",
+            "description": "Lifecycle phase of the participation"
           },
           "status": {
             "$ref": "#/components/schemas/RoundStatus",
@@ -5104,6 +6660,18 @@
             "description": "List of VTXO IDs to refresh. The sum of the VTXOs being refreshed must be\n>= [P2TR_DUST](bitcoin_ext::P2TR_DUST). Keep in mind that fees set out in\n[RefreshFees](crate::cli::fees::RefreshFees) will be deducted from the newly created VTXO, this\nvalue must also be >= [P2TR_DUST](bitcoin_ext::P2TR_DUST)."
           }
         }
+      },
+      "RoundFlowState": {
+        "type": "string",
+        "description": "Lifecycle phase of a round participation.",
+        "enum": [
+          "delegated-pending",
+          "pending",
+          "ongoing",
+          "awaiting-confirmations",
+          "failed",
+          "canceled"
+        ]
       },
       "RoundParticipationInfo": {
         "type": "object",
@@ -5323,6 +6891,44 @@
           "message": {
             "type": "string",
             "description": "Success message"
+          },
+          "payment_hash": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The payment hash, when the destination resolved to a lightning\npayment. Can be used to poll the payment status."
+          }
+        }
+      },
+      "SignMessageRequest": {
+        "type": "object",
+        "description": "Request to sign an arbitrary message with one of the wallet's keys",
+        "required": [
+          "message",
+          "address"
+        ],
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "The Ark address to sign the message with"
+          },
+          "message": {
+            "type": "string",
+            "description": "The message to sign"
+          }
+        }
+      },
+      "SignedMessage": {
+        "type": "object",
+        "description": "A signature over a message",
+        "required": [
+          "signature"
+        ],
+        "properties": {
+          "signature": {
+            "type": "string",
+            "description": "The BIP-340 Schnorr signature over the message digest\n`SHA256(\"bark/message\" || message)`"
           }
         }
       },
@@ -5351,6 +6957,17 @@
             "type": "string"
           },
           "txid": {
+            "type": "string"
+          }
+        }
+      },
+      "UnprocessableEntityError": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
             "type": "string"
           }
         }
@@ -5384,6 +7001,38 @@
           }
         }
       },
+      "VerifyMessageRequest": {
+        "type": "object",
+        "description": "Request to verify a signed message\n\nExactly one of `pubkey` and `address` must be set.",
+        "required": [
+          "message",
+          "signature"
+        ],
+        "properties": {
+          "address": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Ark address whose user public key to verify the signature against"
+          },
+          "message": {
+            "type": "string",
+            "description": "The message that was signed"
+          },
+          "pubkey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The public key to verify the signature against"
+          },
+          "signature": {
+            "type": "string",
+            "description": "The BIP-340 Schnorr signature over the message digest\n`SHA256(\"bark/message\" || message)`, in hex"
+          }
+        }
+      },
       "VtxoInfo": {
         "type": "object",
         "description": "Information about a single VTXO (Virtual Transaction Output).\n\nA VTXO is a chain of off-chain, pre-signed transactions rooted in an\non-chain output. It represents spendable bitcoin on Ark.",
@@ -5409,8 +7058,10 @@
             "description": "The on-chain outpoint that roots this VTXO, formatted as\n`txid:vout`. Typically an output of a round transaction or a\nboard transaction."
           },
           "exit_delta": {
-            "$ref": "#/components/schemas/u16",
-            "description": "The relative timelock, in blocks, that must elapse before the\nfinal on-chain claim in an emergency exit."
+            "type": "integer",
+            "format": "int32",
+            "description": "The relative timelock, in blocks, that must elapse before the\nfinal on-chain claim in an emergency exit.",
+            "minimum": 0
           },
           "exit_depth": {
             "type": [
@@ -5422,8 +7073,10 @@
             "minimum": 0
           },
           "expiry_height": {
-            "$ref": "#/components/schemas/u32",
-            "description": "The block height at which this VTXO expires. After expiry, the\nserver can reclaim the sats. Refresh before expiry to receive\nnew VTXOs, or exit to move them on-chain."
+            "type": "integer",
+            "format": "int32",
+            "description": "The block height at which this VTXO expires. After expiry, the\nserver can reclaim the sats. Refresh before expiry to receive\nnew VTXOs, or exit to move them on-chain.",
+            "minimum": 0
           },
           "id": {
             "type": "string",
@@ -5498,11 +7151,30 @@
           },
           {
             "type": "object",
+            "description": "The VTXO has been moved on-chain via a unilateral exit and is no longer\nusable in the protocol.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "exited"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "The VTXO is locked by an in-progress movement (e.g. a pending\nround or Lightning payment).",
             "required": [
               "type"
             ],
             "properties": {
+              "action_id": {
+                "type": "string",
+                "description": "The action that locked this VTXO, if any."
+              },
               "movement_id": {
                 "type": "integer",
                 "format": "int32",
@@ -5532,6 +7204,30 @@
           }
         }
       },
+      "WaitNotificationResponse": {
+        "type": "object",
+        "description": "Response payload for the long-poll `wait` endpoint.",
+        "required": [
+          "notifications"
+        ],
+        "properties": {
+          "last_pushed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "The timestamp of the last notification pushed to the client."
+          },
+          "notifications": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WalletNotification"
+            },
+            "description": "Notifications received during the long-poll window. Empty if the\ntimeout elapsed without any notifications. Sorted by timestamp\nin ascending order."
+          }
+        }
+      },
       "WalletDeleteRequest": {
         "type": "object",
         "required": [
@@ -5556,6 +7252,12 @@
         "properties": {
           "deleted": {
             "type": "boolean"
+          },
+          "fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "message": {
             "type": "string"
@@ -5637,7 +7339,8 @@
         "required": [
           "txid",
           "tx",
-          "balance_change_sat"
+          "balance_change_sat",
+          "is_cpfp"
         ],
         "properties": {
           "balance_change_sat": {
@@ -5655,6 +7358,10 @@
                 "description": "`Some` when the transaction is mined; `None` while still in the mempool."
               }
             ]
+          },
+          "is_cpfp": {
+            "type": "boolean",
+            "description": "`true` when this tx spends a P2A fee anchor output — i.e. it is a CPFP\nchild bumping its parent. In bark this typically means the wallet is\nfee-bumping an exit transaction."
           },
           "onchain_fee_sat": {
             "type": [
@@ -5693,16 +7400,6 @@
           }
         ],
         "description": "A VTXO together with its current wallet state."
-      },
-      "u16": {
-        "type": "integer",
-        "format": "int32",
-        "minimum": 0
-      },
-      "u32": {
-        "type": "integer",
-        "format": "int32",
-        "minimum": 0
       }
     },
     "securitySchemes": {
@@ -5733,8 +7430,16 @@
       "description": "Estimate fees for wallet operations before executing them."
     },
     {
+      "name": "history",
+      "description": "Inspect and annotate wallet movement history."
+    },
+    {
       "name": "lightning",
       "description": "Create Lightning invoices and track receives."
+    },
+    {
+      "name": "message",
+      "description": "Sign arbitrary messages with the wallet's keys and verify signed messages."
     },
     {
       "name": "onchain",

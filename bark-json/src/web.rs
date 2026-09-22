@@ -5,15 +5,35 @@ use bitcoin::secp256k1::PublicKey;
 use serde::{Deserialize, Serialize};
 
 use ark::VtxoId;
+use ark::lightning::PaymentHash;
 use ark::offboard::OffboardRequest;
 use ark::tree::signed::UnlockHash;
 use ark::vtxo::VtxoPolicyKind;
+use bark::round::RoundFlowKind;
 
 #[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
 
 use crate::cli::RoundStatus;
 
+
+/// Query parameters for filtering wallet history by payment method.
+///
+/// Both fields are optional but must be supplied together: omit both to get the
+/// full history, or provide both to filter by a single payment method. The pair
+/// mirrors the serialized form of a payment method (its `type` tag and `value`).
+#[derive(Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct HistoryQuery {
+	/// The payment method type tag to filter by, e.g. `ark`, `bitcoin`,
+	/// `output-script`, `invoice`, `offer`, `lightning-address`, `lnurl` or
+	/// `custom`. Must be provided together with `value`.
+	#[serde(rename = "type")]
+	pub method_type: Option<String>,
+	/// The payment method value to filter by, e.g. the destination address or
+	/// invoice. Must be provided together with `type`.
+	pub value: Option<String>,
+}
 
 /// Query parameters for fee estimates that only require an amount.
 #[derive(Serialize, Deserialize)]
@@ -39,6 +59,16 @@ pub struct SendOnchainFeeEstimateQuery {
 pub struct OffboardAllFeeEstimateQuery {
 	/// The destination Bitcoin address
 	pub address: String,
+}
+
+/// Request body for estimating the fee of offboarding a specific set of VTXOs.
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct OffboardFeeEstimateRequest {
+	/// The destination Bitcoin address. The fee depends on its script type.
+	pub address: String,
+	/// The IDs of the VTXOs to offboard. Each is offboarded in full.
+	pub vtxos: Vec<String>,
 }
 
 /// A fee estimate for an Ark wallet operation.
@@ -74,6 +104,62 @@ impl From<bark::FeeEstimate> for FeeEstimateResponse {
 	}
 }
 
+/// Query parameters for emergency (unilateral) exit fee estimates.
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct EmergencyExitFeeEstimateQuery {
+	/// Comma-separated VTXO ids to estimate the exit for. When omitted, every spendable VTXO in
+	/// the wallet is used (i.e. exit the entire wallet).
+	pub vtxo_ids: Option<String>,
+	/// The fee rate to price the estimate at, in sat/vB. Applied to both the broadcast and claim
+	/// legs. When omitted, the broadcast leg uses the current `fast` rate and the claim leg the
+	/// `regular` rate.
+	pub fee_rate_sat_per_vb: Option<u64>,
+	/// The destination address for the claim. Only affects the claim-fee weight; when omitted a
+	/// placeholder of the configured network is used.
+	pub destination: Option<String>,
+}
+
+/// A fee breakdown for unilaterally (emergency) exiting a set of VTXOs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct EmergencyExitFeeEstimateResponse {
+	/// The CPFP fees to broadcast every not-yet-confirmed exit transaction (in satoshis). Paid now
+	/// from confirmed on-chain funds.
+	#[serde(rename = "exit_broadcast_fee_sat", with = "bitcoin::amount::serde::as_sat")]
+	#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
+	pub exit_broadcast_fee: Amount,
+	/// The fee for the single batched transaction that drains the matured exit outputs (in
+	/// satoshis). Paid later out of the recovered value.
+	#[serde(rename = "claim_fee_sat", with = "bitcoin::amount::serde::as_sat")]
+	#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
+	pub claim_fee: Amount,
+	/// The sum of the broadcast and claim fees (in satoshis).
+	#[serde(rename = "total_fee_sat", with = "bitcoin::amount::serde::as_sat")]
+	#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
+	pub total_fee: Amount,
+	/// The fee rate the exit-broadcast leg was priced at (sat/vB). Unless an explicit fee rate was
+	/// supplied, the claim leg is priced separately at the chain's `regular` rate.
+	pub fee_rate_sat_per_vb: u64,
+	/// The number of exit transactions that still need to be broadcast and CPFP-bumped.
+	pub txs_to_broadcast: usize,
+	/// Whether the wallet's current on-chain balance covers the full serial exit-broadcast walk.
+	pub fundable: bool,
+}
+
+impl From<bark::exit::ExitFeeEstimate> for EmergencyExitFeeEstimateResponse {
+	fn from(e: bark::exit::ExitFeeEstimate) -> Self {
+		EmergencyExitFeeEstimateResponse {
+			total_fee: e.total(),
+			exit_broadcast_fee: e.exit_broadcast_fee,
+			claim_fee: e.claim_fee,
+			fee_rate_sat_per_vb: e.fee_rate.to_sat_per_vb_ceil(),
+			txs_to_broadcast: e.txs_to_broadcast,
+			fundable: e.fundable,
+		}
+	}
+}
+
 /// Mempool fee rates for on-chain transactions.
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
@@ -105,12 +191,22 @@ pub struct MailboxSyncResponse {
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct CreateWalletRequest {
 	/// The Ark server to use for the wallet.
-	/// Optional when a config.toml already exists in the datadir.
+	/// Optional when a config.toml already exists in the datadir or when
+	/// the network has a default Ark server (mainnet and signet).
 	pub ark_server: Option<String>,
-	/// An access token for a private Ark server
+	/// An access token for a private Ark server.
+	///
+	/// **Deprecated**: access tokens are no longer enforced by the server;
+	/// this field will be removed in a future release.
+	#[deprecated(
+		since = "0.2.4",
+		note = "access tokens are not enforced by the server; this field will be removed",
+	)]
 	pub ark_server_access_token: Option<String>,
 	/// The chain source to use for the wallet.
-	/// Optional when a config.toml already exists in the datadir.
+	/// Optional when a config.toml already exists in the datadir or when
+	/// the network has a default chain source (mainnet, signet and
+	/// mutinynet).
 	pub chain_source: Option<ChainSourceConfig>,
 	/// The optional mnemonic to use for the wallet
 	pub mnemonic: Option<String>,
@@ -118,6 +214,14 @@ pub struct CreateWalletRequest {
 	pub network: BarkNetwork,
 	/// An optional birthday height to start syncing the wallet from
 	pub birthday_height: Option<u32>,
+	/// How many consecutive unused key indices a VTXO key scan may cross before
+	/// it concludes the wallet doesn't own a recovered/imported VTXO.
+	#[serde(default)]
+	#[cfg_attr(feature = "utoipa", schema(maximum = 100_000))]
+	pub gap_limit: Option<u32>,
+	/// Proceed even if the datadir contains unexpected files
+	#[serde(default)]
+	pub force: bool,
 }
 
 /// Networks bark can be used on
@@ -180,9 +284,75 @@ pub struct ConnectedResponse {
 
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct MnemonicResponse {
+	/// The BIP-39 mnemonic phrase backing the wallet.
+	pub mnemonic: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct ArkAddressResponse {
 	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
 	pub address: String,
+}
+
+/// Request to build a BIP 321 unified payment URI.
+///
+/// An Ark address is always included. A BOLT11 invoice is only included when
+/// `amount_sat` is given (an amount is required to create one). An on-chain
+/// address is included only when `onchain` is `true`.
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct Bip321UriRequest {
+	/// Optional amount (in satoshis) to request. When set, it is embedded in
+	/// the URI and used to create the BOLT11 invoice. Any server-configured
+	/// [LightningReceiveFees](crate::cli::fees::LightningReceiveFees) are
+	/// deducted from the amount the client ultimately receives over Lightning.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub amount_sat: Option<u64>,
+	/// Whether to include a fresh on-chain address as a payment destination.
+	/// Defaults to `false`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub onchain: Option<bool>,
+	/// Optional label describing the payment, recorded in the URI's `label`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub label: Option<String>,
+	/// Optional message describing the payment, recorded in the URI's `message`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub message: Option<String>,
+}
+
+/// Query parameters for building a BIP 321 URI.
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct Bip321UriQuery {
+	/// Whether to upper-case the returned `bip321` URI so QR encoders can use
+	/// the compact alphanumeric mode. Defaults to `false`.
+	/// Requesting an upper-case URI fails when it carries case-sensitive data
+	/// (a label or message with lowercase characters, or base58 address) that
+	/// cannot be upper-cased.
+	pub uppercase: Option<bool>,
+}
+
+/// A BIP 321 unified payment URI together with its individual destinations.
+///
+/// The `bip321` field is the combined `bitcoin:` URI; the other fields expose
+/// each generated destination separately for convenience. A field is `null`
+/// when that destination was not requested or could not be produced.
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct Bip321UriResponse {
+	/// The generated Ark address, if any.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub ark: Option<String>,
+	/// The generated BOLT11 invoice, included only when an amount was given.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub bolt11: Option<String>,
+	/// The generated on-chain address, included only when `onchain` was set.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub onchain: Option<String>,
+	/// The combined BIP 321 `bitcoin:` URI.
+	pub bip321: String,
 }
 
 /// Response for the encoded-VTXO endpoint.
@@ -215,6 +385,20 @@ pub struct RefreshRequest {
 
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct DelegatedRefreshRequest {
+	/// List of VTXO IDs to refresh. The sum of the VTXOs being refreshed must be
+	/// >= [P2TR_DUST](bitcoin_ext::P2TR_DUST). Keep in mind that fees set out in
+	/// [RefreshFees](crate::cli::fees::RefreshFees) will be deducted from the newly created VTXO, this
+	/// value must also be >= [P2TR_DUST](bitcoin_ext::P2TR_DUST).
+	pub vtxos: Vec<String>,
+	/// Optional block height to schedule the refresh at. When set, the refresh fee is priced at
+	/// that height and the server includes the participation in the first round once the chain
+	/// tip reaches it; when omitted, the participation is eligible for the next round.
+	pub height: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct BoardRequest {
 	/// An amount of onchain funds to board (in satoshis). For a board operation to be successful,
 	/// this value, with any server-configured [BoardFees](crate::cli::fees::BoardFees) deducted, must be
@@ -240,6 +424,38 @@ pub struct SendRequest {
 pub struct SendResponse {
 	/// Success message
 	pub message: String,
+	/// The payment hash, when the destination resolved to a lightning
+	/// payment. Can be used to poll the payment status.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+	pub payment_hash: Option<PaymentHash>,
+}
+
+/// Request to sign an arbitrary message with one of the wallet's keys
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct SignMessageRequest {
+	/// The message to sign
+	pub message: String,
+	/// The Ark address to sign the message with
+	pub address: String,
+}
+
+/// Request to verify a signed message
+///
+/// Exactly one of `pubkey` and `address` must be set.
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct VerifyMessageRequest {
+	/// The message that was signed
+	pub message: String,
+	/// The BIP-340 Schnorr signature over the message digest
+	/// `SHA256("bark/message" || message)`, in hex
+	pub signature: String,
+	/// The public key to verify the signature against
+	pub pubkey: Option<String>,
+	/// The Ark address whose user public key to verify the signature against
+	pub address: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -276,6 +492,23 @@ pub struct OffboardAllRequest {
 pub struct ImportVtxoRequest {
 	/// Hex-encoded VTXOs to import
 	pub vtxos: Vec<String>,
+	/// How many consecutive unused key indices to scan for each VTXO's user
+	/// pubkey. Overrides the wallet's configured gap limit.
+	#[serde(default)]
+	#[cfg_attr(feature = "utoipa", schema(maximum = 100_000))]
+	pub gap_limit: Option<u32>,
+	/// Import as spendable without asking the server for each VTXO's state.
+	///
+	/// Use it when you already know it's spendable or when the server can't be reached,
+	/// as it can leave the wallet in an inconsistent state.
+	#[serde(default)]
+	pub skip_status_check: bool,
+	/// Keep the VTXOs that import successfully even when another one in the
+	/// request fails. The response lists the VTXOs that were kept.
+	///
+	/// Without it, a single failure discards the whole request.
+	#[serde(default)]
+	pub allow_partial: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -285,6 +518,23 @@ pub struct LightningInvoiceRequest {
 	/// the final amount received by the client will have any server-configured
 	/// [LightningReceiveFees](crate::cli::fees::LightningReceiveFees) deducted.
 	pub amount_sat: u64,
+	/// Optional description embedded in the invoice as its memo.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub description: Option<String>,
+	/// Optional lightning receive token for authentication of the claim, if
+	/// the server requires one and there are no existing spendable VTXOs to
+	/// prove ownership of.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub token: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct LightningInvoiceForAddressRequest {
+	/// The amount to create invoice for (in satoshis).
+	pub amount_sat: u64,
+	/// Ark address that will receive the claimed VTXO.
+	pub address: String,
 	/// Optional description embedded in the invoice as its memo.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub description: Option<String>,
@@ -309,6 +559,11 @@ pub struct LightningPayRequest {
 pub struct LightningPayResponse {
 	/// Success message
 	pub message: String,
+	/// The payment hash of the lightning payment. Can be used to poll the
+	/// payment status.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+	pub payment_hash: Option<PaymentHash>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -393,6 +648,12 @@ pub struct ExitClaimResponse {
 	pub message: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct ExitCancelResponse {
+	pub message: String,
+}
+
 
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
@@ -464,6 +725,38 @@ impl<'a> From<&'a bark::round::RoundParticipation> for RoundParticipationInfo {
 	}
 }
 
+/// Lifecycle phase of a round participation.
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum RoundFlowState {
+	/// Delegated participation waiting for its round.
+	DelegatedPending,
+	/// Interactive participation waiting for its round.
+	Pending,
+	/// The interactive part is being played out with the server.
+	Ongoing,
+	/// The round finished and its funding tx is waiting for confirmations.
+	AwaitingConfirmations,
+	/// The participation failed.
+	Failed,
+	/// The user canceled the participation.
+	Canceled,
+}
+
+impl From<RoundFlowKind> for RoundFlowState {
+	fn from(kind: RoundFlowKind) -> Self {
+		match kind {
+			RoundFlowKind::DelegatedPending => Self::DelegatedPending,
+			RoundFlowKind::Pending => Self::Pending,
+			RoundFlowKind::Ongoing => Self::Ongoing,
+			RoundFlowKind::AwaitingConfirmations => Self::AwaitingConfirmations,
+			RoundFlowKind::Failed => Self::Failed,
+			RoundFlowKind::Canceled => Self::Canceled,
+		}
+	}
+}
+
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct PendingRoundInfo {
@@ -471,10 +764,15 @@ pub struct PendingRoundInfo {
 	pub id: u32,
 	/// the current status of the round
 	pub status: RoundStatus,
+	/// Lifecycle phase of the participation
+	pub state: RoundFlowState,
 	/// the round participation details
 	pub participation: RoundParticipationInfo,
 	#[cfg_attr(feature = "utoipa", schema(value_type = String, nullable = true))]
 	pub unlock_hash: Option<UnlockHash>,
+	/// The block height a delegated participation is scheduled for, if any
+	#[serde(default)]
+	pub scheduled_height: Option<u32>,
 	/// The round transaction id, if already assigned
 	#[cfg_attr(feature = "utoipa", schema(value_type = String, nullable = true))]
 	pub funding_txid: Option<Txid>,
@@ -482,8 +780,8 @@ pub struct PendingRoundInfo {
 }
 
 impl PendingRoundInfo {
-	pub fn new<'a>(
-		state: &'a bark::persist::models::StoredRoundState,
+	pub fn new<G>(
+		state: &bark::persist::models::StoredRoundState<G>,
 		sync_result: anyhow::Result<bark::round::RoundStatus>,
 	) -> Self {
 		let funding_tx = state.state().funding_tx();
@@ -495,11 +793,34 @@ impl PendingRoundInfo {
 					error: format!("{:#}", e),
 				},
 			},
+			state: state.state().flow_kind().into(),
 			participation: state.state().participation().into(),
 			unlock_hash: state.state().unlock_hash(),
+			scheduled_height: state.state().scheduled_height().map(Into::into),
 			funding_txid: funding_tx.map(|t| t.compute_txid()),
 			funding_tx_hex: funding_tx.map(|t| serialize_hex(t)),
 		}
+	}
+
+	/// Like [PendingRoundInfo::new], but without contacting the server: the
+	/// status is derived from the stored state alone.
+	pub fn from_state<G>(state: &bark::persist::models::StoredRoundState<G>) -> Self {
+		let status = match state.state().flow_kind() {
+			RoundFlowKind::AwaitingConfirmations => {
+				bark::round::RoundStatus::Unconfirmed {
+					funding_txid: state.state().funding_tx()
+						.expect("finished rounds have a funding tx")
+						.compute_txid(),
+				}
+			},
+			RoundFlowKind::Canceled => bark::round::RoundStatus::Canceled,
+			RoundFlowKind::DelegatedPending
+				| RoundFlowKind::Pending
+				| RoundFlowKind::Ongoing
+				| RoundFlowKind::Failed
+			=> bark::round::RoundStatus::Pending,
+		};
+		Self::new(state, Ok(status))
 	}
 }
 
@@ -520,6 +841,6 @@ pub struct WalletDeleteRequest {
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct WalletDeleteResponse {
 	pub deleted: bool,
+	pub fingerprint: Option<String>,
 	pub message: String,
 }
-

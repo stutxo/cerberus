@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::iter;
 use std::str::FromStr;
 
 use anyhow::{Context, ensure};
@@ -9,24 +10,23 @@ use bitcoin::hashes::hex::DisplayHex;
 use bitcoin::secp256k1::PublicKey;
 use chrono::DateTime;
 use lightning_invoice::Bolt11Invoice;
-use rusqlite::{self, named_params, params, Connection, Row, ToSql, Transaction};
+use rusqlite::{self, named_params, params, Connection, OptionalExtension, ToSql, Transaction};
 
 use ark::{ProtocolEncoding, Vtxo};
-use ark::lightning::{Invoice, PaymentHash, Preimage};
-use ark::vtxo::{Bare, Full, VtxoRef};
-use bitcoin_ext::BlockDelta;
+use ark::lightning::{PaymentHash, Preimage};
+use ark::vtxo::Full;
 
 use crate::{VtxoId, WalletProperties};
-use crate::exit::{ExitState, ExitTxOrigin};
+use crate::actions::{WalletActionCheckpoint, WalletActionId};
+use crate::exit::{ExitState, ExitStateKind, ExitTxOrigin};
 use crate::movement::{Movement, MovementId, MovementStatus, MovementSubsystem, PaymentMethod};
 use crate::persist::{RoundStateId, StoredRoundState};
 use crate::persist::models::{
-	LightningReceive, LightningSend, PendingBoard, SerdeRoundState, StoredExit, Unlocked,
-	PendingOffboard,
+	PaidInvoice, SerdeRoundState, SettledLightningReceive, StoredExit, Unlocked,
 };
 use crate::persist::sqlite::convert::{row_to_movement, row_to_wallet_vtxo, rows_to_wallet_vtxos};
 use crate::round::RoundState;
-use crate::vtxo::{VtxoState, VtxoStateKind, WalletVtxo};
+use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
 
 /// Set read-only properties for the wallet
 ///
@@ -127,12 +127,13 @@ pub fn create_new_movement(
 	status: MovementStatus,
 	subsystem: &MovementSubsystem,
 	time: DateTime<chrono::Local>,
+	action_id: Option<&str>,
 ) -> anyhow::Result<MovementId> {
 	let mut statement = tx.prepare("
 		INSERT INTO bark_movements (status, subsystem_name, movement_kind, intended_balance,
-			effective_balance, offchain_fee, created_at, updated_at)
+			effective_balance, offchain_fee, created_at, updated_at, action_id)
 		VALUES (:status, :name, :kind, :intended_balance, :effective_balance, :offchain_fee,
-			:created_at, :updated_at)
+			:created_at, :updated_at, :action_id)
 		RETURNING id"
 	)?;
 	let time = time.with_timezone(&chrono::Utc);
@@ -145,9 +146,22 @@ pub fn create_new_movement(
 		":offchain_fee": Amount::ZERO.to_sat(),
 		":created_at": time,
 		":updated_at": time,
+		":action_id": action_id,
 	}, |row| row.get::<_, u32>(0))?;
 
 	Ok(MovementId::new(id))
+}
+
+pub fn get_movement_id_by_action(
+	tx: &Transaction,
+	action_id: &str,
+) -> anyhow::Result<Option<MovementId>> {
+	let mut statement = tx.prepare(
+		"SELECT id FROM bark_movements WHERE action_id = ?1"
+	)?;
+	let id = statement.query_row([action_id], |row| row.get::<_, u32>(0))
+		.optional()?;
+	Ok(id.map(MovementId::new))
 }
 
 pub fn update_movement(tx: &Transaction, movement: &Movement) -> anyhow::Result<()> {
@@ -257,143 +271,6 @@ pub fn get_movements_by_payment_method(
 	Ok(results)
 }
 
-pub fn get_all_pending_boards_ids(conn: &Connection) -> anyhow::Result<Vec<VtxoId>> {
-	let q = "SELECT vtxo_id FROM bark_pending_board;";
-	let mut statement = conn.prepare(q)?;
-	let mut rows = statement.query([])?;
-	let mut pending_boards = Vec::new();
-	while let Some(row) = rows.next()? {
-		let vtxo_id = row.get::<_, String>(0)?;
-		pending_boards.push(VtxoId::from_str(&vtxo_id)?);
-	}
-
-	Ok(pending_boards)
-}
-
-pub fn get_pending_board_by_vtxo_id(
-	conn: &Connection,
-	vtxo_id: VtxoId,
-) -> anyhow::Result<Option<PendingBoard>> {
-	let q = "SELECT vtxo_id, amount_sat, funding_tx, movement_id FROM bark_pending_board WHERE vtxo_id = :vtxo_id;";
-	let mut statement = conn.prepare(q)?;
-	let mut rows = statement.query(named_params! {
-		":vtxo_id": vtxo_id.to_string(),
-	})?;
-
-	match rows.next()? {
-		Some(row) => {
-			let vtxo_id = VtxoId::from_str(&row.get::<_, String>("vtxo_id")?)?;
-			let amount_sat = row.get::<_, i64>("amount_sat")? as u64;
-
-			let funding_tx = row.get::<_, String>("funding_tx")?;
-			Ok(Some(PendingBoard {
-				vtxos: vec![vtxo_id],
-				amount: Amount::from_sat(amount_sat),
-				funding_tx: bitcoin::consensus::encode::deserialize_hex(&funding_tx)?,
-				movement_id: MovementId::new(row.get::<_, u32>("movement_id")?),
-			}))
-		}
-		None => Ok(None),
-	}
-}
-
-pub fn store_new_pending_board(
-	tx: &Transaction,
-	vtxo: &Vtxo<Full>,
-	funding_tx: &bitcoin::Transaction,
-	movement_id: MovementId,
-) -> anyhow::Result<()> {
-	let mut statement = tx.prepare("
-		INSERT INTO bark_pending_board (vtxo_id, amount_sat, funding_tx, movement_id)
-		VALUES (:vtxo_id, :amount_sat, :funding_tx, :movement_id);"
-	)?;
-
-	statement.execute(named_params! {
-		":vtxo_id": vtxo.id().to_string(),
-		":amount_sat": vtxo.amount().to_sat(),
-		":funding_tx": bitcoin::consensus::encode::serialize_hex(&funding_tx),
-		":movement_id": movement_id.0,
-	})?;
-	Ok(())
-}
-
-pub fn remove_pending_board(
-	tx: &Transaction,
-	vtxo_id: &VtxoId,
-) -> anyhow::Result<()> {
-	let q = "DELETE FROM bark_pending_board WHERE vtxo_id = :vtxo_id;";
-	let mut statement = tx.prepare(q)?;
-	statement.execute(named_params! {
-		":vtxo_id": vtxo_id.to_string(),
-	})?;
-	Ok(())
-}
-
-pub fn store_pending_offboard(
-	tx: &Transaction,
-	pending: &PendingOffboard,
-) -> anyhow::Result<()> {
-	let vtxo_ids_json = serde_json::to_string(&pending.vtxo_ids)
-		.context("failed to serialize vtxo_ids")?;
-	let offboard_tx_bytes = consensus::serialize(&pending.offboard_tx);
-
-	let mut statement = tx.prepare("
-		INSERT INTO bark_pending_offboard (movement_id, offboard_txid, offboard_tx, vtxo_ids, destination)
-		VALUES (:movement_id, :offboard_txid, :offboard_tx, :vtxo_ids, :destination);"
-	)?;
-
-	statement.execute(named_params! {
-		":movement_id": pending.movement_id.0,
-		":offboard_txid": pending.offboard_txid.to_string(),
-		":offboard_tx": offboard_tx_bytes,
-		":vtxo_ids": vtxo_ids_json,
-		":destination": pending.destination,
-	})?;
-	Ok(())
-}
-
-pub fn get_all_pending_offboards(conn: &Connection) -> anyhow::Result<Vec<PendingOffboard>> {
-	let q = "SELECT movement_id, offboard_txid, offboard_tx, vtxo_ids, destination, created_at FROM bark_pending_offboard;";
-	let mut statement = conn.prepare(q)?;
-	let mut rows = statement.query([])?;
-	let mut pending = Vec::new();
-	while let Some(row) = rows.next()? {
-		let movement_id = MovementId::new(row.get::<_, u32>("movement_id")?);
-		let offboard_txid = Txid::from_str(&row.get::<_, String>("offboard_txid")?)?;
-		let offboard_tx_bytes = row.get::<_, Vec<u8>>("offboard_tx")?;
-		let offboard_tx: bitcoin::Transaction = consensus::deserialize(&offboard_tx_bytes)
-			.context("failed to deserialize offboard_tx")?;
-		let vtxo_ids_json = row.get::<_, String>("vtxo_ids")?;
-		let vtxo_ids: Vec<VtxoId> = serde_json::from_str(&vtxo_ids_json)
-			.context("failed to deserialize vtxo_ids")?;
-		let destination = row.get::<_, String>("destination")?;
-		let created_at = row.get::<_, DateTime<chrono::Utc>>("created_at")?
-			.with_timezone(&chrono::Local);
-
-		pending.push(PendingOffboard {
-			movement_id,
-			offboard_txid,
-			offboard_tx,
-			vtxo_ids,
-			destination,
-			created_at,
-		});
-	}
-	Ok(pending)
-}
-
-pub fn remove_pending_offboard(
-	tx: &Transaction,
-	movement_id: MovementId,
-) -> anyhow::Result<()> {
-	let q = "DELETE FROM bark_pending_offboard WHERE movement_id = :movement_id;";
-	let mut statement = tx.prepare(q)?;
-	statement.execute(named_params! {
-		":movement_id": movement_id.0,
-	})?;
-	Ok(())
-}
-
 pub fn store_vtxo_with_initial_state(
 	tx: &Transaction,
 	vtxo: &Vtxo<Full>,
@@ -422,7 +299,7 @@ pub fn store_vtxo_with_initial_state(
 	let mut statement = tx.prepare(q1)?;
 	let rows_inserted = statement.execute(named_params! {
 		":vtxo_id" : vtxo.id().to_string(),
-		":expiry_height": vtxo.expiry_height(),
+		":expiry_height": vtxo.expiry_height().to_u32(),
 		":amount_sat": vtxo.amount().to_sat(),
 		":raw_bare": raw_bare,
 		":raw_genesis": raw_genesis,
@@ -448,11 +325,11 @@ pub fn store_vtxo_with_initial_state(
 }
 
 pub fn store_round_state(
-	tx: &rusqlite::Transaction,
+	conn: &Connection,
 	state: &RoundState,
 ) -> anyhow::Result<RoundStateId> {
 	let bytes = rmp_serde::to_vec(&SerdeRoundState::from(state)).expect("can serialize");
-	let mut stmt = tx.prepare(
+	let mut stmt = conn.prepare(
 		"INSERT INTO bark_round_state (state) VALUES (:state) RETURNING id",
 	)?;
 	let id = stmt.query_row(named_params! {
@@ -521,164 +398,10 @@ pub fn get_pending_round_state_ids(
 	Ok(ret)
 }
 
-pub fn get_all_pending_lightning_send(conn: &Connection) -> anyhow::Result<Vec<LightningSend>> {
-	let query = "
-		SELECT htlc_vtxo_ids, invoice, amount_sats, fee_sats, movement_id, preimage, finished_at
-		FROM bark_lightning_send
-		WHERE finished_at IS NULL";
-
-	let mut statement = conn.prepare(query)?;
-
-	let mut rows = statement.query(())?;
-
-	let mut pending_lightning_sends = Vec::new();
-	while let Some(row) = rows.next()? {
-		let invoice = row.get::<_, String>("invoice")?;
-		let htlc_vtxo_ids = serde_json::from_str::<Vec<VtxoId>>(&row.get::<_, String>(0)?)?;
-		let amount_sats = row.get::<_, i64>("amount_sats")?;
-		let fee_sats = row.get::<_, i64>("fee_sats")?;
-		let movement_id = MovementId::new(row.get::<_, u32>("movement_id")?);
-
-		let mut htlc_vtxos = Vec::new();
-		for htlc_vtxo_id in htlc_vtxo_ids {
-			htlc_vtxos.push(get_wallet_vtxo_by_id(conn, htlc_vtxo_id)?.context("no vtxo found")?);
-		}
-
-		pending_lightning_sends.push(LightningSend {
-			invoice: Invoice::from_str(&invoice)?,
-			amount: Amount::from_sat(u64::try_from(amount_sats)?),
-			fee: Amount::from_sat(u64::try_from(fee_sats)?),
-			htlc_vtxos,
-			movement_id,
-			preimage: row.get::<_, Option<String>>("preimage")?
-				.map(|p| Preimage::from_str(&p))
-				.transpose()?,
-			finished_at: row.get("finished_at")?,
-		});
-	}
-
-	Ok(pending_lightning_sends)
-}
-
-pub fn store_new_pending_lightning_send<V: VtxoRef>(
-	conn: &Connection,
-	invoice: &Invoice,
-	amount: Amount,
-	fee: Amount,
-	htlc_vtxo_ids: &[V],
-	movement_id: MovementId,
-) -> anyhow::Result<LightningSend> {
-	let query = "
-		INSERT INTO bark_lightning_send
-			(invoice, payment_hash, amount_sats, fee_sats, htlc_vtxo_ids, movement_id)
-		VALUES
-			(:invoice, :payment_hash, :amount_sats, :fee_sats, :htlc_vtxo_ids, :movement_id)
-	";
-
-	let mut statement = conn.prepare(query)?;
-
-	let mut htlc_vtxos = Vec::new();
-	let mut vtxo_ids = Vec::new();
-	for v in htlc_vtxo_ids {
-		htlc_vtxos.push(get_wallet_vtxo_by_id(conn, v.vtxo_id())?.context("no vtxo found")?);
-		vtxo_ids.push(v.vtxo_id().to_string());
-	}
-
-	statement.execute(named_params! {
-		":invoice": invoice.to_string(),
-		":payment_hash": invoice.payment_hash().as_hex().to_string(),
-		":amount_sats": amount.to_sat(),
-		":fee_sats": fee.to_sat(),
-		":htlc_vtxo_ids": serde_json::to_string(&vtxo_ids)?,
-		":movement_id": movement_id.0,
-	})?;
-
-	Ok(LightningSend {
-		invoice: invoice.clone(),
-		amount,
-		fee,
-		preimage: None,
-		htlc_vtxos,
-		movement_id,
-		finished_at: None,
-	})
-}
-
-pub fn finish_lightning_send(
-	conn: &Connection,
-	payment_hash: PaymentHash,
-	preimage: Option<Preimage>,
-) -> anyhow::Result<()> {
-	let query = "
-		UPDATE bark_lightning_send
-		SET preimage = :preimage, finished_at = :finished_at
-		WHERE payment_hash = :payment_hash";
-
-	let mut statement = conn.prepare(query)?;
-
-	statement.execute(named_params! {
-		":payment_hash": payment_hash.as_hex().to_string(),
-		":preimage": preimage.map(|p| p.as_hex().to_string()),
-		":finished_at": chrono::Local::now(),
-	})?;
-
-	Ok(())
-}
-
-pub fn remove_lightning_send(
-	conn: &Connection,
-	payment_hash: PaymentHash,
-) -> anyhow::Result<()> {
-	let query = "DELETE FROM bark_lightning_send WHERE payment_hash = :payment_hash";
-	let mut statement = conn.prepare(query)?;
-	statement.execute(named_params! { ":payment_hash": payment_hash.as_hex().to_string() })?;
-
-	Ok(())
-}
-
-pub fn get_lightning_send(
-	conn: &Connection,
-	payment_hash: PaymentHash,
-) -> anyhow::Result<Option<LightningSend>> {
-	let query = "
-		SELECT htlc_vtxo_ids, invoice, amount_sats, fee_sats, movement_id, preimage, finished_at
-		FROM bark_lightning_send
-		WHERE payment_hash = ?1";
-	let mut statement = conn.prepare(query)?;
-	let mut rows = statement.query([payment_hash.as_hex().to_string()])?;
-
-	if let Some(row) = rows.next()? {
-		let invoice = row.get::<_, String>("invoice")?;
-		let htlc_vtxo_ids = serde_json::from_str::<Vec<VtxoId>>(&row.get::<_, String>(0)?)?;
-		let amount_sats = row.get::<_, i64>("amount_sats")?;
-		let fee_sats = row.get::<_, i64>("fee_sats")?;
-		let movement_id = MovementId::new(row.get::<_, u32>("movement_id")?);
-
-		let mut htlc_vtxos = Vec::new();
-		for htlc_vtxo_id in htlc_vtxo_ids {
-			htlc_vtxos.push(get_wallet_vtxo_by_id(conn, htlc_vtxo_id)?.context("no vtxo found")?);
-		}
-
-		Ok(Some(LightningSend {
-			invoice: Invoice::from_str(&invoice)?,
-			amount: Amount::from_sat(amount_sats as u64),
-			fee: Amount::from_sat(fee_sats as u64),
-			preimage: row.get::<_, Option<String>>("preimage")?
-				.map(|p| Preimage::from_str(&p))
-				.transpose()?,
-			htlc_vtxos,
-			movement_id,
-			finished_at: row.get("finished_at")?,
-		}))
-	} else {
-		Ok(None)
-	}
-}
-
 /// Columns the `vtxo_view`-based listings always select, in the order
 /// [`row_to_wallet_vtxo`] expects them.
 const VTXO_VIEW_COLUMNS: &str =
-	"raw_bare, exit_depth, exit_tx_weight, state";
+	"raw_bare, exit_depth, exit_tx_weight, state, registered";
 
 pub fn get_wallet_vtxo_by_id(
 	conn: &Connection,
@@ -695,6 +418,43 @@ pub fn get_wallet_vtxo_by_id(
 	} else {
 		Ok(None)
 	}
+}
+
+/// Fetch a batch of wallet VTXOs by id, preserving the order of the input
+/// slice. Errors if any id is missing — callers pass ids they just read
+/// from the wallet, so missing rows indicate the wallet's state is
+/// inconsistent with what the caller observed.
+pub fn get_wallet_vtxos_by_ids(
+	conn: &Connection,
+	ids: &[VtxoId],
+) -> anyhow::Result<Vec<WalletVtxo>> {
+	if ids.is_empty() {
+		return Ok(Vec::new());
+	}
+
+	let query = format!(
+		"SELECT {VTXO_VIEW_COLUMNS} FROM vtxo_view
+		WHERE id IN (SELECT atom FROM json_each(?))",
+	);
+	let mut statement = conn.prepare(&query)?;
+
+	let json_ids = serde_json::to_string(&ids)?;
+	let rows = statement.query([json_ids])?;
+	let vtxos = rows_to_wallet_vtxos(rows)?;
+
+	let by_id = vtxos.into_iter()
+		.map(|v| (v.vtxo.id(), v))
+		.collect::<HashMap<_, _>>();
+	let mut out = Vec::with_capacity(ids.len());
+	for id in ids {
+		// Look up rather than consume so that a repeated id yields the
+		// same vtxo again instead of a spurious "not found".
+		match by_id.get(id) {
+			Some(v) => out.push(v.clone()),
+			None => bail!("vtxo {id} not found in vtxo_view"),
+		}
+	}
+	Ok(out)
 }
 
 pub fn get_all_vtxos(conn: &Connection) -> anyhow::Result<Vec<WalletVtxo>> {
@@ -791,9 +551,7 @@ pub fn get_full_vtxos_by_ids(
 }
 
 fn reassemble_full_vtxo(raw_bare: &[u8], raw_genesis: &[u8]) -> anyhow::Result<Vtxo<Full>> {
-	let bare = Vtxo::<Bare>::deserialize(raw_bare)?;
-	let genesis = Vtxo::<Bare>::decode_genesis(&mut &raw_genesis[..])?;
-	Ok(bare.with_genesis(genesis))
+	Vtxo::<Full>::deserialize_with_genesis(raw_bare, raw_genesis).context("failed to load VTXO")
 }
 
 pub fn delete_vtxo(
@@ -845,6 +603,11 @@ pub fn get_vtxo_state(
 /// Updates the state of a VTXO from one of the
 /// values in `old_state` to `new_state`.
 ///
+/// A VTXO already in exactly `new_state` is a no-op that succeeds without
+/// appending a history row, whatever `old_states` says. See
+/// [BarkPersister::update_vtxo_state_checked][crate::persist::BarkPersister::update_vtxo_state_checked]
+/// for the full contract.
+///
 /// The method is atomic. If another process tries
 /// to update the state only one of them will succeed.
 ///
@@ -861,23 +624,21 @@ pub fn update_vtxo_state_checked(
 		WHERE
 			vtxo_id = :vtxo_id AND
 			state_kind IN (SELECT atom FROM json_each(:old_states)) AND
-			state_kind != :state_kind";
+			state != :state";
 
+	let new_state_blob = serde_json::to_vec(&new_state)?;
 	let mut statement = conn.prepare(query)?;
 	let nb_inserted = statement.execute(named_params! {
 		":vtxo_id": vtxo_id.to_string(),
 		":state_kind": new_state.kind().as_str(),
-		":state": serde_json::to_vec(&new_state)?,
+		":state": &new_state_blob,
 		":old_states": &serde_json::to_string(old_states)?,
 	})?;
 
 	match nb_inserted {
 		0 => {
-			// Either the VTXO doesn't exist, its current state is not in the
-			// allowed old states, or it's already in the target state. The last
-			// case is a no-op — return the existing VTXO.
 			match get_wallet_vtxo_by_id(conn, vtxo_id)? {
-				Some(wv) if wv.state.kind() == new_state.kind() => Ok(wv),
+				Some(wv) if wv.state == new_state => Ok(wv),
 				Some(wv) => bail!(
 					"vtxo {} is in state {} which is not in the allowed old states {:?}",
 					vtxo_id, wv.state.kind(), old_states,
@@ -893,12 +654,111 @@ pub fn update_vtxo_state_checked(
 	}
 }
 
+/// Release `holder`'s lock on a vtxo, transitioning it to
+/// [VtxoState::Spendable]. `holder` must match the value used at lock
+/// time (including `None` for locks taken without a holder). Any other
+/// current state (already Spendable, Locked by a different holder, Spent,
+/// Exited) is a no-op, so calling this repeatedly is safe.
+pub fn release_vtxo_lock(
+	conn: &Connection,
+	vtxo_id: VtxoId,
+	holder: Option<&VtxoLockHolder>,
+) -> anyhow::Result<()> {
+	let query = r"
+		INSERT INTO bark_vtxo_state (vtxo_id, state_kind, state)
+		SELECT :vtxo_id, :spendable_kind, :spendable FROM most_recent_vtxo_state
+		WHERE
+			vtxo_id = :vtxo_id AND
+			state = :expected_state";
+
+	let expected = VtxoState::Locked { holder: holder.cloned() };
+	let expected_blob = serde_json::to_vec(&expected)?;
+	let spendable_blob = serde_json::to_vec(&VtxoState::Spendable)?;
+	let mut statement = conn.prepare(query)?;
+	let nb_inserted = statement.execute(named_params! {
+		":vtxo_id": vtxo_id.to_string(),
+		":spendable_kind": VtxoState::Spendable.kind().as_str(),
+		":spendable": &spendable_blob,
+		":expected_state": &expected_blob,
+	})?;
+	if nb_inserted > 1 {
+		bail!("Corrupted database: inserted {nb_inserted} state rows for a single vtxo");
+	}
+	Ok(())
+}
+
+/// Set the `registered` flag on the given vtxos, recording that their
+/// recovery state (mailbox ID post + signed transaction chain) has been
+/// asserted with the server. The flag only moves from unset to set.
+pub fn mark_vtxos_registered(
+	conn: &Connection,
+	vtxo_ids: &[VtxoId],
+) -> anyhow::Result<()> {
+	let mut statement = conn.prepare(
+		"UPDATE bark_vtxo SET registered = 1
+		WHERE id IN (SELECT atom FROM json_each(?))",
+	)?;
+	statement.execute([serde_json::to_string(&vtxo_ids)?])?;
+	Ok(())
+}
+
+/// Fetch the IDs of all vtxos that are not marked `registered` and not
+/// spent, i.e. the ones the sync-time recovery catch-up still needs to
+/// assert with the server. See
+/// [BarkPersister::get_unregistered_vtxo_ids][crate::persist::BarkPersister::get_unregistered_vtxo_ids]
+/// for why exited vtxos are included.
+pub fn get_unregistered_vtxo_ids(
+	conn: &Connection,
+) -> anyhow::Result<Vec<VtxoId>> {
+	let mut statement = conn.prepare(
+		"SELECT id FROM vtxo_view WHERE registered = 0 AND state_kind != ?",
+	)?;
+	let mut rows = statement.query([VtxoStateKind::Spent.as_str()])?;
+
+	let mut ids = Vec::new();
+	while let Some(row) = rows.next()? {
+		let id: String = row.get(0)?;
+		ids.push(VtxoId::from_str(&id)?);
+	}
+	Ok(ids)
+}
+
+/// Apply [update_vtxo_state_checked] to every id in `vtxo_ids` against the
+/// same connection. The caller is expected to wrap this in a transaction
+/// (BEGIN IMMEDIATE/COMMIT) so the batch is atomic and serialized against
+/// concurrent writers.
+pub fn update_vtxo_states_checked(
+	conn: &Connection,
+	vtxo_ids: &[VtxoId],
+	new_state: VtxoState,
+	old_states: &[VtxoStateKind],
+) -> anyhow::Result<()> {
+	for id in vtxo_ids {
+		update_vtxo_state_checked(conn, *id, new_state.clone(), old_states)?;
+	}
+	Ok(())
+}
+
 pub fn store_vtxo_key(
 	conn: &Connection,
 	index: u32,
 	public_key: PublicKey
 ) -> anyhow::Result<()> {
-	let query = "INSERT INTO bark_vtxo_key (idx, public_key) VALUES (?1, ?2);";
+	// Recovery may re-store a key it already revealed (e.g. retry after a partial
+	// scan), so re-storing the same (idx, public_key) is a no-op. The same index
+	// under a *different* key is real corruption, so surface it.
+	let existing = conn.query_row(
+		"SELECT public_key FROM bark_vtxo_key WHERE idx = ?1",
+		[index.to_sql()?],
+		|row| row.get::<_, String>(0),
+	).optional()?;
+	if let Some(existing) = existing {
+		ensure!(existing == public_key.to_string(),
+			"vtxo key index {index} already stored under a different public key");
+		return Ok(());
+	}
+
+	let query = "INSERT INTO bark_vtxo_key (idx, public_key) VALUES (?1, ?2) ON CONFLICT DO NOTHING;";
 	let mut statement = conn.prepare(query)?;
 	statement.execute([index.to_sql()?, public_key.to_string().to_sql()?])?;
 	Ok(())
@@ -955,168 +815,15 @@ pub fn store_mailbox_checkpoint(conn: &Connection, checkpoint: u64) -> anyhow::R
 	Ok(())
 }
 
-pub fn store_lightning_receive(
-	conn: &Connection,
-	payment_hash: PaymentHash,
-	preimage: Preimage,
-	invoice: &Bolt11Invoice,
-	htlc_recv_cltv_delta: BlockDelta,
-) -> anyhow::Result<()> {
-	let query = "
-		INSERT INTO bark_pending_lightning_receive (payment_hash, preimage, invoice,
-			htlc_recv_cltv_delta)
-		VALUES (:payment_hash, :preimage, :invoice, :htlc_recv_cltv_delta);
-	";
-	let mut statement = conn.prepare(query)?;
-
-	statement.execute(named_params! {
-		":payment_hash": payment_hash.as_hex().to_string(),
-		":preimage": preimage.as_hex().to_string(),
-		":invoice": invoice.to_string(),
-		":htlc_recv_cltv_delta": htlc_recv_cltv_delta,
-	})?;
-
-	Ok(())
-}
-
-fn get_htlc_vtxos(conn: &Connection, row: &Row<'_>) -> anyhow::Result<Vec<WalletVtxo>> {
-	match row.get::<_, Option<String>>("htlc_vtxo_ids")? {
-		Some(vtxo_ids_str) => {
-			let vtxo_ids = serde_json::from_str::<Vec<VtxoId>>(&vtxo_ids_str)?;
-			let mut vtxos = Vec::new();
-			for vtxo_id in vtxo_ids {
-				vtxos.push(get_wallet_vtxo_by_id(conn, vtxo_id)?.context("no vtxo found")?);
-			}
-			Ok(vtxos)
-		},
-		None => Ok(Vec::new()),
-	}
-}
-
-pub fn get_all_pending_lightning_receives<'a>(
-	conn: &'a Connection,
-) -> anyhow::Result<Vec<LightningReceive>> {
-	let query = "
-		SELECT payment_hash, preimage, invoice, htlc_vtxo_ids,
-			preimage_revealed_at, htlc_recv_cltv_delta, movement_id,
-			finished_at
-		FROM bark_pending_lightning_receive
-		WHERE finished_at IS NULL
-		ORDER BY created_at DESC";
-	let mut statement = conn.prepare(query)?;
-	let mut rows = statement.query([])?;
-
-	let mut result = Vec::new();
-	while let Some(row) = rows.next()? {
-		result.push(LightningReceive {
-			payment_hash: PaymentHash::from_str(&row.get::<_, String>("payment_hash")?)?,
-			payment_preimage: Preimage::from_str(&row.get::<_, String>("preimage")?)?,
-			preimage_revealed_at: row.get::<_, Option<DateTime<chrono::Utc>>>("preimage_revealed_at")?
-				.map(|ts| ts.with_timezone(&chrono::Local)),
-			invoice: Bolt11Invoice::from_str(&row.get::<_, String>("invoice")?)?,
-			htlc_recv_cltv_delta: row.get::<_, BlockDelta>("htlc_recv_cltv_delta")?,
-			htlc_vtxos: get_htlc_vtxos(conn, &row)?,
-			movement_id: row.get::<_, Option<u32>>("movement_id")?.map(MovementId::new),
-			finished_at: row.get::<_, Option<DateTime<chrono::Utc>>>("finished_at")?
-				.map(|ts| ts.with_timezone(&chrono::Local)),
-		});
-	}
-
-	Ok(result)
-}
-
-pub fn set_preimage_revealed(conn: &Connection, payment_hash: PaymentHash) -> anyhow::Result<()> {
-	let query = "UPDATE bark_pending_lightning_receive SET preimage_revealed_at = :revealed_at \
-		WHERE payment_hash = :payment_hash";
-	let mut statement = conn.prepare(query)?;
-	statement.execute(named_params! {
-		":payment_hash": payment_hash.as_hex().to_string(),
-		":revealed_at": chrono::Local::now(),
-	})?;
-	Ok(())
-}
-
-pub fn update_lightning_receive(
-	conn: &Connection,
-	payment_hash: PaymentHash,
-	htlc_vtxo_ids: &[VtxoId],
-	movement_id: MovementId,
-) -> anyhow::Result<()> {
-	let query = "
-		UPDATE bark_pending_lightning_receive
-		SET htlc_vtxo_ids = :htlc_vtxo_ids, movement_id = :movement_id
-		WHERE payment_hash = :payment_hash";
-
-	let mut statement = conn.prepare(query)?;
-
-	let mut vtxo_ids = Vec::new();
-	for v in htlc_vtxo_ids {
-		get_wallet_vtxo_by_id(conn, *v)?.context("no vtxo found")?;
-		vtxo_ids.push(v.to_string());
-	}
-
-	statement.execute(named_params! {
-		":payment_hash": payment_hash.as_hex().to_string(),
-		":htlc_vtxo_ids": serde_json::to_string(&vtxo_ids)?,
-		":movement_id": Some(movement_id.0),
-	})?;
-
-	Ok(())
-}
-
-pub fn finish_pending_lightning_receive(
-	conn: &Connection,
-	payment_hash: PaymentHash,
-) -> anyhow::Result<()> {
-	let query = "
-		UPDATE bark_pending_lightning_receive SET finished_at = :finished_at
-		WHERE payment_hash = :payment_hash";
-	let mut statement = conn.prepare(query)?;
-	statement.execute(named_params! {
-		":payment_hash": payment_hash.as_hex().to_string(),
-		":finished_at": chrono::Local::now(),
-	})?;
-
-	Ok(())
-}
-
-pub fn fetch_lightning_receive_by_payment_hash(
-	conn: &Connection,
-	payment_hash: PaymentHash,
-) -> anyhow::Result<Option<LightningReceive>> {
-	let query = "SELECT * FROM bark_pending_lightning_receive WHERE payment_hash = :payment_hash";
-	let mut statement = conn.prepare(query)?;
-	let mut rows = statement.query(named_params! {
-		":payment_hash": payment_hash.as_hex().to_string(),
-	})?;
-
-	let row = match rows.next()? {
-		Some(row) => row,
-		None => return Ok(None),
-	};
-
-	Ok(Some(LightningReceive {
-		payment_hash: PaymentHash::from_str(&row.get::<_, String>("payment_hash")?)?,
-		payment_preimage: Preimage::from_str(&row.get::<_, String>("preimage")?)?,
-		preimage_revealed_at: row.get::<_, Option<DateTime<chrono::Utc>>>("preimage_revealed_at")?
-			.map(|ts| ts.with_timezone(&chrono::Local)),
-		invoice: Bolt11Invoice::from_str(&row.get::<_, String>("invoice")?)?,
-		htlc_recv_cltv_delta: row.get::<_, BlockDelta>("htlc_recv_cltv_delta")?,
-		htlc_vtxos: get_htlc_vtxos(conn, &row)?,
-		movement_id: row.get::<_, Option<u32>>("movement_id")?.map(MovementId::new),
-		finished_at: row.get::<_, Option<DateTime<chrono::Utc>>>("finished_at")?
-			.map(|ts| ts.with_timezone(&chrono::Local)),
-	}))
-}
-
 pub fn store_exit_vtxo_entry(tx: &rusqlite::Transaction, exit: &StoredExit) -> anyhow::Result<()> {
 	let query = r"
-		INSERT INTO bark_exit_states (vtxo_id, state, history)
-		VALUES (?1, ?2, ?3)
+		INSERT INTO bark_exit_states (vtxo_id, state, history, movement_id)
+		VALUES (?1, ?2, ?3, ?4)
 		ON CONFLICT (vtxo_id) DO UPDATE
 		SET
 			state = EXCLUDED.state,
-			history = EXCLUDED.history;
+			history = EXCLUDED.history,
+			movement_id = EXCLUDED.movement_id;
 	";
 
 	// We can't use JSONB with rusqlite, so we make do with strings
@@ -1125,8 +832,9 @@ pub fn store_exit_vtxo_entry(tx: &rusqlite::Transaction, exit: &StoredExit) -> a
 		.map_err(|e| anyhow::format_err!("Exit VTXO {} state can't be serialized: {}", id, e))?;
 	let history = serde_json::to_string(&exit.history)
 		.map_err(|e| anyhow::format_err!("Exit VTXO {} history can't be serialized: {}", id, e))?;
+	let movement_id = exit.movement_id.map(|m| m.0);
 
-	tx.execute(query, (id, state, history))?;
+	tx.execute(query, (id, state, history, movement_id))?;
 	Ok(())
 }
 
@@ -1138,15 +846,65 @@ pub fn remove_exit_vtxo_entry(tx: &rusqlite::Transaction, id: &VtxoId) -> anyhow
 }
 
 pub fn get_exit_vtxo_entries(conn: &Connection) -> anyhow::Result<Vec<StoredExit>> {
-	let mut statement = conn.prepare("SELECT vtxo_id, state, history FROM bark_exit_states;")?;
+	let mut statement = conn.prepare(
+		"SELECT vtxo_id, state, history, movement_id FROM bark_exit_states;",
+	)?;
 	let mut rows = statement.query([])?;
 	let mut result = Vec::new();
 	while let Some(row) = rows.next()? {
 		let vtxo_id = VtxoId::from_str(&row.get::<usize, String>(0)?)?;
 		let state = serde_json::from_str::<ExitState>(&row.get::<usize, String>(1)?)?;
 		let history = serde_json::from_str::<Vec<ExitState>>(&row.get::<usize, String>(2)?)?;
+		let movement_id = row.get::<usize, Option<u32>>(3)?.map(MovementId::new);
 
-		result.push(StoredExit { vtxo_id, state, history });
+		result.push(StoredExit { vtxo_id, state, history, movement_id });
+	}
+
+	Ok(result)
+}
+
+pub fn get_exit_vtxo_entry(conn: &Connection, id: &VtxoId) -> anyhow::Result<Option<StoredExit>> {
+	let mut statement = conn.prepare(
+		"SELECT vtxo_id, state, history, movement_id FROM bark_exit_states WHERE vtxo_id = ?1;",
+	)?;
+	let mut rows = statement.query([id.to_string()])?;
+	if let Some(row) = rows.next()? {
+		let vtxo_id = VtxoId::from_str(&row.get::<usize, String>(0)?)?;
+		let state = serde_json::from_str::<ExitState>(&row.get::<usize, String>(1)?)?;
+		let history = serde_json::from_str::<Vec<ExitState>>(&row.get::<usize, String>(2)?)?;
+		let movement_id = row.get::<usize, Option<u32>>(3)?.map(MovementId::new);
+
+		Ok(Some(StoredExit { vtxo_id, state, history, movement_id }))
+	} else {
+		Ok(None)
+	}
+}
+
+pub fn get_exit_vtxo_entries_with_states(
+	conn: &Connection,
+	states: &[ExitStateKind],
+) -> anyhow::Result<Vec<StoredExit>> {
+	if states.is_empty() {
+		return Ok(Vec::new());
+	}
+
+	let placeholders = iter::repeat("?").take(states.len()).collect::<Vec<_>>().join(", ");
+	let sql = format!(
+		"SELECT vtxo_id, state, history, movement_id FROM bark_exit_states \
+		WHERE json_extract(state, '$.type') IN ({});",
+		placeholders,
+	);
+	let mut statement = conn.prepare(&sql)?;
+	let params = rusqlite::params_from_iter(states.iter().map(|s| s.as_str()));
+	let mut rows = statement.query(params)?;
+	let mut result = Vec::new();
+	while let Some(row) = rows.next()? {
+		let vtxo_id = VtxoId::from_str(&row.get::<usize, String>(0)?)?;
+		let state = serde_json::from_str::<ExitState>(&row.get::<usize, String>(1)?)?;
+		let history = serde_json::from_str::<Vec<ExitState>>(&row.get::<usize, String>(2)?)?;
+		let movement_id = row.get::<usize, Option<u32>>(3)?.map(MovementId::new);
+
+		result.push(StoredExit { vtxo_id, state, history, movement_id });
 	}
 
 	Ok(result)
@@ -1203,6 +961,155 @@ pub fn get_exit_child_tx(
 	}
 }
 
+pub fn upsert_wallet_action_checkpoint(
+	conn: &Connection,
+	id: &WalletActionId,
+	checkpoint: &WalletActionCheckpoint,
+) -> anyhow::Result<()> {
+	let payload = serde_json::to_vec(checkpoint)
+		.context("failed to serialize wallet action checkpoint")?;
+	let query = "
+		INSERT INTO bark_wallet_action_checkpoint (id, payload)
+		VALUES (:id, :payload)
+		ON CONFLICT(id) DO UPDATE SET
+			payload = excluded.payload,
+			updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')";
+	let mut statement = conn.prepare(query)?;
+	statement.execute(named_params! {
+		":id": id,
+		":payload": payload,
+	})?;
+	Ok(())
+}
+
+pub fn get_wallet_action_checkpoint(
+	conn: &Connection,
+	id: &WalletActionId,
+) -> anyhow::Result<Option<WalletActionCheckpoint>> {
+	let query = "SELECT payload FROM bark_wallet_action_checkpoint WHERE id = :id";
+	let mut statement = conn.prepare(query)?;
+	let mut rows = statement.query(named_params! { ":id": id })?;
+
+	let row = match rows.next()? {
+		Some(row) => row,
+		None => return Ok(None),
+	};
+	let payload: Vec<u8> = row.get("payload")?;
+	let checkpoint = serde_json::from_slice(&payload)
+		.context("failed to deserialize wallet action checkpoint")?;
+	Ok(Some(checkpoint))
+}
+
+pub fn get_all_wallet_action_checkpoints(
+	conn: &Connection,
+) -> anyhow::Result<Vec<WalletActionCheckpoint>> {
+	let query = "SELECT payload FROM bark_wallet_action_checkpoint ORDER BY created_at ASC";
+	let mut statement = conn.prepare(query)?;
+	let mut rows = statement.query([])?;
+
+	let mut result = Vec::new();
+	while let Some(row) = rows.next()? {
+		let payload: Vec<u8> = row.get("payload")?;
+		let checkpoint = serde_json::from_slice(&payload)
+			.context("failed to deserialize wallet action checkpoint")?;
+		result.push(checkpoint);
+	}
+	Ok(result)
+}
+
+pub fn remove_wallet_action_checkpoint(
+	conn: &Connection,
+	id: &WalletActionId,
+) -> anyhow::Result<()> {
+	let query = "DELETE FROM bark_wallet_action_checkpoint WHERE id = :id";
+	let mut statement = conn.prepare(query)?;
+	statement.execute(named_params! { ":id": id })?;
+	Ok(())
+}
+
+
+pub fn record_paid_invoice(
+	conn: &Connection,
+	payment_hash: PaymentHash,
+	preimage: Preimage,
+) -> anyhow::Result<()> {
+	let query = "
+		INSERT INTO bark_paid_invoice (payment_hash, preimage)
+		VALUES (:payment_hash, :preimage)
+		ON CONFLICT(payment_hash) DO NOTHING";
+	let mut statement = conn.prepare(query)?;
+	statement.execute(named_params! {
+		":payment_hash": payment_hash.as_hex().to_string(),
+		":preimage": preimage.as_hex().to_string(),
+	})?;
+	Ok(())
+}
+
+pub fn get_paid_invoice(
+	conn: &Connection,
+	payment_hash: PaymentHash,
+) -> anyhow::Result<Option<PaidInvoice>> {
+	let query = "SELECT preimage, paid_at FROM bark_paid_invoice WHERE payment_hash = :payment_hash";
+	let mut statement = conn.prepare(query)?;
+	let mut rows = statement.query(named_params! { ":payment_hash": payment_hash.as_hex().to_string() })?;
+
+	let row = match rows.next()? {
+		Some(row) => row,
+		None => return Ok(None),
+	};
+	let preimage_str: String = row.get("preimage")?;
+	let preimage = Preimage::from_str(&preimage_str)
+		.context("invalid preimage hex in bark_paid_invoice")?;
+	let paid_at: chrono::DateTime<chrono::Local> = row.get("paid_at")?;
+	Ok(Some(PaidInvoice { payment_hash, preimage, paid_at }))
+}
+
+
+pub fn record_settled_lightning_receive(
+	conn: &Connection,
+	payment_hash: PaymentHash,
+	preimage: Preimage,
+	invoice: &Bolt11Invoice,
+	amount: Amount,
+) -> anyhow::Result<()> {
+	let query = "
+		INSERT INTO bark_settled_lightning_receive (payment_hash, preimage, invoice, amount_sat)
+		VALUES (:payment_hash, :preimage, :invoice, :amount_sat)
+		ON CONFLICT(payment_hash) DO NOTHING";
+	let mut statement = conn.prepare(query)?;
+	statement.execute(named_params! {
+		":payment_hash": payment_hash.as_hex().to_string(),
+		":preimage": preimage.as_hex().to_string(),
+		":invoice": invoice.to_string(),
+		":amount_sat": amount.to_sat() as i64,
+	})?;
+	Ok(())
+}
+
+pub fn get_settled_lightning_receive(
+	conn: &Connection,
+	payment_hash: PaymentHash,
+) -> anyhow::Result<Option<SettledLightningReceive>> {
+	let query = "SELECT preimage, invoice, amount_sat, settled_at
+		FROM bark_settled_lightning_receive WHERE payment_hash = :payment_hash";
+	let mut statement = conn.prepare(query)?;
+	let mut rows = statement.query(named_params! { ":payment_hash": payment_hash.as_hex().to_string() })?;
+
+	let row = match rows.next()? {
+		Some(row) => row,
+		None => return Ok(None),
+	};
+	let preimage_str: String = row.get("preimage")?;
+	let preimage = Preimage::from_str(&preimage_str)
+		.context("invalid preimage hex in bark_settled_lightning_receive")?;
+	let invoice_str: String = row.get("invoice")?;
+	let invoice = Bolt11Invoice::from_str(&invoice_str)
+		.context("invalid invoice in bark_settled_lightning_receive")?;
+	let amount = Amount::from_sat(row.get::<_, i64>("amount_sat")? as u64);
+	let settled_at: chrono::DateTime<chrono::Local> = row.get("settled_at")?;
+	Ok(Some(SettledLightningReceive { payment_hash, preimage, invoice, amount, settled_at }))
+}
+
 
 #[cfg(test)]
 mod test {
@@ -1223,7 +1130,7 @@ mod test {
 		let vtxo_2 = &VTXO_VECTORS.arkoor_htlc_out_vtxo;
 		let vtxo_3 = &VTXO_VECTORS.round2_vtxo;
 
-		let locked = VtxoState::Locked { movement_id: None };
+		let locked = VtxoState::Locked { holder: None };
 		store_vtxo_with_initial_state(&tx, &vtxo_1, &locked).unwrap();
 		store_vtxo_with_initial_state(&tx, &vtxo_2, &locked).unwrap();
 		store_vtxo_with_initial_state(&tx, &vtxo_3, &locked).unwrap();
@@ -1266,7 +1173,7 @@ mod test {
 		store_vtxo_with_initial_state(&tx, vtxo, &spendable).unwrap();
 
 		// Second insert with different state should also succeed but NOT change state
-		let locked = VtxoState::Locked { movement_id: None };
+		let locked = VtxoState::Locked { holder: None };
 		store_vtxo_with_initial_state(&tx, vtxo, &locked).unwrap();
 
 		// State should still be Spendable (original state preserved)
@@ -1288,7 +1195,7 @@ mod test {
 		let vtxo = &VTXO_VECTORS.board_vtxo;
 
 		// Store a VTXO in Locked state.
-		let locked = VtxoState::Locked { movement_id: None };
+		let locked = VtxoState::Locked { holder: None };
 		store_vtxo_with_initial_state(&tx, vtxo, &locked).unwrap();
 
 		// First unlock: Locked -> Spendable. Must succeed.
@@ -1321,8 +1228,110 @@ mod test {
 		// Also verify that a disallowed transition still fails.
 		// VTXO is Spendable, but only Spent is allowed -> must error.
 		update_vtxo_state_checked(
-			&tx, vtxo.id(), VtxoState::Locked { movement_id: None }, &[VtxoStateKind::Spent],
+			&tx, vtxo.id(), VtxoState::Locked { holder: None }, &[VtxoStateKind::Spent],
 		).expect_err("transition from Spendable should fail when only Spent is allowed");
+	}
+
+	/// Releasing a lock is holder-scoped and idempotent: repeat calls are
+	/// no-ops, and another holder's lock is never touched. A `None` holder
+	/// is matched exactly like any other value.
+	#[test]
+	fn test_release_vtxo_lock() {
+		let (_, mut conn) = in_memory_db();
+		MigrationContext{}.do_all_migrations(&mut conn).unwrap();
+
+		let tx = conn.transaction().unwrap();
+		let vtxo = &VTXO_VECTORS.board_vtxo;
+
+		let mine = VtxoLockHolder::Movement { id: MovementId::new(1) };
+		let theirs = VtxoLockHolder::Movement { id: MovementId::new(2) };
+
+		// Own lock: releases to Spendable.
+		store_vtxo_with_initial_state(&tx, vtxo, &VtxoState::Locked {
+			holder: Some(mine.clone()),
+		}).unwrap();
+		release_vtxo_lock(&tx, vtxo.id(), Some(&mine)).unwrap();
+		let wv = get_wallet_vtxo_by_id(&tx, vtxo.id()).unwrap().unwrap();
+		assert_eq!(wv.state, VtxoState::Spendable);
+
+		// Idempotent: already Spendable, still a no-op success.
+		release_vtxo_lock(&tx, vtxo.id(), Some(&mine)).unwrap();
+		let wv = get_wallet_vtxo_by_id(&tx, vtxo.id()).unwrap().unwrap();
+		assert_eq!(wv.state, VtxoState::Spendable);
+
+		// Another holder's lock: must not be released.
+		let theirs_state = VtxoState::Locked { holder: Some(theirs.clone()) };
+		update_vtxo_state_checked(
+			&tx, vtxo.id(), theirs_state.clone(), &[VtxoStateKind::Spendable],
+		).unwrap();
+		release_vtxo_lock(&tx, vtxo.id(), Some(&mine)).unwrap();
+		let wv = get_wallet_vtxo_by_id(&tx, vtxo.id()).unwrap().unwrap();
+		assert_eq!(wv.state, theirs_state, "other holder's lock must survive");
+
+		// Passing None must not release someone else's Some lock either.
+		release_vtxo_lock(&tx, vtxo.id(), None).unwrap();
+		let wv = get_wallet_vtxo_by_id(&tx, vtxo.id()).unwrap().unwrap();
+		assert_eq!(wv.state, theirs_state, "None holder must not release a Some lock");
+	}
+
+	#[test]
+	fn test_mark_vtxos_registered() {
+		let (_, mut conn) = in_memory_db();
+		MigrationContext{}.do_all_migrations(&mut conn).unwrap();
+
+		let tx = conn.transaction().unwrap();
+		let vtxo_1 = &VTXO_VECTORS.board_vtxo;
+		let vtxo_2 = &VTXO_VECTORS.arkoor_htlc_out_vtxo;
+
+		let spendable = VtxoState::Spendable;
+		store_vtxo_with_initial_state(&tx, &vtxo_1, &spendable).unwrap();
+		store_vtxo_with_initial_state(&tx, &vtxo_2, &spendable).unwrap();
+
+		// Fresh vtxos start unregistered.
+		let wv = get_wallet_vtxo_by_id(&tx, vtxo_1.id()).unwrap().unwrap();
+		assert!(!wv.registered);
+
+		// Marking one vtxo must not affect the other.
+		mark_vtxos_registered(&tx, &[vtxo_1.id()]).unwrap();
+		let wv = get_wallet_vtxo_by_id(&tx, vtxo_1.id()).unwrap().unwrap();
+		assert!(wv.registered);
+		let wv = get_wallet_vtxo_by_id(&tx, vtxo_2.id()).unwrap().unwrap();
+		assert!(!wv.registered);
+
+		// The flag survives state transitions.
+		update_vtxo_state_checked(
+			&tx, vtxo_1.id(), VtxoState::Spent, &[VtxoStateKind::Spendable],
+		).unwrap();
+		let wv = get_wallet_vtxo_by_id(&tx, vtxo_1.id()).unwrap().unwrap();
+		assert!(wv.registered);
+	}
+
+	#[test]
+	fn test_get_unregistered_vtxo_ids() {
+		let (_, mut conn) = in_memory_db();
+		MigrationContext{}.do_all_migrations(&mut conn).unwrap();
+
+		let tx = conn.transaction().unwrap();
+		let spendable = &VTXO_VECTORS.board_vtxo;
+		let locked = &VTXO_VECTORS.round1_vtxo;
+		let exited = &VTXO_VECTORS.round2_vtxo;
+		let spent = &VTXO_VECTORS.arkoor_htlc_out_vtxo;
+		let registered = &VTXO_VECTORS.arkoor2_vtxo;
+
+		store_vtxo_with_initial_state(&tx, spendable, &VtxoState::Spendable).unwrap();
+		store_vtxo_with_initial_state(&tx, locked, &VtxoState::Locked { holder: None }).unwrap();
+		store_vtxo_with_initial_state(&tx, exited, &VtxoState::Exited).unwrap();
+		store_vtxo_with_initial_state(&tx, spent, &VtxoState::Spent).unwrap();
+		store_vtxo_with_initial_state(&tx, registered, &VtxoState::Spendable).unwrap();
+		mark_vtxos_registered(&tx, &[registered.id()]).unwrap();
+
+		// Spendable, locked and exited unregistered vtxos all need recovery
+		// catch-up; spent and already-registered ones don't.
+		let mut ids = get_unregistered_vtxo_ids(&tx).unwrap();
+		ids.sort();
+		let mut expected = vec![spendable.id(), locked.id(), exited.id()];
+		expected.sort();
+		assert_eq!(ids, expected);
 	}
 
 	#[test]

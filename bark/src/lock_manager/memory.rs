@@ -1,14 +1,13 @@
 //! In-process named locks with a process-wide shared keyspace.
 //!
 //! All [`MemoryLockManager`] instances within a process share a single
-//! global key map: two `MemoryLockManager::new()` calls produce handles
+//! global key map: two [MemoryLockManager::new()] calls produce handles
 //! into the same lock universe. Two instances cannot accidentally end
 //! up with disjoint lock universes the way direct
-//! [`InternalMemoryLockManager`](super::internal_memory::InternalMemoryLockManager)
-//! instances would.
+//! `InternalMemoryLockManager` instances would.
 //!
 //! Compare with
-//! [`InternalMemoryLockManager`](super::internal_memory::InternalMemoryLockManager),
+//! `InternalMemoryLockManager`,
 //! whose keyspace is per-instance and exists for composition by
 //! file-based backends — each backend needs its own private in-process
 //! map so two unrelated lock directories don't falsely contend on the
@@ -38,7 +37,7 @@ use super::internal_memory::InternalMemoryLockManager;
 
 /// In-process named locks with a process-wide shared keyspace. See the
 /// [module docs](self) for the comparison with
-/// [`InternalMemoryLockManager`].
+/// `InternalMemoryLockManager`.
 pub struct MemoryLockManager;
 
 impl MemoryLockManager {
@@ -65,7 +64,8 @@ impl std::fmt::Debug for MemoryLockManager {
 	}
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl LockManager for MemoryLockManager {
 	async fn try_lock(&self, key: &str) -> Option<Box<dyn LockGuard>> {
 		Self::shared().try_lock(key).await

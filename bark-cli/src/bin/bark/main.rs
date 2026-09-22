@@ -8,28 +8,24 @@ mod round;
 mod swap;
 
 use std::cmp::Ordering;
-use std::sync::Arc;
 use std::{env, process};
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::Context;
 use bark::movement::PaymentMethod;
-use bark_cli::VERSION_DIRTY;
+use bark::secret::Secret;
+use bark_cli::VERSION_DEV_MARKER;
 use bitcoin::{Amount};
+use bitcoin::secp256k1;
+use bitcoin_ext::BlockDelta;
 use clap::builder::BoolishValueParser;
 use clap::Parser;
 use futures::StreamExt;
-use ::lightning::offers::offer::Offer;
-use lightning_invoice::Bolt11Invoice;
-use lnurl::lightning_address::LightningAddress;
 use log::{debug, info, warn};
-use tokio::sync::RwLock;
 
 use ark::{ProtocolEncoding, VtxoId};
-use ark::lightning::PaymentHash;
-use bark::Wallet;
-use bark::onchain::ChainSync;
+use bark::PaymentInitOutput;
 use bark::vtxo::{VtxoFilter, VtxoStateKind};
 use bark_json as json;
 use bark_json::primitives::WalletVtxoInfo;
@@ -50,6 +46,9 @@ fn default_datadir() -> String {
 /// The full version string we show in our binary.
 /// (BARK_VERSION and GIT_HASH are set in build.rs)
 const FULL_VERSION: &str = concat!(env!("BARK_VERSION"), " (", env!("GIT_HASH"), ")");
+
+/// Wire-level client identity sent in `x-user-agent` on every RPC.
+pub const USER_AGENT: &str = concat!("bark/", env!("BARK_VERSION"));
 
 #[derive(Parser)]
 #[command(name = "bark", author = "Team Second <hello@second.tech>", version = FULL_VERSION, about)]
@@ -73,6 +72,20 @@ struct Cli {
 	)]
 	quiet: bool,
 
+	/// Write the debug log to this file instead of the default
+	/// `<datadir>/debug.log`
+	#[arg(long, env = "BARK_LOGFILE", global = true, conflicts_with = "no_logfile")]
+	logfile: Option<PathBuf>,
+	/// Disable the debug log file entirely
+	#[arg(
+		long,
+		env = "BARK_NO_LOGFILE",
+		global = true,
+		conflicts_with = "logfile",
+		value_parser = BoolishValueParser::new(),
+	)]
+	no_logfile: bool,
+
 	/// The datadir of the bark wallet
 	#[arg(long, env = "BARK_DATADIR", global = true, default_value_t = default_datadir())]
 	datadir: String,
@@ -93,12 +106,46 @@ struct AddressLookupFilter {
 	index: Option<u32>,
 }
 
+#[derive(clap::Args)]
+#[group(required = true, multiple = false)]
+struct VerifyMessageKey {
+	/// The public key to verify the signature against
+	#[arg(long)]
+	pubkey: Option<secp256k1::PublicKey>,
+	/// The Ark address whose user pubkey to verify the signature against
+	#[arg(long)]
+	address: Option<ark::Address>,
+}
+
 #[derive(clap::Subcommand)]
 enum AddressCommand {
 	/// Look up receives for an Ark address
 	Lookup {
 		#[clap(flatten)]
 		filter: AddressLookupFilter,
+	},
+}
+
+#[derive(clap::Subcommand)]
+enum MessageCommand {
+	/// Sign an arbitrary message with the key of the provided Ark address
+	Sign {
+		/// The message to sign
+		message: String,
+		/// The Ark address to sign the message with
+		address: ark::Address,
+	},
+
+	/// Verify a signed message
+	///
+	/// Exits with an error if the signature is not valid.
+	Verify {
+		/// The message that was signed
+		message: String,
+		/// The signature, in hex
+		signature: secp256k1::schnorr::Signature,
+		#[clap(flatten)]
+		key: VerifyMessageKey,
 	},
 }
 
@@ -128,6 +175,40 @@ enum Command {
 
 		#[command(subcommand)]
 		subcommand: Option<AddressCommand>,
+	},
+
+	/// Sign and verify messages
+	#[command(subcommand)]
+	Message(MessageCommand),
+
+	/// Generate a BIP 321 payment string
+	#[command()]
+	Bip321 {
+		/// The amount to receive
+		///
+		/// Provided value must match format `<amount> <unit>`, where unit can be any amount denomination. Example: `250000 sats`.
+		///
+		/// Optional. If omitted, the builder will skip generating a BOLT11 invoice.
+		#[arg(long)]
+		amount: Option<Amount>,
+		/// The label to add to the payment
+		#[arg(long)]
+		label: Option<String>,
+		/// The message to add to the payment
+		#[arg(long)]
+		message: Option<String>,
+		/// Whether to include all payment methods
+		#[arg(long)]
+		all: bool,
+		/// Whether to include an onchain address in the payment
+		#[arg(long)]
+		onchain: bool,
+		/// Whether to include a Lightning invoice in the payment
+		#[arg(long)]
+		lightning: bool,
+		/// Whether to include an Ark address in the payment
+		#[arg(long)]
+		ark: bool,
 	},
 
 	/// Get the wallet balance
@@ -189,6 +270,10 @@ enum Command {
 		/// Perform the refresh in delegated (non-interactive) mode
 		#[arg(long)]
 		delegated: bool,
+		/// Schedule the delegated refresh at this block height instead of the next round.
+		/// Requires --delegated.
+		#[arg(long, requires = "delegated")]
+		height: Option<u32>,
 		/// Skip syncing wallet
 		#[arg(long)]
 		no_sync: bool,
@@ -211,10 +296,16 @@ enum Command {
 		no_sync: bool,
 	},
 
-	/// Send money using Ark
+	/// Send a payment to an Ark, Lightning, Bitcoin or BIP-321 destination
 	#[command()]
 	Send {
-		/// The destination can be an Ark address, a BOLT11-invoice, LNURL or a lightning address
+		/// Supported destinations are:
+		/// - Ark address
+		/// - BOLT11 invoice
+		/// - BOLT12 offer
+		/// - Lightning address
+		/// - Bitcoin address
+		/// - BIP321 payment URI
 		destination: String,
 		/// The amount to send (optional for bolt11)
 		///
@@ -227,7 +318,12 @@ enum Command {
 		no_sync: bool,
 		/// Wait for the payment to be completed
 		#[arg(long)]
-		wait: bool
+		wait: bool,
+		/// In case the BIP 321 payment URI has multiple valid payment methods,
+		/// select the method by index. Allow using this CLI in non-interactive
+		/// mode. It is ignored if the destination has only one valid payment method.
+		#[arg(long)]
+		method_index: Option<u32>,
 	},
 
 	/// Send money from your vtxo's to an onchain address
@@ -309,18 +405,18 @@ enum Command {
 async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 	let datadir = PathBuf::from_str(&cli.datadir).unwrap();
 
-	init_logging(cli.verbose, cli.quiet, &datadir);
+	init_logging(cli.verbose, cli.quiet, &datadir, cli.logfile.clone(), cli.no_logfile);
 
 	info!("Starting bark version {} with datadir {}", FULL_VERSION, datadir.display());
 
-	if env!("BARK_VERSION") == VERSION_DIRTY {
+	if env!("BARK_VERSION").contains(VERSION_DEV_MARKER) {
 		warn!("You're running a custom build of bark, which might cause unexpected issues. \
 			Consider building at one of the tagged versions or using the release builds.");
 	}
 
 	// Handle create command differently.
 	if let Command::Create(opts) = cli.command {
-		create_wallet(&datadir, opts).await?;
+		create_wallet(&datadir, USER_AGENT, opts).await?;
 		return Ok(())
 	}
 
@@ -328,22 +424,39 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 		return dev::execute_dev_command(cmd, datadir).await;
 	}
 
-	if let Command::Swap(swap::SwapCommand::BtcArk(
-		swap::BtcArkCommand::Coordinator { listen },
-	)) = cli.command {
-		return swap::execute_btc_ark_coordinator_command(listen).await;
+	// Message verification is stateless, so it doesn't need a wallet.
+	if let Command::Message(MessageCommand::Verify { message, signature, key }) = cli.command {
+		let pubkey = if let Some(pubkey) = key.pubkey {
+			pubkey
+		} else if let Some(address) = key.address {
+			address.policy().user_pubkey()
+		} else {
+			unreachable!("clap requires --pubkey or --address");
+		};
+		if !ark::message::verify(pubkey, message.as_bytes(), &signature) {
+			bail!("invalid signature");
+		}
+		output_json(&json::cli::MessageVerification { valid: true });
+		return Ok(())
 	}
 
-	let (mut wallet, mut onchain) = open_wallet(&datadir).await
-			.context("error opening wallet")?
-			.context("No wallet found")?;
+	let mut wallet = open_wallet(&datadir, USER_AGENT).await
+		.context("error opening wallet")?
+		.context("No wallet found")?;
 
 	let net = wallet.network().await?;
 
 	match cli.command {
-		Command::Create { .. } | Command::Dev(_) => unreachable!("handled earlier"),
+		Command::Create { .. } | Command::Dev(_) | Command::Message(MessageCommand::Verify { .. }) => {
+			unreachable!("handled earlier")
+		},
 		Command::Config => {
-			output_json(&wallet.config())
+			let mut config = wallet.config().clone();
+			// The Secret wrapper only redacts Debug output; JSON
+			// serialization passes through, so swap the value here.
+			config.bitcoind_pass = config.bitcoind_pass
+				.map(|_| Secret::new("[redacted]".to_owned()));
+			output_json(&config)
 		},
 		Command::ArkInfo => {
 			match wallet.require_ark_info().await {
@@ -376,6 +489,64 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 				},
 			}
 		},
+		Command::Message(MessageCommand::Sign { message, address }) => {
+			let signature = wallet.sign_message(message.as_bytes(), &address).await?
+				.context("address does not belong to this wallet or its key has not been derived")?;
+			output_json(&json::cli::SignedMessage { signature });
+		},
+		Command::Bip321 {
+			amount, label, message,
+			onchain: onchain_enabled,
+			lightning: lightning_enabled,
+			ark: ark_enabled,
+			all: all_enabled,
+		} => {
+			let onchain = wallet.onchain();
+			let mut onchain_guard = match onchain.as_ref() {
+				Some(onchain) => Some(onchain.write().await),
+				None => None,
+			};
+
+			let mut builder = wallet.bip321_uri();
+			if let Some(amount) = amount {
+				builder = builder.amount(amount);
+			}
+
+			if let Some(label) = label {
+				builder = builder.label(label);
+			}
+			if let Some(message) = message {
+				builder = builder.message(message);
+			}
+
+			if all_enabled {
+				let onchain = onchain_guard.as_mut()
+					.context("no onchain wallet configured")?;
+				builder = builder
+					.onchain_wallet(&mut **onchain)
+					.lightning_bolt11(true)
+					.ark(true);
+			} else {
+				let enabled_count = [onchain_enabled, lightning_enabled, ark_enabled]
+					.iter().filter(|e| **e).count();
+				if enabled_count == 0 {
+					bail!("at least one payment method must be enabled");
+				}
+
+				// The builder enables all methods by default,
+				// so first disable them and re-enable the selected ones.
+				builder = builder.disable_all();
+				if onchain_enabled {
+					let onchain = onchain_guard.as_mut()
+						.context("no onchain wallet configured")?;
+					builder = builder.onchain_wallet(&mut **onchain);
+				}
+				if lightning_enabled { builder = builder.lightning_bolt11(true); }
+				if ark_enabled { builder = builder.ark(true); }
+			}
+
+			println!("{}", builder.build().await?);
+		},
 		Command::Balance { no_sync } => {
 			if !no_sync {
 				info!("Syncing wallet...");
@@ -405,7 +576,7 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 				}
 			});
 
-			output_json(&vtxos.into_iter().map(WalletVtxoInfo::from).collect::<Vec<_>>());
+			output_json(&vtxos.iter().map(WalletVtxoInfo::from).collect::<Vec<_>>());
 		},
 		Command::RawVtxo { vtxo_id } => {
 			let v = wallet.get_full_vtxo(vtxo_id.parse().context("invalid VTXO ID")?).await?;
@@ -428,7 +599,8 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 			output_json(&movements);
 		},
 		Command::Refresh {
-			vtxos, threshold_blocks, threshold_hours, counterparty, all, delegated, no_sync,
+			vtxos, threshold_blocks, threshold_hours, counterparty, all, delegated,
+			height, no_sync,
 		} => {
 			if !no_sync {
 				info!("Syncing wallet...");
@@ -436,9 +608,15 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 			}
 
 			let vtxos = match (threshold_blocks, threshold_hours, counterparty, all, vtxos) {
-				(None, None, false, false, None) => wallet.get_expiring_vtxos(wallet.config().vtxo_refresh_expiry_threshold).await?,
-				(Some(b), None, false, false, None) => wallet.get_expiring_vtxos(b).await?,
-				(None, Some(h), false, false, None) => wallet.get_expiring_vtxos(h*6).await?,
+				(None, None, false, false, None) => wallet.get_expiring_vtxos(
+					wallet.config().vtxo_refresh_expiry_threshold,
+				).await?,
+				(Some(b), None, false, false, None) => wallet.get_expiring_vtxos(
+					BlockDelta::try_from(b).context("threshold_blocks too large")?,
+				).await?,
+				(None, Some(h), false, false, None) => wallet.get_expiring_vtxos(
+					BlockDelta::try_from(h*6).context("threshold_hours too large")?,
+				).await?,
 				(None, None, true, false, None) => {
 					let filter = VtxoFilter::new(&wallet).counterparty();
 					wallet.spendable_vtxos_with(&filter).await?
@@ -457,7 +635,12 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 
 			info!("Refreshing {} vtxos...", vtxos.len());
 			if delegated {
-				if let Some(res) = wallet.refresh_vtxos_delegated(vtxos).await? {
+				let res = match height {
+					Some(height) => wallet.refresh_vtxos_scheduled(vtxos, height.into()).await?,
+					None => wallet.refresh_vtxos_delegated(vtxos).await?,
+				};
+
+				if let Some(res) = res {
 					output_json(&json::cli::RoundStateInfo {
 						round_state_id: res.id().0,
 					});
@@ -475,58 +658,119 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 		Command::Board { amount, all, no_sync } => {
 			if !no_sync {
 				info!("Syncing onchain wallet...");
-				if let Err(e) = onchain.sync(&wallet.chain).await {
+				if let Err(e) = wallet.sync_onchain().await {
 					warn!("Sync error: {}", e)
 				}
 			}
 			let board = match (amount, all) {
 				(Some(a), false) => {
 					info!("Boarding {}...", a);
-					wallet.board_amount(&mut onchain, a).await?
+					wallet.board_amount(a).await?
 				},
 				(None, true) => {
 					info!("Boarding total balance...");
-					wallet.board_all(&mut onchain).await?
+					wallet.board_all().await?
 				},
 				_ => bail!("please provide either an amount or --all"),
 			};
 			output_json(&json::cli::PendingBoardInfo::from(board));
 		},
-		Command::Send { destination, amount, comment, no_sync, wait } => {
+		Command::Send { destination, amount, comment, no_sync, wait, method_index } => {
 			if !no_sync {
 				info!("Syncing wallet...");
 				wallet.sync().await;
 			}
 
-			if let Ok(addr) = ark::Address::from_str(&destination) {
-				let amount = amount.context("amount missing")?;
-				if comment.is_some() {
-					bail!("comment not supported for Ark address");
-				}
+			let parsed_payment = wallet.parse_payment_request(&destination).await?;
+			let effective_amount = amount.or(parsed_payment.amount);
 
-				info!("Sending arkoor payment of {} to address {}", amount, addr);
-				wallet.send_arkoor_payment(&addr, amount).await?;
-				info!("Payment sent successfully!");
-			} else if let Ok(inv) = Bolt11Invoice::from_str(&destination) {
-				if comment.is_some() {
-					bail!("comment is not supported for BOLT-11 invoices");
+			let mut valid = Vec::with_capacity(parsed_payment.options.len());
+			let mut invalid = Vec::with_capacity(parsed_payment.options.len());
+
+			for option in parsed_payment.options {
+				let fee_str = if let Some(amt) = effective_amount {
+					match wallet.estimate_payment_fee(&option, amt).await {
+						Ok(fee) => format!("fee ~{}", fee.fee),
+						Err(_) => "unknown fee".to_string(),
+					}
+				} else {
+					"unknown fee".to_string()
+				};
+
+				let err_str = if option.errors.is_empty() {
+					String::new()
+				} else {
+					let msgs: Vec<_> = option.errors.iter()
+						.map(|e| e.to_string()).collect();
+					format!(" ({})", msgs.join(", "))
+				};
+
+				let label = format!("{} ({}){}", option.method.type_str(), fee_str, err_str);
+				if err_str.is_empty() {
+					valid.push((option, label));
+				} else {
+					invalid.push((option, label));
 				}
-				let ln_send = wallet.pay_lightning_invoice(inv, amount).await?;
-				wait_for_lightning_send(&wallet, ln_send.invoice.payment_hash(), wait).await;
-			} else if let Ok(offer) = Offer::from_str(&destination) {
-				if comment.is_some() {
-					bail!("comment is not supported for BOLT-12 offers");
-				}
-				let ln_send = wallet.pay_lightning_offer(offer, amount).await?;
-				wait_for_lightning_send(&wallet, ln_send.invoice.payment_hash(), wait).await;
-			} else if let Ok(addr) = LightningAddress::from_str(&destination) {
-				let amount = amount.context("amount is required for Lightning addresses")?;
-				let ln_send = wallet.pay_lightning_address(&addr, amount, comment).await?;
-				wait_for_lightning_send(&wallet, ln_send.invoice.payment_hash(), wait).await;
+			}
+
+			for (_, label) in invalid {
+				info!("Ignoring invalid payment method: {}", label);
+			}
+
+			if valid.is_empty() {
+				bail!("no valid payment methods found");
+			}
+
+			// If payment string has more than one valid method,
+			// prompt the user to select one.
+			let selected_method = if valid.len() == 1 {
+				info!("{} is only method supported, auto selected", valid[0].1);
+				&valid[0].0.method
+			} else if let Some(index) = method_index {
+				let (option, _) = &valid.get(index as usize)
+					.context("Could not pick method by index")?;
+				&option.method
 			} else {
-				bail!("Argument is not a valid destination. Supported are: \
-					VTXO pubkeys, bolt11 invoices, bolt12 offers and lightning addresses",
-				);
+				let options = valid.iter()
+					.map(|(_, label)| label.clone())
+					.collect::<Vec<String>>();
+
+				let selection = dialoguer::Select::new()
+					.with_prompt("Select payment method")
+					.items(&options)
+					.default(0)
+					.interact()
+					.context("failed to read user selection")?;
+
+				let (option, _) = &valid[selection];
+				&option.method
+			};
+
+			// Ask for an amount when the selected method needs one
+			// and none was provided.
+			let effective_amount = match effective_amount {
+				None if selected_method.requires_amount() => {
+					let amount = dialoguer::Input::<Amount>::new()
+						.with_prompt("Amount to send (e.g. 250000 sats)")
+						.interact_text()
+						.context("failed to read amount")?;
+					Some(amount)
+				},
+				other => other,
+			};
+
+			// Send the payment.
+			let output = wallet.send_payment(
+				selected_method, effective_amount, comment, wait
+			).await?;
+
+			// Wait for lightning payment settlement if requested.
+			if let PaymentInitOutput::Lightning(invoice) = output {
+				if wait {
+					info!("Payment completed: hash = {}", invoice.payment_hash());
+				} else {
+					info!("Payment initiated: hash = {}", invoice.payment_hash());
+				}
 			}
 		},
 		Command::SendOnchain { destination, amount, no_sync } => {
@@ -559,7 +803,7 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 
 				address
 			} else {
-				onchain.address().await?
+				wallet.onchain().context("no onchain wallet configured")?.write().await.address().await?
 			};
 
 			let offboard_txid = if let Some(vtxos) = vtxos {
@@ -590,10 +834,10 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 			output_json(&json::cli::OffboardResult { offboard_txid });
 		},
 		Command::Onchain(onchain_command) => {
-			onchain::execute_onchain_command(onchain_command, &mut wallet, &mut onchain).await?;
+			onchain::execute_onchain_command(onchain_command, &wallet).await?;
 		},
 		Command::Exit(cmd) => {
-			exit::execute_exit_command(cmd, &mut wallet, &mut onchain).await?;
+			exit::execute_exit_command(cmd, &mut wallet).await?;
 		},
 		Command::Lightning(cmd) => {
 			lightning::execute_lightning_command(cmd, &mut wallet).await?;
@@ -605,10 +849,8 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 			swap::execute_swap_command(cmd, &mut wallet, &mut onchain, &datadir).await?;
 		},
 		Command::Watch => {
-			let wallet = Arc::new(wallet);
-			let onchain = Arc::new(RwLock::new(onchain));
 			let mut stream = wallet.subscribe_notifications();
-			let _daemon = wallet.start_daemon(Some(onchain))
+			let _daemon = wallet.start_daemon()
 				.context("failed to start bark daemon")?;
 			while let Some(notif) = stream.next().await {
 				output_json(&json::notifications::WalletNotification::from(notif));
@@ -617,27 +859,13 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 		},
 		Command::Maintain { delegated } => {
 			if delegated {
-				wallet.maintenance_with_onchain_delegated(&mut onchain).await?;
+				wallet.maintenance_delegated().await?;
 			} else {
-				wallet.maintenance_with_onchain(&mut onchain).await?;
+				wallet.maintenance().await?;
 			}
 		},
 	}
 	Ok(())
-}
-
-
-async fn wait_for_lightning_send(wallet: &Wallet, payment_hash: PaymentHash, wait: bool) {
-	if wait {
-		match wallet.check_lightning_payment(payment_hash, true).await {
-			Ok(Some(_)) => info!("Payment sent: hash = {}", payment_hash),
-			Err(err) => warn!("Error waiting for payment: {:?}", err),
-			Ok(None) => info!("Payment failed: hash = {}", payment_hash),
-		}
-	} else {
-		info!("Payment initiated but not completed (yet).");
-	}
-
 }
 
 #[tokio::main]

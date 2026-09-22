@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use tonic::transport::Uri;
 use tracing::{debug, error, info};
 use ark::integration::{TokenStatus, TokenType};
-use uuid::Uuid;
 
 use ark::VtxoId;
 use server::{bitcoind as bcd, filters, Config, Server, CAPTAIND_CLI_API_KEY};
@@ -28,8 +27,8 @@ const DEFAULT_ADMIN_RPC_ADDR: &str = "127.0.0.1:3536";
 
 /// The full semver version to set, which includes the git commit hash
 /// as the build suffix.
-/// (GIT_HASH is set in build.rs)
-const FULL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("GIT_HASH"));
+/// (SERVER_VERSION and GIT_HASH are set in build.rs)
+const FULL_VERSION: &str = concat!(env!("SERVER_VERSION"), "+", env!("GIT_HASH"));
 
 #[derive(Parser)]
 #[command(
@@ -102,6 +101,16 @@ enum Command {
 		#[arg(long)]
 		force: bool,
 	},
+
+	/// Check a config file for validity
+	#[command()]
+	CheckConfig {
+		/// Path to the config file to check
+		path: PathBuf,
+		/// Check a watchmand config instead of captaind config
+		#[arg(long)]
+		watchman: bool,
+	},
 }
 
 #[derive(clap::Subcommand)]
@@ -117,6 +126,31 @@ enum RpcCommand {
 	/// Manage vtxo bans
 	#[command(subcommand)]
 	Ban(BanCommand),
+
+	/// Manage the txs the nursery is following up on
+	#[command(subcommand)]
+	Nursery(NurseryCommand),
+}
+
+#[derive(clap::Subcommand)]
+enum NurseryCommand {
+	/// List the txs the nursery is following up on
+	#[command()]
+	List {
+		/// Also include confirmed txs
+		#[arg(long)]
+		include_confirmed: bool,
+		/// Also include abandoned txs
+		#[arg(long)]
+		include_abandoned: bool,
+	},
+	/// Abandon a nursery tx that can no longer make it onchain: the
+	/// nursery stops following it up and stops warning about it
+	#[command()]
+	Abandon {
+		/// The txid to give up on
+		txid: Txid,
+	},
 }
 
 #[derive(clap::Subcommand)]
@@ -231,6 +265,12 @@ enum DataCommand {
 	/// Fix board expiry VTXOs with incorrect internal key
 	#[command()]
 	FixBoardExpiryPolicy,
+	/// Fix offboard connector and forfeit VTXOs stored with an empty vtxo blob
+	#[command()]
+	FixOffboardVtxos,
+	/// Backfill the htlc_vtxos table from existing HTLC vtxos
+	#[command()]
+	BackfillHtlcVtxos,
 }
 
 #[derive(clap::Subcommand)]
@@ -290,6 +330,21 @@ async fn inner_main() -> anyhow::Result<()> {
 	let cli = Cli::parse();
 	let config_path: Option<&PathBuf> = cli.config.as_ref();
 
+	if let Command::CheckConfig { path, watchman } = cli.command {
+		if watchman {
+			let cfg = server::config::watchmand::Config::load(&path)
+				.context("error loading watchmand config file")?;
+			cfg.validate().context("invalid watchmand configuration")?;
+			println!("Watchmand config is valid");
+		} else {
+			let cfg = Config::load(&path)
+				.context("error loading captaind config file")?;
+			cfg.validate().context("invalid captaind configuration")?;
+			println!("Captaind config is valid");
+		}
+		return Ok(());
+	}
+
 	if let Command::Rpc { cmd, addr } = cli.command {
 		// Setting simple logging with no telemetry for RPC commands
 		tracing_subscriber::fmt::init();
@@ -310,7 +365,7 @@ async fn inner_main() -> anyhow::Result<()> {
 
 	let cfg = Config::load(config_path.context("no config file path provided")?)
 		.context("error loading config file")?;
-	cfg.validate().expect("invalid configuration");
+	cfg.validate().context("invalid configuration")?;
 
 	if let Command::Start = cli.command {
 		if let Err(e) = Server::run(cfg).await {
@@ -326,6 +381,7 @@ async fn inner_main() -> anyhow::Result<()> {
 	tracing_subscriber::fmt::init();
 
 	match cli.command {
+		Command::CheckConfig { .. } => unreachable!(),
 		Command::Rpc { .. } => unreachable!(),
 		Command::Start => unreachable!(),
 		Command::Create => {
@@ -344,6 +400,7 @@ async fn inner_main() -> anyhow::Result<()> {
 				.context("failed to query node for deep tip")?;
 			let mut w = server::wallet::PersistedWallet::load_derive_from_master_xpriv(
 				db.clone(),
+				bitcoind.clone(),
 				cfg.network,
 				&master_xpriv,
 				server::wallet::WalletKind::Rounds,
@@ -351,7 +408,7 @@ async fn inner_main() -> anyhow::Result<()> {
 				cfg.min_trusted_confs,
 			).await?;
 
-			let tx = w.drain(address, &bitcoind).await?;
+			let tx = w.drain(address).await?;
 			println!("{}", tx.compute_txid());
 		}
 		Command::GetMnemonic => {
@@ -365,6 +422,14 @@ async fn inner_main() -> anyhow::Result<()> {
 					let bitcoind = bcd::build_client(&cfg.bitcoind.url, cfg.bitcoind.auth())?;
 					let count = server::database::data_migrations::fix_board_expiry_policy::run(&db, &bitcoind).await?;
 					println!("Fixed {} board expiry vtxos", count);
+				}
+				DataCommand::FixOffboardVtxos => {
+					let count = server::database::data_migrations::fix_offboard_vtxos::run(&db).await?;
+					println!("Fixed {} offboard vtxos", count);
+				}
+				DataCommand::BackfillHtlcVtxos => {
+					let count = server::database::data_migrations::backfill_htlc_vtxos::run(&db).await?;
+					println!("Backfilled {} htlc vtxos", count);
 				}
 			}
 		}
@@ -457,9 +522,7 @@ async fn inner_main() -> anyhow::Result<()> {
 				} => {
 					let db_filters = filters::Filters::init(filters.ip, filters.dns);
 					let token = uuid::Uuid::new_v4().to_string();
-					let api_key_uuid = integration_api_key.unwrap_or_else(|| {
-						Uuid::parse_str(CAPTAIND_CLI_API_KEY).expect("default api key valid")
-					});
+					let api_key_uuid = integration_api_key.unwrap_or(CAPTAIND_CLI_API_KEY);
 					let integration_token = db.write(async |t| {
 						let int = t.get_integration_by_name(integration_name.as_str()).await?
 							.context("Invalid integration name")?;
@@ -484,9 +547,7 @@ async fn inner_main() -> anyhow::Result<()> {
 				IntegrationCommand::UpdateTokenStatus {
 					integration_name, integration_api_key, token, status,
 				} => {
-					let api_key_uuid = integration_api_key.unwrap_or_else(|| {
-						Uuid::parse_str(CAPTAIND_CLI_API_KEY).expect("default api key valid")
-					});
+					let api_key_uuid = integration_api_key.unwrap_or(CAPTAIND_CLI_API_KEY);
 					let integration_token = db.write(async |t| {
 						let int = t.get_integration_by_name(integration_name.as_str()).await?
 							.context("invalid integration name")?;
@@ -510,9 +571,7 @@ async fn inner_main() -> anyhow::Result<()> {
 					integration_name, integration_api_key, token, filters,
 				} => {
 					let filters = filters::Filters::init(filters.ip, filters.dns);
-					let api_key_uuid = integration_api_key.unwrap_or_else(|| {
-						Uuid::parse_str(CAPTAIND_CLI_API_KEY).expect("default api key valid")
-					});
+					let api_key_uuid = integration_api_key.unwrap_or(CAPTAIND_CLI_API_KEY);
 					let token = db.write(async |t| {
 						let int = t.get_integration_by_name(integration_name.as_str()).await?
 							.context("invalid integration name")?;
@@ -569,7 +628,7 @@ async fn inner_main() -> anyhow::Result<()> {
 				// Check if any user-facing output vtxos have already been spent.
 				let any_spent = db.read(async |t| {
 					let round = t.get_round(round_id).await?.context("round not found")?;
-					let cached_tree = round.signed_tree.into_cached_tree();
+					let cached_tree = round.into_cached_tree()?;
 					let mut any_spent = false;
 					for vtxo in cached_tree.output_vtxos() {
 						let state = t.get_user_vtxo_by_id(vtxo.id()).await?;
@@ -665,6 +724,45 @@ async fn run_rpc(addr: &str, cmd: RpcCommand) -> anyhow::Result<()> {
 							println!("{} — banned until block {}", vtxo_id, until);
 						}
 					}
+				}
+			}
+		}
+		RpcCommand::Nursery(cmd) => {
+			let mut rpc = rpc::admin::NurseryAdminServiceClient::connect(endpoint)
+				.await.context("failed to connect to rpc")?;
+
+			match cmd {
+				NurseryCommand::List { include_confirmed, include_abandoned } => {
+					let res = rpc.list_nursery_txs(protos::ListNurseryTxsRequest {
+						include_confirmed, include_abandoned,
+					}).await?.into_inner();
+					if res.txs.is_empty() {
+						println!("No nursery txs");
+					}
+					for tx in &res.txs {
+						let status = if tx.abandoned_at.is_some() {
+							"abandoned".to_string()
+						} else if let Some(h) = tx.confirmed_at_height {
+							format!("confirmed at {}", h)
+						} else if let Some(kwu) = tx.chunk_fee_rate_kwu {
+							format!("in mempool, chunk feerate {:.2} sat/vB", kwu as f64 / 250.0)
+						} else if tx.in_mempool {
+							// The tx was in getrawmempool but getmempoolentry failed
+							// on it. That should not happen; the log has the error.
+							"in mempool, CHUNK FEERATE UNKNOWN, check the captaind log".to_string()
+						} else {
+							"MISSING FROM MEMPOOL".to_string()
+						};
+						println!("{} kind={} {}, should confirm by {}",
+							tx.txid, tx.kind, status, tx.confirm_target_height,
+						);
+					}
+				}
+				NurseryCommand::Abandon { txid } => {
+					rpc.abandon(protos::AbandonRequest {
+						txid: txid.to_string(),
+					}).await?;
+					println!("Abandoned nursery tx {}", txid);
 				}
 			}
 		}

@@ -1,6 +1,6 @@
 [package]
 name = "bip321"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 description = "A Rust library for parsing and serializing BIP 321 bitcoin: payment URIs."
@@ -11,10 +11,15 @@ categories = ["cryptography", "parsing"]
 name = "bip321"
 path = "src/lib.rs"
 
+[features]
+default = ["lightning"]
+lightning = ["dep:lightning", "dep:lightning-invoice"]
+
 [dependencies]
 bitcoin = "0.32"
-lightning-invoice = { version = "0.34.0", default-features = false }
-lightning = { version = "0.2.0", default-features = false }
+bark-bitcoin-ext = { version = "0.7.1", path = "../bitcoin-ext", default-features = false }
+lightning-invoice = { version = "0.34.0", default-features = false, optional = true }
+lightning = { version = "0.2.0", default-features = false, optional = true }
 
 percent-encoding = "2.3"
 thiserror = "2"

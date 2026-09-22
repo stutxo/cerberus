@@ -38,10 +38,25 @@ pub struct ProgressDeadlineExceeded {
 impl_slog!(ProgressDeadlineExceeded, WARN, "progress deadline exceeded");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressIgnoredDust {
+	pub vtxo_id: VtxoId,
+	pub txid: Txid,
+}
+impl_slog!(ProgressIgnoredDust, TRACE, "ignoring progress tx: it has a sub-dust output so it can never be relayed, and its input is too small to matter; falling back to sweep or claim");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchmanAddedVtxo {
 	pub id: VtxoId,
 }
 impl_slog!(WatchmanAddedVtxo, TRACE, "added VTXO to frontier");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HtlcVtxoResolvedOnChain {
+	pub vtxo_id: VtxoId,
+	pub height: BlockHeight,
+	pub resolution: String,
+}
+impl_slog!(HtlcVtxoResolvedOnChain, INFO, "htlc vtxo resolved on chain");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchmanAddedFundingTx {

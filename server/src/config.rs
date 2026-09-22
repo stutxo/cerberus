@@ -1,4 +1,4 @@
-use std::{fmt, fs, io};
+use std::{fs, io};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,104 +16,6 @@ use cln_rpc::plugins::hold::hold_client::HoldClient;
 
 use crate::{fee_estimator, utils, vtxopool};
 use crate::secret::Secret;
-
-
-/// Wraps another config struct but adds an enabled boolean
-pub enum OptionalService<T> {
-	Enabled(T),
-	Disabled,
-}
-
-impl<T> OptionalService<T> {
-	pub fn enabled(&self) -> Option<&T> {
-		match self {
-			Self::Enabled(c) => Some(c),
-			Self::Disabled => None,
-		}
-	}
-
-	pub fn enabled_mut(&mut self) -> Option<&mut T> {
-		match self {
-			Self::Enabled(c) => Some(c),
-			Self::Disabled => None,
-		}
-	}
-}
-
-impl<T: Default> OptionalService<T> {
-	/// Set the service to enabled if disabled and return the inner value
-	///
-	/// The inner value is set to [Default::default()] if previously disabled.
-	pub fn set_enabled(&mut self) -> &mut T {
-		match self {
-			Self::Enabled(c) => c,
-			Self::Disabled => {
-				*self = Self::Enabled(T::default());
-				self.enabled_mut().unwrap()
-			},
-		}
-	}
-}
-
-impl<T> From<T> for OptionalService<T> {
-	fn from(cfg: T) -> Self {
-	    Self::Enabled(cfg)
-	}
-}
-
-impl<T: Clone> Clone for OptionalService<T> {
-	fn clone(&self) -> Self {
-	    match self {
-			Self::Enabled(c) => Self::Enabled(c.clone()),
-			Self::Disabled => Self::Disabled,
-		}
-	}
-}
-
-impl<T: fmt::Debug> fmt::Debug for OptionalService<T> {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-	    match self {
-			Self::Enabled(c) => fmt::Debug::fmt(c, f),
-			Self::Disabled => write!(f, "Disabled"),
-		}
-	}
-}
-
-impl<T: serde::Serialize> serde::Serialize for OptionalService<T> {
-	fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-		#[derive(Serialize)]
-	    struct C<T> {
-			enabled: bool,
-			#[serde(flatten)]
-			config: Option<T>,
-		}
-
-		let c = match self {
-			Self::Enabled(c) => C { enabled: true, config: Some(c) },
-			Self::Disabled => C { enabled: false, config: None },
-		};
-
-		serde::Serialize::serialize(&c, s)
-	}
-}
-
-impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for OptionalService<T> {
-	fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-		#[derive(Deserialize)]
-	    struct C<T> {
-			enabled: bool,
-			#[serde(flatten)]
-			config: Option<T>,
-		}
-
-		let c = C::<T>::deserialize(d)?;
-		if c.enabled {
-			Ok(Self::Enabled(c.config.ok_or_else(|| serde::de::Error::custom("missing config"))?))
-		} else {
-			Ok(Self::Disabled)
-		}
-	}
-}
 
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -178,7 +80,16 @@ impl Bitcoind {
 pub struct Rpc {
 	/// The socket to bind to for the public Ark gRPC.
 	pub public_address: SocketAddr,
+
+	/// The value set for the `http2_max_pending_accept_reset_streams` variable
+	/// for public RPC endpoints (ark and intman).
+	///
+	/// Defaults to 1000.
+	pub max_pending_accept_reset_streams: Option<usize>,
+
 	/// The socket to bind to for the private admin gRPC.
+	///
+	/// Unauthenticated by design, see [crate::rpcserver::admin]. Keep it on loopback.
 	pub admin_address: Option<SocketAddr>,
 	/// The socket to bind to for the integrations gRPC.
 	pub integration_address: Option<SocketAddr>,
@@ -280,6 +191,7 @@ mod defaults {
 	/// Must be longer than keepalives_idle (60s) so keepalive probes
 	/// can detect dead connections before the pool discards them.
 	pub fn idle_timeout_secs() -> u64 { 90 }
+
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -297,6 +209,41 @@ pub struct Config {
 	/// Minimum amount required for board transactions.
 	#[serde(with = "utils::serde::string")]
 	pub min_board_amount: Amount,
+	/// Maximum amount for a board.
+	///
+	/// Unset means no limit. Zero disables boards.
+	#[serde(default, with = "utils::serde::string::opt")]
+	pub max_board_amount: Option<Amount>,
+	/// Maximum total input amount for an offboard or send-onchain.
+	///
+	/// Unset means no limit. Zero disables offboards.
+	#[serde(default, with = "utils::serde::string::opt")]
+	pub max_offboard_amount: Option<Amount>,
+	/// Maximum total input amount for an arkoor send.
+	///
+	/// Unset means no limit. Zero disables arkoor sends.
+	#[serde(default, with = "utils::serde::string::opt")]
+	pub max_arkoor_amount: Option<Amount>,
+	/// Maximum amount for a lightning send.
+	///
+	/// Unset means no limit. Zero disables lightning sends.
+	#[serde(default, with = "utils::serde::string::opt")]
+	pub max_ln_send_amount: Option<Amount>,
+	/// Maximum amount for which the server will issue lightning receive
+	/// invoices.
+	///
+	/// Unset means no limit. Zero disables lightning receives.
+	#[serde(default, with = "utils::serde::string::opt")]
+	pub max_ln_receive_amount: Option<Amount>,
+	/// Maximum total output amount for a single round participation.
+	///
+	/// Unset means no limit. Zero disables round participation.
+	///
+	/// NB this can strand a large balance: clients can't see the limit and
+	/// don't split a refresh to fit under it, and a vtxo above it can never be
+	/// refreshed, leaving a unilateral exit as the only way out.
+	#[serde(default, with = "utils::serde::string::opt")]
+	pub max_round_amount: Option<Amount>,
 	/// Maximum exit depth (genesis chain length) allowed for a VTXO.
 	/// Once a VTXO's exit depth reaches this value the server will refuse to
 	/// cosign further OOR transactions spending it. Clients should refresh
@@ -308,6 +255,9 @@ pub struct Config {
 	pub required_board_confirmations: usize,
 	/// Minimum number of confirmations for a UTXO to be considered trusted.
 	pub min_trusted_confs: u32,
+	/// Whether server allows spending expired VTXOs in arkoor
+	#[serde(default)]
+	pub allow_expired_arkoor: bool,
 
 	#[serde(with = "utils::serde::duration")]
 	pub round_interval: Duration,
@@ -323,10 +273,6 @@ pub struct Config {
 	/// Whether or not to add full error information to RPC internal errors.
 	pub rpc_rich_errors: bool,
 
-	/// The interval at which the txindex checks tx statuses.
-	#[serde(with = "utils::serde::duration")]
-	pub txindex_check_interval: Duration,
-
 	/// The interval at which the SyncManager polls for new blocks.
 	#[serde(with = "utils::serde::duration")]
 	pub sync_manager_block_poll_interval: Duration,
@@ -335,6 +281,10 @@ pub struct Config {
 	/// announcements to all cliens.
 	pub handshake_psa: Option<String>,
 
+	/// Link to the terms of service of this server,
+	/// announced to clients via `ArkInfo.tos_link`.
+	pub tos_link: Option<String>,
+
 	pub otel_collector_endpoint: Option<String>,
 	/// <= 0 -> Tracing always disabled,
 	/// 0.5 -> Tracing enabled 50% of the time, and
@@ -342,21 +292,17 @@ pub struct Config {
 	pub otel_tracing_sampler: Option<f64>,
 	pub otel_deployment_name: String,
 
-	#[serde(with = "utils::serde::string")]
-	pub watchman_min_balance: Amount,
-
-	/// Config for the Watchman process.
-	pub watchman: OptionalService<crate::watchman::Config>,
-
 	/// Config for the VtxoPool process
 	pub vtxopool: vtxopool::Config,
 
 	/// Config for the FeeEstimator process.
 	pub fee_estimator: fee_estimator::Config,
 
-	// The interval used to rebroadcast transactions
-	#[serde(with = "utils::serde::duration")]
-	pub transaction_rebroadcast_interval: Duration,
+	/// The number of blocks within which a tx broadcast via the TxNursery
+	/// is expected to confirm. When the target passes without a
+	/// confirmation, the operator is warned on every new block until
+	/// they intervene.
+	pub nursery_confirm_target_blocks: BlockDelta,
 
 	pub rpc: Rpc,
 	pub postgres: Postgres,
@@ -387,10 +333,14 @@ pub struct Config {
 	/// Maximum delay for TrackAll stream reconnection backoff (e.g., 60 seconds)
 	#[serde(alias = "track_all_max_delay", with = "utils::serde::duration")]
 	pub max_track_all_delay: Duration,
-
 	/// The number of blocks to keep between Lightning and Ark HTLCs expiries.
 	///
-	/// Default is 6
+	/// It also sets the extra delay on the user's preimage clause of an
+	/// HTLC-recv VTXO, so clients size the invoice CLTV delta from the value
+	/// advertised in [ark::ArkInfo]. Raising it invalidates the margin of
+	/// invoices that were already created.
+	///
+	/// Default is 40
 	pub htlc_expiry_delta: BlockDelta,
 	/// The number of blocks after which an HTLC-send VTXO expires once granted.
 	/// When granting an HTLC-send VTXO, the Server doesn't know the lightning
@@ -443,6 +393,12 @@ pub struct Config {
 	#[serde(with = "utils::serde::duration")]
 	pub offboard_session_timeout: Duration,
 
+	/// How often we check pending offboards: expiring sessions that reached
+	/// [Config::offboard_session_timeout] and retrying the commit and
+	/// broadcast of signed offboard txs.
+	#[serde(with = "utils::serde::duration")]
+	pub offboard_check_interval: Duration,
+
 	/// The time in which a fee rate is considered valid for performing an offboard.
 	///
 	/// This allows us to handle the case where clients don't receive up-to-date fee rates due to
@@ -454,12 +410,44 @@ pub struct Config {
 	#[serde(with = "utils::serde::duration")]
 	pub offboard_acceptable_fee_rate_duration: Duration,
 
-	/// The maximum number of items we return to mailbox queries
+	/// The maximum number of messages we return to mailbox queries.
+	///
+	/// A message holds a whole batch post, so a page can carry more rows
+	/// than this.
 	#[serde(alias = "read_mailbox_max_items")]
 	pub max_read_mailbox_items: usize,
 
 	/// The fee schedule outlining any fees that must be paid to interact with the Ark server.
 	pub fees: FeeSchedule,
+
+	/// Path to a bitcoin address blocklist file
+	///
+	/// The file should contain one bitcoin address per line.
+	///
+	/// The bitcoin addresses will be blocked from
+	/// - being used for boards
+	/// - being used in offboards or send-onchain actions
+	/// - sending money to our internal wallets
+	pub bitcoin_address_blocklist: Option<PathBuf>,
+
+	/// How often the bitcoin address blocklist file is re-read from disk.
+	///
+	/// Defaults to 1 hour. Only relevant if [Self::bitcoin_address_blocklist] is set.
+	#[serde(default, with = "utils::serde::duration::opt")]
+	pub bitcoin_address_blocklist_refresh_interval: Option<Duration>,
+
+	/// Require the board funding tx from users
+	///
+	/// This should be enforced always in prod, but in order to test backwards
+	/// compatibility, we allow disabling it in tests.
+	#[serde(default)]
+	pub require_board_funding_tx: bool,
+
+	/// Build round vtxo trees with the legacy v0 hashlock clauses.
+	///
+	/// Only intended for testing.
+	#[serde(default)]
+	pub round_legacy_hashlock_clauses: bool,
 }
 
 impl Config {
@@ -499,6 +487,21 @@ impl Config {
 		};
 
 		let raw_cfg = builder.build().context("error building config")?;
+
+		// captaind used to be able to run the watchman inside its own process.
+		// Silently ignoring these leftover keys would leave an upgrading
+		// operator without any watchman at all, so fail loudly instead.
+		if raw_cfg.get::<Value>("watchman").is_ok() {
+			bail!("captaind no longer runs an embedded watchman. \
+				Remove the [watchman] section from the captaind config and \
+				run the watchmand binary as a separate process instead.");
+		}
+		if raw_cfg.get::<Value>("watchman_min_balance").is_ok() {
+			bail!("captaind no longer manages the watchman wallet, so \
+				watchman_min_balance has no effect. Remove it from the captaind \
+				config and make sure the watchmand wallet stays funded.");
+		}
+
 		let mut cfg = raw_cfg.try_deserialize::<Config>().context("error parsing config")?;
 		// merge the json parsed cln_array
 		cfg.cln_array.extend(cln_array);
@@ -516,6 +519,48 @@ impl Config {
 	pub fn validate(&self) -> anyhow::Result<()> {
 		self.bitcoind.validate()?;
 		self.fees.validate()?;
+
+		if self.offboard_check_interval > self.offboard_session_timeout {
+			bail!("Invalid configuration: offboard_check_interval ({:?}) may not \
+				exceed offboard_session_timeout ({:?}), otherwise sessions linger \
+				past their timeout between checks.",
+				self.offboard_check_interval, self.offboard_session_timeout,
+			);
+		}
+
+		// A send-onchain splits its inputs with an arkoor over the same total,
+		// so an offboard limit above the arkoor one dies at that split.
+		if self.max_offboard_amount.unwrap_or(Amount::MAX)
+			> self.max_arkoor_amount.unwrap_or(Amount::MAX)
+		{
+			bail!("Invalid configuration: max_offboard_amount ({:?}) may not exceed \
+				max_arkoor_amount ({:?}), otherwise a send-onchain fails halfway \
+				through, when it splits its inputs with an arkoor.",
+				self.max_offboard_amount, self.max_arkoor_amount,
+			);
+		}
+
+		// At 0 the wallet trusts every unconfirmed tx, including deposits
+		// from third parties, so coin selection would spend outputs that
+		// a double-spend can still invalidate.
+		if self.min_trusted_confs == 0 {
+			bail!("Invalid configuration: min_trusted_confs must be at least 1, \
+				otherwise unconfirmed deposits from third parties count as trusted.",
+			);
+		}
+
+		// At 0 mailbox pages are empty while have_more stays true, so readers page forever.
+		if self.max_read_mailbox_items == 0 {
+			bail!("Invalid configuration: max_read_mailbox_items must be at least 1");
+		}
+
+		if self.network == bitcoin::Network::Bitcoin && !self.require_board_funding_tx {
+			bail!("Cannot turn off require_board_funding_tx on mainnet");
+		}
+
+		if self.network == bitcoin::Network::Bitcoin && self.round_legacy_hashlock_clauses {
+			bail!("Cannot turn on round_legacy_hashlock_clauses on mainnet");
+		}
 
 		Ok(())
 	}
@@ -538,10 +583,6 @@ pub mod watchmand {
 		pub data_dir: PathBuf,
 		pub network: bitcoin::Network,
 
-		/// The interval at which the txindex checks tx statuses.
-		#[serde(with = "utils::serde::duration")]
-		pub txindex_check_interval: Duration,
-
 		/// The interval at which the SyncManager polls for new blocks.
 		#[serde(with = "utils::serde::duration")]
 		pub sync_manager_block_poll_interval: Duration,
@@ -558,10 +599,6 @@ pub mod watchmand {
 		/// Config for the FeeEstimator process.
 		pub fee_estimator: fee_estimator::Config,
 
-		// The interval used to rebroadcast transactions
-		#[serde(with = "utils::serde::duration")]
-		pub transaction_rebroadcast_interval: Duration,
-
 		/// The interval at which the HtlcSettler polls for cross-process settlements.
 		#[serde(with = "utils::serde::duration")]
 		pub htlc_settlement_poll_interval: Duration,
@@ -571,6 +608,8 @@ pub mod watchmand {
 
 		/// Address to expose the admin gRPC server on (e.g. "127.0.0.1:3538").
 		/// If absent, no admin RPC server is started.
+		///
+		/// Unauthenticated by design, see [crate::rpcserver::admin]. Keep it on loopback.
 		pub admin_address: Option<std::net::SocketAddr>,
 
 		pub postgres: Postgres,
@@ -578,6 +617,17 @@ pub mod watchmand {
 		pub bitcoind: Bitcoind,
 
 		pub sweep_address: Option<Address<NetworkUnchecked>>, // no default
+
+		/// Path to a bitcoin address blocklist file
+		///
+		/// See [super::Config::bitcoin_address_blocklist] for more info
+		pub bitcoin_address_blocklist: Option<PathBuf>,
+
+		/// How often the bitcoin address blocklist file is re-read from disk.
+		///
+		/// See [super::Config::bitcoin_address_blocklist_refresh_interval] for more info
+		#[serde(default, with = "utils::serde::duration::opt")]
+		pub bitcoin_address_blocklist_refresh_interval: Option<Duration>,
 	}
 
 	impl Config {
@@ -630,7 +680,12 @@ pub mod watchmand {
 mod test {
 	use std::collections::HashMap;
 	use std::str::FromStr;
+
+	use bitcoin::{OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Witness};
+	use bitcoin::opcodes::all::OP_PUSHNUM_1;
+	use bitcoin::script::PushBytes;
 	use tonic::transport::Uri;
+
 	use super::*;
 
 	const DEFAULT_CAPTAIND_CONFIG_PATH: &str =
@@ -647,6 +702,53 @@ mod test {
 		cfg.bitcoind.cookie = Some(".cookie".into());
 
 		cfg.validate().expect("error validating default config");
+	}
+
+	#[test]
+	fn default_offboard_fixed_vb_covers_a_two_in_three_out_keyspend() {
+		let cfg = Config::load(DEFAULT_CAPTAIND_CONFIG_PATH).unwrap();
+
+		let keyspend_input = TxIn {
+			previous_output: OutPoint::null(),
+			script_sig: ScriptBuf::new(),
+			sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+			witness: Witness::from_slice(&[[0u8; 64]]),
+		};
+		let p2tr_spk = ScriptBuf::builder()
+			.push_opcode(OP_PUSHNUM_1)
+			.push_slice(<&PushBytes>::try_from(&[0u8; 32][..]).unwrap())
+			.into_script();
+		let p2tr_output = TxOut { value: Amount::ZERO, script_pubkey: p2tr_spk.clone() };
+		let offboard_tx = Transaction {
+			version: bitcoin::transaction::Version::TWO,
+			lock_time: bitcoin::absolute::LockTime::ZERO,
+			input: vec![keyspend_input; 2],
+			output: vec![p2tr_output; 3],
+		};
+
+		let priced_vb = cfg.fees.offboard.fixed_additional_vb + p2tr_spk.len() as u64;
+		assert_eq!(priced_vb, offboard_tx.vsize() as u64);
+	}
+
+	#[test]
+	fn captaind_config_rejects_embedded_watchman_leftovers() {
+		// captaind used to support running the watchman in-process. A config
+		// that still carries those keys must fail loudly instead of silently
+		// running without any watchman.
+		let dir = std::env::temp_dir().join("captaind-config-test");
+		std::fs::create_dir_all(&dir).unwrap();
+
+		let default = std::fs::read_to_string(DEFAULT_CAPTAIND_CONFIG_PATH).unwrap();
+
+		let path = dir.join("watchman-section.toml");
+		std::fs::write(&path, format!("{}\n[watchman]\nenabled = true\n", default)).unwrap();
+		let err = Config::load(&path).expect_err("watchman section must be rejected");
+		assert!(format!("{}", err).contains("watchmand"), "unexpected error: {}", err);
+
+		let path = dir.join("watchman-min-balance.toml");
+		std::fs::write(&path, format!("watchman_min_balance = \"1 btc\"\n{}", default)).unwrap();
+		let err = Config::load(&path).expect_err("watchman_min_balance must be rejected");
+		assert!(format!("{}", err).contains("watchman_min_balance"), "unexpected error: {}", err);
 	}
 
 	#[test]
@@ -694,6 +796,58 @@ mod test {
 		cfg.bitcoind.rpc_user = bitcoind_rpc_user.clone();
 		cfg.bitcoind.rpc_pass = bitcoind_rpc_pass.clone();
 		cfg.validate().expect_err("Invalid. Either cookie or pass but not both");
+	}
+
+	#[test]
+	fn validate_offboard_check_interval() {
+		let mut cfg = Config::load(DEFAULT_CAPTAIND_CONFIG_PATH).unwrap();
+		cfg.bitcoind.cookie = Some(".cookie".into());
+
+		cfg.offboard_session_timeout = Duration::from_secs(30);
+		cfg.offboard_check_interval = Duration::from_secs(30);
+		cfg.validate().expect("checking exactly once per timeout is valid");
+
+		cfg.offboard_check_interval = Duration::from_secs(31);
+		cfg.validate().expect_err("Invalid because sessions would outlive their timeout");
+	}
+
+	#[test]
+	fn validate_min_trusted_confs() {
+		let mut cfg = Config::load(DEFAULT_CAPTAIND_CONFIG_PATH).unwrap();
+		cfg.bitcoind.cookie = Some(".cookie".into());
+
+		cfg.min_trusted_confs = 0;
+		let err = cfg.validate().expect_err("trusting unconfirmed deposits is invalid");
+		assert!(err.to_string().contains("min_trusted_confs"), "{}", err);
+
+		cfg.min_trusted_confs = 1;
+		cfg.validate().expect("one confirmation is valid");
+	}
+
+	#[test]
+	fn validate_max_offboard_amount_against_arkoor() {
+		let mut cfg = Config::load(DEFAULT_CAPTAIND_CONFIG_PATH).unwrap();
+		cfg.bitcoind.cookie = Some(".cookie".into());
+
+		cfg.max_arkoor_amount = Some(Amount::from_sat(100_000));
+		cfg.max_offboard_amount = Some(Amount::from_sat(100_000));
+		cfg.validate().expect("an offboard limit at the arkoor limit is valid");
+
+		cfg.max_offboard_amount = Some(Amount::from_sat(100_001));
+		cfg.validate().expect_err("Invalid because the arkoor split refuses such an offboard");
+
+		cfg.max_offboard_amount = None;
+		cfg.validate().expect_err("Invalid because unlimited offboards exceed the arkoor limit");
+
+		cfg.max_arkoor_amount = None;
+		cfg.validate().expect("without an arkoor limit there is no ceiling on offboards");
+
+		// Zero disables arkoors, so offboards have to be disabled with them.
+		cfg.max_arkoor_amount = Some(Amount::ZERO);
+		cfg.validate().expect_err("Invalid because offboards outlive disabled arkoors");
+
+		cfg.max_offboard_amount = Some(Amount::ZERO);
+		cfg.validate().expect("disabling both together is valid");
 	}
 
 	#[test]
@@ -752,32 +906,12 @@ mod test {
 		let cfg = Config::load_with_custom_env(DEFAULT_CAPTAIND_CONFIG_PATH, Some(env)).unwrap();
 		cfg.validate().expect("invalid configuration");
 
-		assert_eq!(cfg.vtxo_lifetime, 42);
+		assert_eq!(cfg.vtxo_lifetime, BlockDelta::new(42));
 		assert_eq!(cfg.bitcoind.cookie, Some("/not/hot/dog/but/cookie".into()));
 		let lncfg = cfg.cln_array.get(0).unwrap();
 		assert_eq!(lncfg.uri, Uri::from_str(uri).unwrap());
 		assert_eq!(lncfg.server_cert_path, PathBuf::from(server_cert_path));
 		assert_eq!(lncfg.client_cert_path, PathBuf::from(client_cert_path));
 		assert_eq!(lncfg.client_key_path, PathBuf::from(client_key_path));
-	}
-
-	#[test]
-	fn test_optional_service() {
-		#[derive(Serialize, Deserialize)]
-		struct S {
-			var: usize,
-		}
-		#[derive(Serialize, Deserialize)]
-		struct C {
-			optional: OptionalService<S>,
-		}
-
-		let enabled = "[optional]\nenabled = true\nvar = 5";
-		let enabled = toml::from_str::<C>(enabled).unwrap();
-		assert_eq!(enabled.optional.enabled().unwrap().var, 5);
-
-		let disabled = "[optional]\nenabled = false";
-		let disabled = toml::from_str::<C>(disabled).unwrap();
-		assert!(disabled.optional.enabled().is_none());
 	}
 }

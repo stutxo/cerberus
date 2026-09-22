@@ -3,7 +3,6 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{env, fs};
-use std::time::Duration;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -21,7 +20,8 @@ use crate::{Bitcoind, Daemon, DaemonHelper};
 use crate::daemon::{DaemonState, LogHandler, STDOUT_LOGFILE};
 use crate::daemon::captaind::{SlogHandler, SweepAdminClient};
 use crate::constants::env::WATCHMAND_EXEC;
-use crate::util::resolve_path;
+use crate::ports::pick_port;
+use crate::util::{poll_interval, resolve_path};
 
 pub type Watchmand = Daemon<WatchmandHelper>;
 
@@ -184,7 +184,7 @@ impl Watchmand {
 					return;
 				}
 			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
+			tokio::time::sleep(poll_interval()).await;
 		}
 	}
 
@@ -195,7 +195,7 @@ impl Watchmand {
 				return addr.clone();
 			}
 			trace!("Waiting a bit to get watchmand wallet address...");
-			tokio::time::sleep(Duration::from_millis(100)).await;
+			tokio::time::sleep(poll_interval()).await;
 		}
 	}
 }
@@ -226,7 +226,7 @@ impl DaemonHelper for WatchmandHelper {
 	}
 
 	async fn make_reservations(&self) -> anyhow::Result<()> {
-		let admin_port = portpicker::pick_unused_port().expect("No ports free");
+		let admin_port = pick_port();
 		let admin_address = format!("127.0.0.1:{}", admin_port);
 		trace!("admin rpc address: {}", admin_address.to_string());
 		self.cfg.lock().admin_address = Some(SocketAddr::from_str(admin_address.as_str())?);
@@ -252,7 +252,7 @@ impl DaemonHelper for WatchmandHelper {
 
 	async fn wait_for_init(&self) -> anyhow::Result<()> {
 		while !self.is_ready().await {
-			tokio::time::sleep(Duration::from_millis(100)).await;
+			tokio::time::sleep(poll_interval()).await;
 		}
 		Ok(())
 	}
@@ -418,7 +418,7 @@ async fn spawn_slf_pipe(datadir: PathBuf) {
 			match reader.read_line(&mut line).await {
 				Ok(0) => {
 					// EOF or no data yet, wait a bit
-					tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+					tokio::time::sleep(poll_interval()).await;
 				}
 				Ok(_) => {
 					if let Err(e) = stdin.write_all(line.as_bytes()).await {

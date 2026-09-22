@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ark::fees::{
 	BoardFees, FeeSchedule, LightningReceiveFees, LightningSendFees, OffboardFees, PpmFeeRate,
@@ -13,7 +13,7 @@ use ark::fees::{
 use bitcoin::{Amount, FeeRate, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use bitcoin::absolute::LockTime;
 use bitcoin::transaction::Version;
-use bitcoin_ext::{BlockHeight, FeeRateExt, TxOutExt};
+use bitcoin_ext::{BlockDelta, BlockHeight, FeeRateExt, TxOutExt};
 use bitcoin_ext::fee::P2A_SCRIPT;
 use bitcoin_ext::rpc::BitcoinRpcExt;
 use bitcoincore_rpc::json::SignRawTransactionInput;
@@ -26,17 +26,19 @@ use server::Server;
 use tokio::{fs, join};
 use tonic::transport::Uri;
 
+use bitcoind_async_client::traits::Reader;
+
 use crate::daemon::bitcoind::BitcoindRpcHandle;
 use crate::daemon::bitcoind::snapshot;
 use crate::daemon::captaind::proxy::ArkRpcProxyServer;
 use crate::postgres::{self, PostgresDatabaseManager};
 use crate::util::{
-	get_bark_chain_source_from_env, get_cargo_workspace, test_data_directory,
-	TestContextChainSource,
+	get_bark_chain_source_from_env, get_cargo_workspace, get_tx_propagation_timeout_millis,
+	test_data_directory, poll_interval, TestContextChainSource,
 };
 use crate::{
-	btc, constants, sat, Bark, Barkd, Bitcoind, BitcoindConfig, Captaind, Electrs, ElectrsConfig,
-	Lightningd,
+	btc, constants, sat, Bark, Barkd, Bitcoind, BitcoindConfig, Captaind, Electrs,
+	ElectrsConfig, Lightningd,
 };
 
 pub mod builders;
@@ -100,6 +102,12 @@ pub struct TestContext {
 	pub datadir: PathBuf,
 
 	pub bitcoind: Option<Arc<Bitcoind>>,
+	/// The test's own copy of the bitcoind snapshot, made once when the
+	/// central bitcoind is started. All bitcoind nodes of this test copy
+	/// from here rather than from the shared snapshot, so that they are
+	/// guaranteed to start on the same chain even if the shared snapshot
+	/// gets regenerated while the test runs.
+	bitcoind_snapshot_dir: Option<PathBuf>,
 	/// the main captaind instance for the test
 	pub captainds: Mutex<Vec<Arc<Captaind>>>,
 
@@ -131,6 +139,7 @@ impl TestContext {
 			test_name,
 			datadir,
 			bitcoind: None,
+			bitcoind_snapshot_dir: None,
 			captainds: Mutex::new(Vec::new()),
 			secondary_bitcoinds: Mutex::new(Vec::new()),
 			electrs: None,
@@ -150,8 +159,13 @@ impl TestContext {
 
 	pub fn bitcoind_default_cfg(&self, name: impl AsRef<str>) -> BitcoindConfig {
 		let datadir = self.datadir.join(name.as_ref());
-		let snapshot_dir = std::env::var(constants::env::BITCOIND_SNAPSHOT_DIR)
-			.map(PathBuf::from).ok();
+		// Prefer the test's own snapshot copy so all nodes of this test
+		// start on the same chain; fall back to the shared snapshot for
+		// contexts that never started a central bitcoind.
+		let snapshot_dir = self.bitcoind_snapshot_dir.clone().or_else(|| {
+			std::env::var(constants::env::BITCOIND_SNAPSHOT_DIR)
+				.map(PathBuf::from).ok()
+		});
 		BitcoindConfig {
 			datadir,
 			wallet: false,
@@ -172,6 +186,15 @@ impl TestContext {
 
 		snapshot::ensure_snapshot(&snapshot_dir).await;
 
+		// Copy the snapshot once into the test's datadir; every bitcoind of
+		// this test copies from there. Copying from the shared snapshot per
+		// node would let a concurrent regeneration hand different chains to
+		// different nodes of the same test.
+		let local_snapshot = self.datadir.join("bitcoind_snapshot");
+		snapshot::copy_snapshot(&snapshot_dir, &local_snapshot).await
+			.expect("failed to copy bitcoind snapshot for test");
+		self.bitcoind_snapshot_dir = Some(local_snapshot.clone());
+
 		let bitcoind = Bitcoind::new(
 			"bitcoind".to_string(),
 			BitcoindConfig {
@@ -181,7 +204,7 @@ impl TestContext {
 				network: Network::Regtest,
 				fallback_fee: FeeRate::from_sat_per_vb(1).unwrap(),
 				relay_fee: None,
-				snapshot_dir: Some(snapshot_dir),
+				snapshot_dir: Some(local_snapshot),
 			},
 			None,
 		);
@@ -201,6 +224,7 @@ impl TestContext {
 					bitcoin_rpc_port: self.bitcoind().rpc_port(),
 					bitcoin_zmq_port: self.bitcoind().zmq_port(),
 					electrs_dir: self.datadir.join("electrs"),
+					cors: Some("*".to_owned()),
 				};
 				let electrs = Electrs::new(&self.test_name, cfg, electrs_type);
 				electrs.start().await.unwrap();
@@ -250,6 +274,17 @@ impl TestContext {
 		builders::BarkBuilder::new(self, name, srv)
 	}
 
+	/// In-process counterpart to [`Self::bark`]: returns a builder that
+	/// constructs a [`bark::Wallet`] directly via the library API,
+	/// instead of spawning the `bark` CLI binary.
+	pub fn bark_sdk<'a>(
+		&'a self,
+		name: impl AsRef<str>,
+		srv: &'a dyn ToArkUrl,
+	) -> builders::BarkSdkBuilder<'a> {
+		builders::BarkSdkBuilder::new(self, name, srv)
+	}
+
 	pub fn watchmand(&self, name: impl AsRef<str>) -> builders::WatchmandBuilder<'_> {
 		builders::WatchmandBuilder::new(self, name)
 	}
@@ -270,11 +305,70 @@ impl TestContext {
 
 		let bitcoind = Bitcoind::new(name.to_string(), cfg, Some(self.bitcoind().p2p_url()));
 		bitcoind.start().await.unwrap();
+		// A freshly snapshot-loaded secondary occasionally fails to catch up to
+		// the ctx bitcoind over P2P: the log shows the missing blocks arriving
+		// from the peer but being rejected as "Unexpected block message
+		// received from peer 0", and the tip stays put. Nudge it past this
+		// before any downstream captaind hits the node's RPC.
+		self.await_secondary_bitcoind_synced(&bitcoind).await;
 		if wallet {
 			bitcoind.create_wallet(name).await;
 		}
 		self.secondary_bitcoinds.lock().unwrap().push(bitcoind.rpc_handle());
 		bitcoind
+	}
+
+	/// Ensure a freshly-started secondary bitcoind has caught up to the ctx
+	/// bitcoind's tip. See the call site in [`new_bitcoind_with_cfg`] for the
+	/// direct-fetch race this guards against.
+	async fn await_secondary_bitcoind_synced(&self, node: &Bitcoind) {
+		let Some(ctx) = self.bitcoind.as_ref() else { return };
+		let target = ctx.get_block_count().await;
+
+		// Fast path: ZMQ tip notifications from the node itself. Bounded so a
+		// stalled P2P direct-fetch falls through to the RPC push below.
+		let fast = tokio::time::timeout(
+			Duration::from_secs(2),
+			node.wait_for_blockheight(BlockHeight::new(target as u32)),
+		).await;
+		if fast.is_ok() {
+			return;
+		}
+
+		// P2P stalled. Push blocks one at a time to avoid retriggering the
+		// batch race; `submitblock` is idempotent on already-known blocks.
+		let ctx_rpc = ctx.async_client();
+		let node_rpc = node.async_client();
+		let mut have = node.get_block_count().await;
+		while have < target {
+			let next = have + 1;
+			let hash = ctx_rpc.get_block_hash(next).await
+				.expect("get_block_hash on ctx bitcoind");
+			let hex: String = ctx_rpc.call_raw(
+				"getblock", &[hash.to_string().into(), 0.into()],
+			).await.expect("getblock hex on ctx bitcoind");
+			// `submitblock`: null = accepted, "duplicate" = already had it,
+			// any other string = rejected. On rejection, only advance if the
+			// tip actually moved (e.g. via P2P); otherwise panic.
+			let resp: serde_json::Value = node_rpc.call_raw(
+				"submitblock", &[hex.into()],
+			).await.expect("submitblock on stalled secondary bitcoind");
+			match &resp {
+				serde_json::Value::Null => {},
+				serde_json::Value::String(s) if s == "duplicate" => {},
+				other => {
+					let observed = node.get_block_count().await;
+					if observed <= have {
+						panic!("submitblock rejected block {} at height {} on {}: {}",
+							hash, next, node.name, other,
+						);
+					}
+					have = observed;
+					continue;
+				},
+			}
+			have = next;
+		}
 	}
 
 	pub async fn new_postgres(&self, db_name: &str) -> server::config::Postgres {
@@ -326,8 +420,8 @@ impl TestContext {
 		server::config::Config {
 			data_dir: data_dir.clone(),
 			network: Network::Regtest,
-			vtxo_lifetime: 432,
-			vtxo_exit_delta: 12,
+			vtxo_lifetime: BlockDelta::new(432),
+			vtxo_exit_delta: BlockDelta::new(12),
 			round_interval: Duration::from_secs(3600),
 			round_submit_time: Duration::from_millis(5000),
 			// this one can be long cuz in most tests all users are ready and we don't wait
@@ -337,37 +431,37 @@ impl TestContext {
 			required_board_confirmations: constants::BOARD_CONFIRMATIONS as usize,
 			min_trusted_confs: 1,
 			max_vtxo_amount: None,
+			max_board_amount: None,
+			max_offboard_amount: None,
+			max_arkoor_amount: None,
+			max_ln_send_amount: None,
+			max_round_amount: None,
+			max_ln_receive_amount: None,
 			max_vtxo_exit_depth: 50,
 			max_arkoor_fanout: 4,
+			allow_expired_arkoor: false,
 			rpc_rich_errors: true,
-			txindex_check_interval: Duration::from_millis(500),
+			nursery_confirm_target_blocks: BlockDelta::new(6),
 			sync_manager_block_poll_interval: Duration::from_millis(100),
 			handshake_psa: None,
+			tos_link: None,
 			otel_collector_endpoint: None,
 			otel_tracing_sampler: Some(1f64),
 			otel_deployment_name: db_name,
-			watchman: server::config::OptionalService::Enabled(
-				server::watchman::Config {
-					process_interval: std::time::Duration::from_secs(1),
-					progress_grace_period: 2,
-					claim_chunksize: 15.try_into().unwrap(),
-					incremental_relay_fee: FeeRate::from_sat_per_kvb_ceil(100),
-					min_cpfp_amount: Amount::from_sat(10_000),
-				},
-			),
-			watchman_min_balance: Amount::from_sat(1_000_000),
 			vtxopool: server::vtxopool::Config {
 				vtxo_targets: vec![
 					VtxoTarget { count: 3, amount: sat(10_000) },
 					VtxoTarget { count: 3, amount: btc(1) },
 				],
 				vtxo_target_issue_threshold: 50,
-				vtxo_lifetime: 432,
-				vtxo_pre_expiry: 12,
-				max_vtxo_arkoor_depth: 3,
-				issue_interval: Duration::from_secs(3),
+				vtxo_lifetime: BlockDelta::new(432),
+				vtxo_pre_expiry: BlockDelta::new(12),
+				// A checkpointed allocation adds two txs to the chain, so this
+				// allows the same three chained allocations as before checkpoints.
+				max_vtxo_exit_depth: 6,
 			},
 			offboard_session_timeout: Duration::from_secs(30),
+			offboard_check_interval: Duration::from_secs(1),
 			offboard_acceptable_fee_rate_duration: Duration::from_secs(60 * 10),
 			fee_estimator: server::fee_estimator::Config {
 				update_interval: Duration::from_secs(60),
@@ -375,11 +469,12 @@ impl TestContext {
 				fallback_fee_rate_fast: FeeRate::from_sat_per_vb_u32(25),
 				fallback_fee_rate_regular: FeeRate::from_sat_per_vb_u32(7),
 				fallback_fee_rate_slow: FeeRate::from_sat_per_vb_u32(5),
+				max_fee_rate: None,
 			},
-			transaction_rebroadcast_interval: std::time::Duration::from_secs(2),
 			rpc: server::config::Rpc {
 				// these will be overwritten on start, but can't be empty
 				public_address: SocketAddr::from_str("127.0.0.1:3535").unwrap(),
+				max_pending_accept_reset_streams: None,
 				admin_address: None,
 				integration_address: None,
 			},
@@ -400,9 +495,9 @@ impl TestContext {
 			htlc_settlement_poll_interval: Duration::from_secs(5),
 			track_all_base_delay: Duration::from_secs(1),
 			max_track_all_delay: Duration::from_secs(60),
-			htlc_expiry_delta: 6,
-			htlc_send_expiry_delta: 258,
-			max_user_invoice_cltv_delta: 58,
+			htlc_expiry_delta: BlockDelta::new(6),
+			htlc_send_expiry_delta: BlockDelta::new(258),
+			max_user_invoice_cltv_delta: BlockDelta::new(58),
 			invoice_expiry: Duration::from_secs(10 * 60),
 			receive_htlc_forward_timeout: Duration::from_secs(30),
 			min_board_amount: Amount::from_sat(20_000),
@@ -434,6 +529,10 @@ impl TestContext {
 					ppm_expiry_table: vec![],
 				},
 			},
+			bitcoin_address_blocklist: None,
+			bitcoin_address_blocklist_refresh_interval: None,
+			require_board_funding_tx: true,
+			round_legacy_hashlock_clauses: false,
 		}
 	}
 
@@ -453,8 +552,9 @@ impl TestContext {
 		server::config::watchmand::Config {
 			postgres: srv.config().postgres.clone(),
 			watchman: server::watchman::Config {
-				process_interval: std::time::Duration::from_secs(1),
-				progress_grace_period: 2,
+				reaction_interval: std::time::Duration::from_secs(1),
+				sweep_interval: std::time::Duration::from_secs(1),
+				progress_grace_period: BlockDelta::new(2),
 				claim_chunksize: 15.try_into().unwrap(),
 				incremental_relay_fee: FeeRate::from_sat_per_kvb_ceil(100),
 				min_cpfp_amount: Amount::from_sat(10_000),
@@ -463,7 +563,6 @@ impl TestContext {
 			data_dir: data_dir.clone(),
 			network: Network::Regtest,
 			min_trusted_confs: 1,
-			txindex_check_interval: Duration::from_millis(500),
 			sync_manager_block_poll_interval: Duration::from_millis(100),
 			otel_collector_endpoint: None,
 			otel_tracing_sampler: Some(1f64),
@@ -474,8 +573,8 @@ impl TestContext {
 				fallback_fee_rate_fast: FeeRate::from_sat_per_vb_u32(25),
 				fallback_fee_rate_regular: FeeRate::from_sat_per_vb_u32(7),
 				fallback_fee_rate_slow: FeeRate::from_sat_per_vb_u32(5),
+				max_fee_rate: None,
 			},
-			transaction_rebroadcast_interval: std::time::Duration::from_secs(2),
 			bitcoind: server::config::Bitcoind {
 				url: bitcoind.rpc_url(),
 				cookie: Some(bitcoind.rpc_cookie()),
@@ -484,6 +583,8 @@ impl TestContext {
 			},
 			htlc_settlement_poll_interval: Duration::from_secs(5),
 			admin_address: None,
+			bitcoin_address_blocklist: None,
+			bitcoin_address_blocklist_refresh_interval: None,
 		}
 	}
 
@@ -498,7 +599,25 @@ impl TestContext {
 		mod_cfg(&mut cfg);
 
 		Server::create(cfg.clone()).await.expect("error creating server");
-		Server::start(cfg).await.expect("error starting server")
+		let srv = Server::start(cfg).await.expect("error starting server");
+
+		// Server::start returns before LightningManager has finished its first
+		// connect pass. Tests that hit start_lightning_receive immediately would
+		// otherwise race with "no active hold-compatible cln node".
+		if lightningd.is_some() {
+			trace!("Waiting for lightning node to come online");
+			let wait = async {
+				while !srv.has_hold_node() {
+					tokio::time::sleep(poll_interval()).await;
+				}
+			};
+			if tokio::time::timeout(Duration::from_secs(5), wait).await.is_err() {
+				log::error!("timed out waiting for lightning node to come online;
+					letting test continue so the actual failure surfaces");
+			}
+		}
+
+		srv
 	}
 
 	pub fn bark_default_cfg(
@@ -506,9 +625,11 @@ impl TestContext {
 		srv: &dyn ToArkUrl,
 		bitcoind: Option<&Bitcoind>,
 	) -> bark::Config {
+		#[allow(deprecated)]
 		bark::Config {
 			server_address: srv.ark_url(),
 			server_access_token: None,
+			user_agent: None,
 			esplora_address: if bitcoind.is_none() {
 				Some(self.electrs.as_ref().expect("need either bitcoind or electrs").rest_url())
 			} else {
@@ -518,17 +639,21 @@ impl TestContext {
 			bitcoind_cookiefile: bitcoind.map(|b| b.rpc_cookie()),
 			bitcoind_user: None,
 			bitcoind_pass: None,
+			bitcoind_zmq_address: bitcoind.map(|b| b.zmq_url()),
 			socks5_proxy: None,
 
-			vtxo_refresh_expiry_threshold: 24,
-			vtxo_exit_margin: 12,
-			htlc_recv_claim_delta: 18,
+			vtxo_refresh_expiry_threshold: BlockDelta::new(24),
+			vtxo_exit_margin: BlockDelta::new(12),
+			htlc_recv_claim_delta: BlockDelta::new(18),
 			lightning_receive_claim_retries: 5,
 			fallback_fee_rate: Some(FeeRate::from_sat_per_vb_u32(5)),
-			round_tx_required_confirmations: constants::ROUND_CONFIRMATIONS,
-			offboard_required_confirmations: constants::OFFBOARD_CONFIRMATIONS,
+			round_tx_required_confirmations: constants::ROUND_CONFIRMATIONS.try_into().unwrap(),
+			offboard_required_confirmations: constants::OFFBOARD_CONFIRMATIONS.try_into().unwrap(),
+			offboard_lost_tx_grace_period_secs: 3600,
 			daemon_sync_interval_secs: 3,
 			daemon_manual_sync: false,
+			change_vtxo_split_factor: 2,
+			vtxo_key_gap_limit: bark::DEFAULT_VTXO_KEY_GAP_LIMIT,
 		}
 	}
 
@@ -578,7 +703,7 @@ impl TestContext {
 		// receive the block; the wallet syncs in a background task and may
 		// still be catching up. Callers that immediately query `wallet_status`
 		// need to also wait for the wallet's own sync height to catch up.
-		let height = srv.bitcoind().get_block_count().await as BlockHeight;
+		let height = BlockHeight::new(srv.bitcoind().get_block_count().await as u32);
 		srv.wait_for_sync_height(height).await;
 	}
 
@@ -639,11 +764,11 @@ impl TestContext {
 						break;
 					}
 				}
-				tokio::time::sleep(Duration::from_millis(100)).await;
+				tokio::time::sleep(poll_interval()).await;
 			}
 		}));
 
-		let electrs: Pin<Box<dyn Future<Output = ()>>> = if let Some(electrs) = self.electrs.as_ref() {
+		let electrs: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(electrs) = self.electrs.as_ref() {
 			Box::pin(electrs.await_tip_synced(tip as u32))
 		} else {
 			Box::pin(always_ready(|| ()))
@@ -652,7 +777,7 @@ impl TestContext {
 		// wait for all captainds to catch up
 		let captainds = self.captainds.lock().unwrap().clone();
 		let captainds = join_all(captainds.into_iter().map(|srv| async move {
-			srv.wait_for_sync_height(tip as u32).await
+			srv.wait_for_sync_height(BlockHeight::new(tip as u32)).await
 		}));
 
 		// then join all futures
@@ -671,7 +796,21 @@ impl TestContext {
 				electrs.await_transaction(txid).await;
 			}
 		};
-		join!(bitcoin, electrs);
+		let bitcoinds = self.secondary_bitcoinds.lock().unwrap().clone();
+		let bitcoinds = join_all(bitcoinds.into_iter().map(|b| async move {
+			let client = b.client();
+			let start = Instant::now();
+			let timeout = get_tx_propagation_timeout_millis();
+			while Instant::now().duration_since(start).as_millis() < timeout as u128 {
+				if client.get_raw_transaction(&txid, None).is_ok() {
+					return;
+				} else {
+					tokio::time::sleep(poll_interval()).await;
+				}
+			}
+			panic!("Failed to get raw transaction: {}", txid);
+		}));
+		join!(bitcoin, electrs, bitcoinds);
 	}
 
 	/// Waits for the given transaction ID to be available in the central bitcoin and electrs, as
@@ -695,7 +834,7 @@ impl TestContext {
 
 	/// Generated a block using the central bitcoind and ensures that electrs is synced with it.
 	/// Returns the new block height.
-	pub async fn generate_blocks(&self, block_num: u32) -> u32 {
+	pub async fn generate_blocks(&self, block_num: u32) -> BlockHeight {
 		// Give transactions time to propagate
 		tokio::time::sleep(Duration::from_millis(1000)).await;
 
@@ -706,7 +845,7 @@ impl TestContext {
 
 		let height = self.bitcoind().get_block_count().await;
 		info!("New chain tip: {}", height);
-		height as u32
+		BlockHeight::new(height as u32)
 	}
 
 	/// Generated a block using the central bitcoind without waiting for propagation

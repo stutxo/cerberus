@@ -5,9 +5,8 @@ pub use model::*;
 
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid};
 use bitcoin::consensus::serialize;
@@ -51,19 +50,31 @@ impl<'t> Tx<'t> {
 				&funding_txid.to_string(),
 				&serialize(&unsigned_funding_tx),
 				&signed_tree.spec.serialize(),
-				&(signed_tree.spec.spec.expiry_height as i32)
+				&(signed_tree.spec.spec.expiry_height.to_u32() as i32)
 			]
 		).await?;
 		let round_id = row.get::<_, i64>("id");
 
 		// store round participations for the interactive participants
 		let remove_existing_stmt = self.prepare_typed(
-			"DELETE FROM round_participation
-			WHERE id IN (
-				SELECT participation_id
-				FROM round_part_input
-				WHERE vtxo_id = ANY($1)
-			);", &[Type::TEXT_ARRAY],
+			"WITH deleted AS (
+				DELETE FROM round_participation
+				WHERE id IN (
+					SELECT participation_id
+					FROM round_part_input
+					WHERE vtxo_id = ANY($1)
+				)
+				RETURNING id
+			),
+			_inputs AS (
+				DELETE FROM round_part_input
+				WHERE participation_id IN (SELECT id FROM deleted)
+			),
+			_outputs AS (
+				DELETE FROM round_part_output
+				WHERE participation_id IN (SELECT id FROM deleted)
+			)
+			SELECT id FROM deleted", &[Type::TEXT_ARRAY],
 		).await?;
 		for (unlock_hash, part) in interactive_participations {
 			// remove any existing ones, but if the round was not full,
@@ -82,6 +93,7 @@ impl<'t> Tx<'t> {
 				part.unlock_preimage,
 				&part.inputs,
 				&part.outputs,
+				None,
 			).await.with_context(|| format!(
 				"db rejected round participation for interactive participant (unlock_hash={}) \
 				with inputs {:?}", unlock_hash, part.inputs,
@@ -104,13 +116,23 @@ impl<'t> Tx<'t> {
 		tree::execute_vtxo_tree_update(&self, update).await?;
 
 		// register the funding output vtxos directly into the frontier
-		self.execute(
-			"INSERT INTO watchman_vtxo_frontier (vtxo_id) \
-			SELECT vtxo_id FROM vtxo WHERE vtxo_txid = $1 \
-			ON CONFLICT DO NOTHING",
-			&[&funding_txid.to_string()],
-		).await?;
+		self.add_funding_vtxos_to_frontier(funding_txid, None).await?;
 
+		Ok(())
+	}
+
+	/// Update the funding tx of a round to its signed version.
+	///
+	/// Enforces that the txid of `signed_tx` matches the stored `funding_txid`,
+	/// so the identity of the round cannot change.
+	pub async fn update_round_funding_tx(&self, signed_tx: &Transaction) -> anyhow::Result<()> {
+		let txid = signed_tx.compute_txid();
+		let stmt = self.prepare_typed(
+			"UPDATE round SET funding_tx = $1 WHERE funding_txid = $2 RETURNING id;",
+			&[Type::BYTEA, Type::TEXT],
+		).await?;
+		self.query_one(&stmt, &[&serialize(signed_tx), &txid.to_string()]).await
+			.with_context(|| format!("no round found with funding_txid {}", txid))?;
 		Ok(())
 	}
 
@@ -154,43 +176,7 @@ impl<'t> Tx<'t> {
 			SELECT funding_txid FROM round WHERE expiry <= $1 AND swept_at IS NULL;
 		").await?;
 
-		let rows = self.query(&statement, &[&(height as i32)]).await?;
-		Ok(rows
-			.into_iter()
-			.map(|row| RoundId::from_str(row.get("funding_txid")).expect("corrupt db"))
-			.collect::<Vec<_>>()
-		)
-	}
-
-	/// Get all new rounds since either a given round or within a lifetime window
-	///
-	/// Returned round ids are ordered chronologically.
-	pub async fn get_fresh_round_ids(
-		&self,
-		last_round_id: Option<RoundId>,
-		vtxo_lifetime: Option<Duration>,
-	) -> anyhow::Result<Vec<RoundId>> {
-		let rows = if let Some(last) = last_round_id {
-			let stmt = self.prepare("
-				SELECT funding_txid
-				FROM round
-				WHERE created_at > (SELECT created_at FROM round WHERE funding_txid = $1)
-				ORDER BY id
-			").await?;
-			self.query(&stmt, &[&last.to_string()]).await?
-		} else if let Some(lifetime) = vtxo_lifetime {
-			let window = lifetime + lifetime / 2;
-			let stmt = self.prepare("
-				SELECT funding_txid
-				FROM round
-				WHERE created_at >= NOW() - ($1 * interval '1 second')
-				ORDER BY id
-			").await?;
-			self.query(&stmt, &[&(window.as_secs() as f64)]).await?
-		} else {
-			bail!("need to provide either last_round_id or vtxo_lifetime argument");
-		};
-
+		let rows = self.query(&statement, &[&(height.to_u32() as i32)]).await?;
 		Ok(rows
 			.into_iter()
 			.map(|row| RoundId::from_str(row.get("funding_txid")).expect("corrupt db"))
@@ -205,12 +191,26 @@ impl<'t> Tx<'t> {
 		))
 	}
 
+	/// Whether any participation exists with this unlock hash, without
+	/// loading or completing the row.
+	pub async fn unlock_hash_exists(
+		&self,
+		unlock_hash: UnlockHash,
+	) -> anyhow::Result<bool> {
+		let row = self.query_opt(
+			"SELECT 1 FROM round_participation WHERE unlock_hash = $1",
+			&[&unlock_hash.to_string()],
+		).await?;
+		Ok(row.is_some())
+	}
+
 	pub async fn get_round_participation_by_unlock_hash(
 		&self,
 		unlock_hash: UnlockHash,
 	) -> anyhow::Result<Option<StoredRoundParticipation>> {
 		let part_opt = self.query_opt(
-			"SELECT id, unlock_hash, unlock_preimage, round_id, forfeited_at, created_at \
+			"SELECT id, unlock_hash, unlock_preimage, round_id, forfeited_at, created_at, \
+				scheduled_height \
 			FROM round_participation \
 			WHERE unlock_hash = $1",
 			&[&unlock_hash.to_string()],
@@ -224,14 +224,20 @@ impl<'t> Tx<'t> {
 		Ok(Some(query::complete_round_participation(&self, part_row).await?))
 	}
 
+	/// Get all round participations not yet assigned to a round and
+	/// due at the given chain tip.
+	#[tracing::instrument(skip(self))]
 	pub async fn get_all_pending_round_participations(
 		&self,
+		chain_tip: BlockHeight,
 	) -> anyhow::Result<Vec<StoredRoundParticipation>> {
 		let parts = self.query(
-			"SELECT id, unlock_hash, unlock_preimage, round_id, forfeited_at, created_at \
+			"SELECT id, unlock_hash, unlock_preimage, round_id, forfeited_at, created_at, \
+				scheduled_height \
 			FROM round_participation \
-			WHERE round_id IS NULL",
-			&[],
+			WHERE round_id IS NULL \
+				AND (scheduled_height IS NULL OR scheduled_height <= $1)",
+			&[&(chain_tip.to_u32() as i32)],
 		).await?;
 
 		let mut ret = Vec::with_capacity(parts.len());
@@ -245,12 +251,20 @@ impl<'t> Tx<'t> {
 	/// Try register a new hArk round participation
 	///
 	/// Will check that the input vtxos are spendable.
+	#[tracing::instrument(
+		skip(self, unlock_preimage, outputs),
+		fields(
+			chain_tip = chain_tip.to_u32(),
+			nb_inputs = inputs.len(),
+		)
+	)]
 	pub async fn try_store_round_participation(
 		&self,
 		chain_tip: BlockHeight,
 		unlock_preimage: UnlockPreimage,
 		inputs: &[VtxoId],
 		outputs: impl IntoIterator<Item = &StoredRoundOutput>,
+		scheduled_height: Option<BlockHeight>,
 	) -> anyhow::Result<()> {
 		let unlock_hash = UnlockHash::hash(&unlock_preimage);
 		trace!("Storing round participation for unlock hash {} and inputs {:?}",
@@ -262,8 +276,15 @@ impl<'t> Tx<'t> {
 			vtxo.check_spendable(chain_tip)?;
 		}
 
+		// Drop any earlier pending delegated refresh on the same inputs: a new
+		// request for these vtxos supersedes the old one.
+		let dropped = query::delete_pending_participations_for_inputs(&self, inputs).await?;
+		if dropped > 0 {
+			trace!("Dropped {} stale delegated round participation(s) for inputs {:?}", dropped, inputs);
+		}
+
 		query::store_round_participation(
-			&self, unlock_hash, unlock_preimage, inputs, outputs,
+			&self, unlock_hash, unlock_preimage, inputs, outputs, scheduled_height,
 		).await?;
 
 		Ok(())
@@ -313,20 +334,43 @@ impl<'t> Tx<'t> {
 			);
 		}
 
+		// Same state guard as do_round_forfeit_updates (tree.rs): only
+		// touch vtxos that finish_round already transitioned to 'spent'
+		// with spent_in_round set, and whose oor_spent_txid is unset or
+		// already equals this txid. The OR-equal arm keeps retries with
+		// the same forfeit batch idempotent; the rest catches vtxos in an
+		// unexpected state instead of silently overwriting oor_spent_txid
+		// the way the previous unconditional UPDATE would have.
 		let stmt = self.prepare_typed(
-			"UPDATE vtxo SET oor_spent_txid = u.txid, updated_at = NOW() \
-			FROM UNNEST($1::text[], $2::text[]) AS u(vtxo_id, txid) \
-			WHERE vtxo.vtxo_id = u.vtxo_id",
+			"UPDATE vtxo SET oor_spent_txid = u.txid, updated_at = NOW()
+			FROM UNNEST($1::text[], $2::text[]) AS u(vtxo_id, txid)
+			WHERE vtxo.vtxo_id = u.vtxo_id
+				AND vtxo.spend_state = 'spent'
+				AND vtxo.spent_in_round IS NOT NULL
+				AND (vtxo.oor_spent_txid IS NULL OR vtxo.oor_spent_txid = u.txid)",
 			&[Type::TEXT_ARRAY, Type::TEXT_ARRAY],
 		).await.context("error preparing vtxo query")?;
 		let rows_affected = self.execute(&stmt, &[
 			&vtxo_id_strs,
 			&txid_strs,
 		]).await.context("error executing vtxo query")?;
-		ensure!(rows_affected as usize == vtxo_ids.len(),
-			"corrupt db: expected {} vtxos updated, got {}",
-			vtxo_ids.len(), rows_affected,
-		);
+		if rows_affected as usize != vtxo_ids.len() {
+			let diag_stmt = self.prepare_typed(
+				"SELECT u.vtxo_id
+				FROM UNNEST($1::text[], $2::text[]) AS u(vtxo_id, txid)
+				LEFT JOIN vtxo v ON v.vtxo_id = u.vtxo_id
+				WHERE v.vtxo_id IS NULL
+					OR v.spend_state != 'spent'
+					OR v.spent_in_round IS NULL
+					OR (v.oor_spent_txid IS NOT NULL AND v.oor_spent_txid != u.txid)
+				LIMIT 1",
+				&[Type::TEXT_ARRAY, Type::TEXT_ARRAY],
+			).await.context("error preparing vtxo diagnostic query")?;
+			let bad = self.query_one(&diag_stmt, &[&vtxo_id_strs, &txid_strs]).await
+				.context("error finding bad vtxo")?;
+			let vtxo_id: &str = bad.get("vtxo_id");
+			return badarg!("vtxo not round-spent or already forfeited differently: {}", vtxo_id);
+		}
 
 		Ok(())
 	}
@@ -348,7 +392,8 @@ impl<'t> Tx<'t> {
 		let round = self.get_round(round_id).await?
 			.with_context(|| format!("round {} not found", round_id))?;
 
-		let cached_tree = round.signed_tree.into_cached_tree();
+		let round_db_id = round.id;
+		let cached_tree = round.into_cached_tree()?;
 
 		let user_vtxo_ids = cached_tree.output_vtxos()
 			.map(|v| v.id().to_string())
@@ -372,7 +417,7 @@ impl<'t> Tx<'t> {
 		// Restore input vtxos: set them back to spendable.
 		// oor_spent_txid may have been set by set_forfeit_transactions after finish_round.
 		let update = tree::VtxoTreeUpdate::new()
-			.undo_round(round.id);
+			.undo_round(round_db_id);
 		tree::execute_vtxo_tree_update(&self, update).await?;
 
 		// Delete round_part_input and round_part_output before round_participation (FK).
@@ -395,13 +440,6 @@ impl<'t> Tx<'t> {
 			&[Type::TEXT],
 		).await?;
 		self.execute(&stmt, &[&round_id_str]).await?;
-
-		// Delete watchman frontier rows before vtxos (FK constraint).
-		let stmt = self.prepare_typed(
-			"DELETE FROM watchman_vtxo_frontier WHERE vtxo_id = ANY($1)",
-			&[Type::TEXT_ARRAY],
-		).await?;
-		self.execute(&stmt, &[&output_vtxo_ids]).await?;
 
 		// Delete vtxos that were created by this round (output and internal tree vtxos).
 		let stmt = self.prepare_typed(

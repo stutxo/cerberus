@@ -3,8 +3,9 @@ use std::collections::HashSet;
 use anyhow::{Context, bail};
 
 use bitcoin::{Transaction, Txid};
+use tracing::debug;
 
-use ark::{ProtocolEncoding, ServerVtxo, VtxoId};
+use ark::{ProtocolEncoding, ServerVtxo, Vtxo, VtxoId};
 use ark::vtxo::{Bare, Full};
 
 use super::model::{SpendState, VirtualTransaction};
@@ -81,8 +82,8 @@ impl VtxoInserts {
 		self.vtxo_ids.push(vtxo.id().to_string());
 		self.vtxo_txids.push(vtxo.point().txid.to_string());
 		self.data.push(vtxo.serialize());
-		self.expiry.push(vtxo.expiry_height() as i32);
-		self.exit_deltas.push(vtxo.exit_delta() as i32);
+		self.expiry.push(vtxo.expiry_height().to_u32() as i32);
+		self.exit_deltas.push(vtxo.exit_delta().to_u16() as i32);
 		self.policy_types.push(vtxo.policy_type().to_string());
 		self.policies.push(vtxo.policy().serialize());
 		self.server_pubkeys.push(vtxo.server_pubkey().to_string());
@@ -95,10 +96,11 @@ impl VtxoInserts {
 	fn push_bare_vtxo(&mut self, vtxo: &ServerVtxo<Bare>, spend_state: SpendState, oor_spent_txid: Option<Txid>) {
 		self.vtxo_ids.push(vtxo.id().to_string());
 		self.vtxo_txids.push(vtxo.point().txid.to_string());
-		// Bare vtxos don't carry genesis data, store empty bytes.
-		self.data.push(Vec::new());
-		self.expiry.push(vtxo.expiry_height() as i32);
-		self.exit_deltas.push(vtxo.exit_delta() as i32);
+		// Bare vtxos encode as a full vtxo with an empty genesis, so readers
+		// of the vtxo column (e.g. the watchman frontier) can decode them.
+		self.data.push(vtxo.serialize());
+		self.expiry.push(vtxo.expiry_height().to_u32() as i32);
+		self.exit_deltas.push(vtxo.exit_delta().to_u16() as i32);
 		self.policy_types.push(vtxo.policy_type().to_string());
 		self.policies.push(vtxo.policy().serialize());
 		self.server_pubkeys.push(vtxo.server_pubkey().to_string());
@@ -136,6 +138,7 @@ impl VtxoInserts {
 }
 
 struct VtxoUpdates {
+	provide_signatures: Vec<Vtxo<Full>>,
 	oor_spends: Vec<OorSpendUpdate>,
 	round_spends: Vec<RoundSpendUpdate>,
 	offboard_spends: Vec<OffboardSpendUpdate>,
@@ -148,6 +151,7 @@ struct VtxoUpdates {
 impl VtxoUpdates {
 	fn new() -> Self {
 		VtxoUpdates {
+			provide_signatures: Vec::new(),
 			oor_spends: Vec::new(),
 			round_spends: Vec::new(),
 			offboard_spends: Vec::new(),
@@ -297,7 +301,8 @@ impl VtxoTreeUpdate {
 	}
 
 	/// Insert bare vtxos with `spend_state = 'spendable'`.
-	/// Bare vtxos don't carry genesis data so the vtxo column is empty.
+	/// Bare vtxos don't carry genesis data, they are stored with an
+	/// empty genesis.
 	pub fn insert_spendable_bare_vtxos<V: std::borrow::Borrow<ServerVtxo<Bare>>>(
 		self,
 		vtxos: impl IntoIterator<Item = V>,
@@ -412,6 +417,21 @@ impl VtxoTreeUpdate {
 		self.vtxo_updates.registrations.extend(ids);
 		self
 	}
+
+	/// Overwrites the stored VTXOs with their fully-signed versions, so the
+	/// server can later serve complete VTXOs to a wallet recovering from seed.
+	/// Every provided VTXO must already exist (see `do_provide_signatures`).
+	///
+	/// Callers must only pass validated, fully-signed VTXOs: the stored bytes
+	/// are overwritten unconditionally, and same-id duplicates are deduped on
+	/// the assumption that any of them serves recovery equally well.
+	pub fn provide_signatures(
+		mut self,
+		vtxos: impl IntoIterator<Item = Vtxo<Full>>,
+	) -> Self {
+		self.vtxo_updates.provide_signatures.extend(vtxos);
+		self
+	}
 }
 
 // -- Execution --
@@ -422,16 +442,71 @@ impl VtxoTreeUpdate {
 /// 1. Upsert virtual transactions
 /// 2. Insert VTXOs (with ON CONFLICT DO NOTHING)
 /// 3. Update existing VTXOs (mark spent, forfeited, claimed)
+///
+/// Returns the number of VTXO rows actually inserted by step 2. Callers
+/// gate fresh-vs-retry behaviour on this: `> 0` means at least one new
+/// VTXO row was written, `0` means every insert hit `ON CONFLICT DO NOTHING`
+/// (i.e. an idempotent retry of an already-applied update).
 pub async fn execute_vtxo_tree_update(
 	tx: &tokio_postgres::Transaction<'_>,
 	update: VtxoTreeUpdate,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
 	debug_assert!(validate(&update).is_ok(), "{}", validate(&update).unwrap_err());
 
 	upsert_virtual_transactions(tx, &update.tx_inserts).await?;
-	insert_vtxos(tx, &update.vtxo_inserts).await?;
+	let inserted = insert_vtxos(tx, &update.vtxo_inserts).await?;
 	apply_vtxo_updates(tx, &update.vtxo_updates).await?;
 
+	Ok(inserted)
+}
+
+async fn do_provide_signatures(
+	tx: &tokio_postgres::Transaction<'_>,
+	vtxos: &[Vtxo<Full>],
+) -> anyhow::Result<()> {
+	if vtxos.is_empty() { return Ok(()) }
+
+	let mut seen = HashSet::with_capacity(vtxos.len());
+	let mut vtxo_ids = Vec::with_capacity(vtxos.len());
+	let mut serialised = Vec::with_capacity(vtxos.len());
+	for vtxo in vtxos {
+		if seen.insert(vtxo.id()) {
+			vtxo_ids.push(vtxo.id().to_string());
+			serialised.push(vtxo.serialize());
+		}
+	}
+
+	let rows = tx.execute(
+		"
+		UPDATE vtxo
+		SET
+			vtxo = u.serialised,
+			updated_at = NOW()
+		FROM
+			UNNEST($1::text[], $2::bytea[]) AS u(vtxo_id, serialised)
+		WHERE vtxo.vtxo_id = u.vtxo_id
+		",
+		&[&vtxo_ids, &serialised]
+	).await.context("failed to provide signatures")?;
+
+	// Every provided vtxo must exist; a mismatch means a caller handed us an id
+	// the server never stored, which would otherwise be swallowed silently.
+	if rows != vtxo_ids.len() as u64 {
+		let missing = tx.query("
+			SELECT u.vtxo_id
+			FROM UNNEST($1::text[]) AS u(vtxo_id)
+			LEFT JOIN vtxo v ON v.vtxo_id = u.vtxo_id
+			WHERE v.vtxo_id IS NULL
+		", &[&vtxo_ids]).await.context("failed to find vtxos missing for provide_signatures")?;
+		if missing.is_empty() {
+			bail!("provide_signatures updated {} of {} rows but no vtxo is missing",
+				rows, vtxo_ids.len(),
+			);
+		}
+		let missing = missing.iter().map(|r| r.get::<_, &str>("vtxo_id"))
+			.collect::<Vec<_>>();
+		return badarg!("cannot provide signatures for unknown vtxos: {}", missing.join(", "));
+	}
 	Ok(())
 }
 
@@ -448,12 +523,15 @@ async fn upsert_virtual_transactions(
 		signed_txs.push(vtx.signed_tx().map(bitcoin::consensus::serialize));
 		is_funding.push(vtx.is_funding);
 	}
+	// The ORDER BY makes concurrent upserts of overlapping txid sets take
+	// their row locks in the same order, so they can't deadlock.
 	tx.execute("
 		INSERT INTO virtual_transaction
 			(txid, signed_tx, is_funding, created_at, updated_at)
 		SELECT txid, signed_tx, is_funding, NOW(), NOW()
 		FROM UNNEST($1::text[], $2::bytea[], $3::bool[])
 			AS u(txid, signed_tx, is_funding)
+		ORDER BY txid
 		ON CONFLICT (txid) DO UPDATE SET
 			signed_tx = COALESCE(virtual_transaction.signed_tx, EXCLUDED.signed_tx),
 			updated_at = NOW()
@@ -465,13 +543,13 @@ async fn upsert_virtual_transactions(
 async fn insert_vtxos(
 	tx: &tokio_postgres::Transaction<'_>,
 	vi: &VtxoInserts,
-) -> anyhow::Result<()> {
-	if vi.is_empty() { return Ok(()) }
+) -> anyhow::Result<u64> {
+	if vi.is_empty() { return Ok(0) }
 	// ON CONFLICT DO NOTHING just continues if the vtxo already exists. For
 	// rows inserted via `insert_oor_spent_vtxos`, we then validate that the
 	// existing row's oor_spent_txid actually matches — otherwise the insert
 	// would silently authorize a double-spend.
-	tx.execute("
+	let inserted = tx.execute("
 		INSERT INTO vtxo (
 			vtxo_id, vtxo_txid, vtxo, expiry, exit_delta, policy_type, policy,
 			server_pubkey, amount, anchor_point,
@@ -503,13 +581,14 @@ async fn insert_vtxos(
 		let vtxo_id: &str = row.get("vtxo_id");
 		bail!("vtxo {} is already spent", vtxo_id);
 	}
-	Ok(())
+	Ok(inserted)
 }
 
 async fn apply_vtxo_updates(
 	tx: &tokio_postgres::Transaction<'_>,
 	vu: &VtxoUpdates,
 ) -> anyhow::Result<()> {
+	do_provide_signatures(tx, &vu.provide_signatures).await?;
 	do_oor_spend_updates(tx, &vu.oor_spends).await?;
 	do_round_spend_updates(tx, &vu.round_spends).await?;
 	do_offboard_spend_updates(tx, &vu.offboard_spends).await?;
@@ -517,12 +596,20 @@ async fn apply_vtxo_updates(
 	do_undo_round_updates(tx, &vu.round_unspends).await?;
 	do_claim_updates(tx, &vu.claims).await?;
 	do_register_updates(tx, &vu.registrations).await?;
+
+	invalidate_pending_participations_for_inputs(tx, &vu).await?;
+
 	Ok(())
 }
 
 // -- Individual update functions --
 
 /// Idempotent: succeeds if already spent with the same oor_spent_txid.
+///
+/// A vtxo with a `confirmed_height` has exited onchain and is gone, so the
+/// UPDATE refuses a fresh spend of it. Replaying the exact same spend stays
+/// idempotent even when the exit confirmed afterwards, so a retry of an arkoor
+/// we already signed still succeeds.
 async fn do_oor_spend_updates(
 	tx: &tokio_postgres::Transaction<'_>,
 	spends: &[OorSpendUpdate],
@@ -534,31 +621,41 @@ async fn do_oor_spend_updates(
 		UPDATE vtxo SET spend_state = 'spent', oor_spent_txid = u.txid, updated_at = NOW()
 		FROM UNNEST($1::text[], $2::text[]) AS u(vtxo_id, txid)
 		WHERE vtxo.vtxo_id = u.vtxo_id
-		AND (vtxo.spend_state = 'spendable'
-			OR vtxo.spend_state = 'pool'
-			OR vtxo.spend_state = 'htlc-recv-unclaimed'
+		AND ((vtxo.confirmed_height IS NULL
+				AND (vtxo.spend_state = 'spendable'
+					OR vtxo.spend_state = 'pool'
+					OR vtxo.spend_state = 'htlc-recv-unclaimed'))
 			OR (vtxo.spend_state = 'spent' AND vtxo.oor_spent_txid = u.txid))
 	", &[&ids, &txids]).await.context("failed to mark VTXOs as oor-spent")?;
 	if rows != spends.len() as u64 {
 		// Find the first vtxo that wasn't spendable and doesn't match our txid
 		let bad = tx.query_one("
-			SELECT u.vtxo_id, v.spend_state::text, v.oor_spent_txid
+			SELECT u.vtxo_id, v.spend_state::text, v.oor_spent_txid, v.confirmed_height
 			FROM UNNEST($1::text[], $2::text[]) AS u(vtxo_id, txid)
 			LEFT JOIN vtxo v ON v.vtxo_id = u.vtxo_id
 			WHERE v.vtxo_id IS NULL
-				OR (v.spend_state != 'spendable'
-					AND v.spend_state != 'pool'
-					AND v.spend_state != 'htlc-recv-unclaimed'
+				OR (NOT (v.confirmed_height IS NULL
+						AND (v.spend_state = 'spendable'
+							OR v.spend_state = 'pool'
+							OR v.spend_state = 'htlc-recv-unclaimed'))
 					AND NOT (v.spend_state = 'spent' AND v.oor_spent_txid = u.txid))
 			LIMIT 1
 		", &[&ids, &txids]).await.context("failed to find bad vtxo")?;
 		let vtxo_id: &str = bad.get("vtxo_id");
-		bail!("vtxo doesn't exist or is unspendable: {}", vtxo_id);
+		if bad.get::<_, Option<i32>>("confirmed_height").is_some() {
+			return badarg!("vtxo {} has exited onchain", vtxo_id);
+		}
+		return badarg!("vtxo doesn't exist or is unspendable: {}", vtxo_id);
 	}
 	Ok(())
 }
 
 /// Idempotent: succeeds if already spent in the same round.
+///
+/// `policy_type` is part of the condition so an HTLC vtxo can never be
+/// forfeited into a round, whatever the caller checked. The
+/// `confirmed_height IS NULL` guard refuses exited vtxos, see
+/// [do_oor_spend_updates].
 async fn do_round_spend_updates(
 	tx: &tokio_postgres::Transaction<'_>,
 	spends: &[RoundSpendUpdate],
@@ -570,21 +667,26 @@ async fn do_round_spend_updates(
 		UPDATE vtxo SET spend_state = 'spent', spent_in_round = u.round_id, updated_at = NOW()
 		FROM UNNEST($1::text[], $2::int8[]) AS u(vtxo_id, round_id)
 		WHERE vtxo.vtxo_id = u.vtxo_id
-		AND (vtxo.spend_state = 'spendable'
+		AND vtxo.policy_type = 'pubkey'
+		AND ((vtxo.confirmed_height IS NULL AND vtxo.spend_state = 'spendable')
 			OR (vtxo.spend_state = 'spent' AND vtxo.spent_in_round = u.round_id))
 	", &[&ids, &round_ids]).await.context("failed to mark VTXOs as round-spent")?;
 	if rows != spends.len() as u64 {
 		let bad = tx.query_one("
-			SELECT u.vtxo_id, v.spend_state::text, v.spent_in_round
+			SELECT u.vtxo_id, v.spend_state::text, v.spent_in_round, v.confirmed_height
 			FROM UNNEST($1::text[], $2::int8[]) AS u(vtxo_id, round_id)
 			LEFT JOIN vtxo v ON v.vtxo_id = u.vtxo_id
 			WHERE v.vtxo_id IS NULL
-				OR (v.spend_state != 'spendable'
+				OR v.policy_type != 'pubkey'
+				OR (NOT (v.confirmed_height IS NULL AND v.spend_state = 'spendable')
 					AND NOT (v.spend_state = 'spent' AND v.spent_in_round = u.round_id))
 			LIMIT 1
 		", &[&ids, &round_ids]).await.context("failed to find bad vtxo")?;
 		let vtxo_id: &str = bad.get("vtxo_id");
-		bail!("vtxo doesn't exist or is unspendable: {}", vtxo_id);
+		if bad.get::<_, Option<i32>>("confirmed_height").is_some() {
+			return badarg!("vtxo {} has exited onchain", vtxo_id);
+		}
+		return badarg!("vtxo doesn't exist or is unspendable: {}", vtxo_id);
 	}
 	Ok(())
 }
@@ -593,6 +695,10 @@ async fn do_round_spend_updates(
 /// txid in a single update.
 ///
 /// Idempotent: succeeds if already offboarded with the same txids.
+///
+/// `policy_type` is part of the condition so an HTLC vtxo can never be
+/// offboarded, whatever the caller checked. The `confirmed_height IS NULL`
+/// guard refuses exited vtxos, see [do_oor_spend_updates].
 async fn do_offboard_spend_updates(
 	tx: &tokio_postgres::Transaction<'_>,
 	spends: &[OffboardSpendUpdate],
@@ -610,7 +716,8 @@ async fn do_offboard_spend_updates(
 		FROM UNNEST($1::text[], $2::text[], $3::text[])
 			AS u(vtxo_id, offboard_txid, forfeit_txid)
 		WHERE vtxo.vtxo_id = u.vtxo_id
-		AND (vtxo.spend_state = 'spendable'
+		AND vtxo.policy_type = 'pubkey'
+		AND ((vtxo.confirmed_height IS NULL AND vtxo.spend_state = 'spendable')
 			OR (vtxo.spend_state = 'spent'
 				AND vtxo.offboarded_in = u.offboard_txid
 				AND vtxo.oor_spent_txid = u.forfeit_txid))
@@ -618,12 +725,13 @@ async fn do_offboard_spend_updates(
 		.await.context("failed to mark VTXOs as offboard-spent")?;
 	if rows != spends.len() as u64 {
 		let bad = tx.query_one("
-			SELECT u.vtxo_id
+			SELECT u.vtxo_id, v.confirmed_height
 			FROM UNNEST($1::text[], $2::text[], $3::text[])
 				AS u(vtxo_id, offboard_txid, forfeit_txid)
 			LEFT JOIN vtxo v ON v.vtxo_id = u.vtxo_id
 			WHERE v.vtxo_id IS NULL
-				OR (v.spend_state != 'spendable'
+				OR v.policy_type != 'pubkey'
+				OR (NOT (v.confirmed_height IS NULL AND v.spend_state = 'spendable')
 					AND NOT (v.spend_state = 'spent'
 						AND v.offboarded_in = u.offboard_txid
 						AND v.oor_spent_txid = u.forfeit_txid))
@@ -631,7 +739,10 @@ async fn do_offboard_spend_updates(
 		", &[&ids, &offboard_txids, &forfeit_txids])
 			.await.context("failed to find bad vtxo")?;
 		let vtxo_id: &str = bad.get("vtxo_id");
-		bail!("vtxo doesn't exist or is unspendable: {}", vtxo_id);
+		if bad.get::<_, Option<i32>>("confirmed_height").is_some() {
+			return badarg!("vtxo {} has exited onchain", vtxo_id);
+		}
+		return badarg!("vtxo doesn't exist or is unspendable: {}", vtxo_id);
 	}
 	Ok(())
 }
@@ -713,6 +824,27 @@ async fn do_register_updates(
 		UPDATE vtxo SET spend_state = 'spendable', updated_at = NOW()
 		WHERE vtxo_id = ANY($1::text[]) AND spend_state = 'unregistered'
 	", &[&ids]).await.context("failed to mark VTXOs as registered")?;
+	Ok(())
+}
+
+/// A spent input invalidates any pending delegated refresh that relies on
+/// it, so drop those participations now rather than failing them later at
+/// round time.
+///
+/// Participations already assigned to a round have round_id
+/// set and are left untouched.
+async fn invalidate_pending_participations_for_inputs(
+	tx: &tokio_postgres::Transaction<'_>,
+	vtxo_updates: &VtxoUpdates,
+) -> anyhow::Result<()> {
+	let spent_inputs = vtxo_updates.oor_spends.iter().map(|s| s.vtxo_id)
+		.chain(vtxo_updates.round_spends.iter().map(|s| s.vtxo_id))
+		.chain(vtxo_updates.offboard_spends.iter().map(|s| s.vtxo_id))
+		.collect::<Vec<_>>();
+	let dropped = super::query::delete_pending_participations_for_inputs(tx, &spent_inputs).await?;
+	if dropped > 0 {
+		debug!("Invalidated {} pending delegated round participation(s) whose inputs were spent", dropped);
+	}
 	Ok(())
 }
 

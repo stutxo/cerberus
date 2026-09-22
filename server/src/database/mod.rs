@@ -1,15 +1,21 @@
 
 mod embedded {
-	use refinery::embed_migrations;
-	embed_migrations!("src/database/migrations");
+	// refinery's embed_migrations! macro embeds migrations in filesystem
+	// readdir order, which is not deterministic across machines. build.rs
+	// generates the equivalent module from a sorted file list instead.
+	pub mod migrations {
+		include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
+	}
 }
 
 mod ban;
 pub mod block;
 pub mod data_migrations;
+pub mod htlc_vtxo;
 pub mod watchman;
 pub mod intman;
 pub mod ln;
+pub mod nursery;
 pub mod rounds;
 pub mod tree;
 pub mod vtxopool;
@@ -36,7 +42,7 @@ use ark::vtxo::{Bare, Full};
 use bb8::{ManageConnection, Pool, PooledConnection};
 use bb8_postgres::PostgresConnectionManager;
 use bdk_wallet::{chain::Merge, ChangeSet};
-use bitcoin::{Transaction, Txid};
+use bitcoin::{Amount, Transaction, Txid};
 use bitcoin::consensus::{serialize, deserialize};
 use bitcoin::secp256k1::{self, PublicKey};
 use chrono::Local;
@@ -49,6 +55,7 @@ use ark::lightning::{PaymentHash, Preimage};
 use ark::mailbox::{MailboxIdentifier, MailboxType};
 use ark::encode::ProtocolEncoding;
 
+use crate::error::ContextExt;
 use crate::wallet::WalletKind;
 use crate::config::Postgres as PostgresConfig;
 use crate::telemetry;
@@ -69,10 +76,13 @@ enum AdvisoryLock {
 	HtlcSettlementWrite = 2,
 }
 
-/// A stored bitcoin tx with txid pre-calculated
-pub struct StoredBitcoinTx {
+/// An uncommitted offboard fetched for the retry-task commit path. Carries
+/// `user_fee_sat` so `commit_offboard` can record fee telemetry at the same
+/// site that flips `wallet_commit` from FALSE to TRUE.
+pub struct StoredUncommittedOffboard {
 	pub txid: Txid,
 	pub tx: Transaction,
+	pub user_fee_sat: Option<u64>,
 }
 
 /// A stored mailbox entry.
@@ -117,6 +127,7 @@ pub enum MailboxPayload {
 	},
 	LightningReceive {
 		payment_hash: PaymentHash,
+		amount: Amount,
 	},
 	RecoveryVtxoIds {
 		vtxo_ids: Vec<VtxoId>,
@@ -130,7 +141,7 @@ pub enum MailboxPayload {
 
 #[derive(Clone)]
 pub struct Db {
-	pool: Pool<PostgresConnectionManager<NoTls>>
+	pool: Pool<ConnectionManager>
 }
 
 impl Db {
@@ -180,7 +191,7 @@ impl Db {
 	async fn pool_connect(
 		database: &str,
 		postgres_config: &PostgresConfig,
-	) -> anyhow::Result<Pool<PostgresConnectionManager<NoTls>>> {
+	) -> anyhow::Result<Pool<ConnectionManager>> {
 		let config = Self::config(database, postgres_config);
 
 		let manager = PostgresConnectionManager::new(config, NoTls);
@@ -189,7 +200,7 @@ impl Db {
 			.connection_timeout(Duration::from_secs(postgres_config.connection_timeout_secs))
 			.idle_timeout(Some(Duration::from_secs(postgres_config.idle_timeout_secs)))
 			.error_sink(Box::new(PoolErrorSink))
-			.build(manager).await?)
+			.build(ConnectionManager(manager)).await?)
 	}
 
 	async fn check_database_emptiness(conn: &Client) -> anyhow::Result<()> {
@@ -236,7 +247,14 @@ impl Db {
 		Self::connect(config).await
 	}
 
-	async fn get_conn(&self) -> anyhow::Result<PooledConnection<'_, PostgresConnectionManager<NoTls>>> {
+	/// Check out a raw pooled connection, below the [Db::read]/[Db::write]
+	/// transaction API. Only for tests that must manipulate session state.
+	#[doc(hidden)]
+	pub async fn raw_conn(&self) -> anyhow::Result<PooledConnection<'_, ConnectionManager>> {
+		self.get_conn().await
+	}
+
+	async fn get_conn(&self) -> anyhow::Result<PooledConnection<'_, ConnectionManager>> {
 		let before = self.pool.state();
 		telemetry::set_postgres_connection_pool_metrics(self.pool.state());
 		let start = std::time::Instant::now();
@@ -350,7 +368,8 @@ impl<'t> Tx<'t> {
 		let vtxos = vtxos.into_iter().map(|v| v.borrow().clone()).collect::<Vec<_>>();
 		let update = tree::VtxoTreeUpdate::new()
 			.insert_spendable_vtxos(vtxos);
-		self.execute_vtxo_tree_update(update).await
+		self.execute_vtxo_tree_update(update).await?;
+		Ok(())
 	}
 
 	pub async fn get_server_vtxo_by_id(
@@ -360,11 +379,19 @@ impl<'t> Tx<'t> {
 		query::get_vtxo_by_id(&self, id).await
 	}
 
+	pub async fn try_get_bare_vtxo_by_id(
+		&self,
+		id: VtxoId,
+	) -> anyhow::Result<Option<VtxoState<Bare, ServerVtxoPolicy>>> {
+		query::try_get_bare_vtxo_by_id(&self, id).await
+	}
+
 	pub async fn get_bare_vtxo_by_id(
 		&self,
 		id: VtxoId,
 	) -> anyhow::Result<VtxoState<Bare, ServerVtxoPolicy>> {
-		query::get_bare_vtxo_by_id(&self, id).await
+		Ok(query::try_get_bare_vtxo_by_id(&self, id).await?
+			.not_found([id], "VTXO not found")?)
 	}
 
 	pub async fn get_server_vtxos_by_id(
@@ -393,9 +420,8 @@ impl<'t> Tx<'t> {
 	pub async fn execute_vtxo_tree_update(
 		&self,
 		update: tree::VtxoTreeUpdate,
-	) -> anyhow::Result<()> {
-		tree::execute_vtxo_tree_update(&self, update).await?;
-		Ok(())
+	) -> anyhow::Result<u64> {
+		tree::execute_vtxo_tree_update(&self, update).await
 	}
 
 	/// Queries a virtual transaction by txid
@@ -432,22 +458,29 @@ impl<'t> Tx<'t> {
 		let checkpoint: i64 = self.query_one("SELECT next_checkpoint()", &[]).await?.get(0);
 		let mailbox_type_str = String::from(mailbox_type);
 
+		// Duplicate posts of the same vtxo are idempotent: a re-posted vtxo is
+		// silently ignored rather than rejected.
 		let statement = self.prepare("
 			INSERT INTO mailbox (unblinded_mailbox_id, vtxo_id, vtxo, checkpoint, mailbox_type, created_at)
-			VALUES ($1, $2, $3, $4, $5::TEXT::mailbox_type, NOW());
+			VALUES ($1, $2, $3, $4, $5::TEXT::mailbox_type, NOW())
+			ON CONFLICT (mailbox_type, vtxo_id) DO NOTHING;
 		").await?;
+		let mut total_inserted = 0u64;
 		for vtxo in vtxos {
-			let rows_updated = self.execute(&statement, &[
+			total_inserted += self.execute(&statement, &[
 				&mailbox_id.to_string(),
 				&vtxo.id().to_string(),
 				&ProtocolEncoding::serialize(vtxo).to_vec(),
 				&checkpoint,
 				&mailbox_type_str,
 			]).await?;
-			debug_assert_eq!(rows_updated, 1);
 		}
 
-		telemetry::set_mailbox_put_metric(mailbox_type, vtxos.len());
+		if total_inserted == 0 {
+			return Ok(None);
+		}
+
+		telemetry::set_mailbox_put_metric(mailbox_type, total_inserted as usize);
 		Ok(Some(checkpoint as u64))
 	}
 
@@ -465,6 +498,13 @@ impl<'t> Tx<'t> {
 
 	/// Retrieve mailbox messages (both arkoor VTXOs and lightning receive
 	/// notifications) for a given mailbox, ordered by checkpoint.
+	///
+	/// `limit` counts checkpoints, not rows. A batch post stores all its rows
+	/// under one checkpoint and the reader's cursor can only resume between
+	/// checkpoints, so a row limit could cut a page inside a checkpoint group
+	/// and the reader would silently skip the group's remaining rows. Returning
+	/// the next `limit` checkpoints whole makes one returned entry per
+	/// checkpoint, so a caller may compare `len()` against `limit`.
 	pub async fn get_mailbox_messages(
 		&self,
 		mailbox_id: MailboxIdentifier,
@@ -472,11 +512,19 @@ impl<'t> Tx<'t> {
 		limit: usize,
 	) -> anyhow::Result<Vec<MailboxEntry>> {
 		let statement = self.prepare(&format!("
-			SELECT vtxo_id, vtxo, payment_hash, unlock_hash, preimage, checkpoint, mailbox_type::TEXT AS entry_type
-			FROM mailbox
-			WHERE unblinded_mailbox_id = $1 AND checkpoint > $2
-			ORDER BY checkpoint ASC, entry_type ASC
-			LIMIT {limit};
+			WITH checkpoints AS (
+				SELECT DISTINCT checkpoint FROM mailbox
+				WHERE unblinded_mailbox_id = $1 AND checkpoint > $2
+				ORDER BY checkpoint ASC
+				LIMIT {limit}
+			)
+			SELECT
+				m.vtxo_id, m.vtxo, m.payment_hash, m.unlock_hash, m.preimage,
+				m.checkpoint, m.mailbox_type::TEXT AS entry_type, m.amount_sat
+			FROM mailbox m
+			WHERE m.unblinded_mailbox_id = $1
+				AND m.checkpoint IN (SELECT checkpoint FROM checkpoints)
+			ORDER BY m.checkpoint ASC, entry_type ASC;
 		")).await?;
 
 		let checkpoint = checkpoint as i64;
@@ -508,9 +556,17 @@ impl<'t> Tx<'t> {
 
 					let payment_hash = PaymentHash::from_str(&row.get::<_, &str>("payment_hash"))
 						.context("invalid payment hash in mailbox notification")?;
+					// Invariant: a ln-recv-pending mailbox row is always posted
+					// with its amount. A NULL is a row from before the V57
+					// migration for which no subscription amount could be
+					// recovered, the same row that used to fail the join here.
+					let amount_sat = row.get::<_, Option<i64>>("amount_sat")
+						.context("ln-recv-pending mailbox row without amount_sat")?;
+					let amount = Amount::from_sat(u64::try_from(amount_sat)
+						.context("negative amount_sat in mailbox row")?);
 					res.push(MailboxEntry {
 						checkpoint: cp,
-						payload: MailboxPayload::LightningReceive { payment_hash },
+						payload: MailboxPayload::LightningReceive { payment_hash, amount },
 					});
 					telemetry::set_mailbox_get_metric(mailbox_type, 1);
 
@@ -641,12 +697,15 @@ impl<'t> Tx<'t> {
 	}
 
 	/// Store a lightning receive notification in the mailbox.
-	/// Returns the checkpoint assigned to this notification.
+	///
+	/// Returns the checkpoint assigned to this notification, or `None` if a
+	/// notification for this payment hash already exists.
 	pub async fn store_lightning_receive_notification(
 		&self,
 		mailbox_id: MailboxIdentifier,
 		payment_hash: &str,
-	) -> anyhow::Result<Checkpoint> {
+		amount: Amount,
+	) -> anyhow::Result<Option<Checkpoint>> {
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
 		// Lock is automatically released when transaction commits/rolls back.
@@ -657,19 +716,28 @@ impl<'t> Tx<'t> {
 		let checkpoint: i64 = self.query_one("SELECT next_checkpoint()", &[]).await?.get(0);
 		let mailbox_type_str = String::from(MailboxType::LnRecvPendingPayment);
 
+		// A re-post of the same payment hash is ignored, so the amount of the
+		// first notification stands.
 		let statement = self.prepare("
-			INSERT INTO mailbox (unblinded_mailbox_id, payment_hash, checkpoint, mailbox_type, created_at)
-			VALUES ($1, $2, $3, $4::TEXT::mailbox_type, NOW());
+			INSERT INTO mailbox (unblinded_mailbox_id, payment_hash, amount_sat, checkpoint, mailbox_type, created_at)
+			VALUES ($1, $2, $3, $4, $5::TEXT::mailbox_type, NOW())
+			ON CONFLICT (mailbox_type, payment_hash) DO NOTHING;
 		").await?;
-		let rows_updated = self.execute(&statement, &[
+		let amount_sat = i64::try_from(amount.to_sat())
+			.context("amount does not fit the amount_sat column")?;
+		let rows_inserted = self.execute(&statement, &[
 			&mailbox_id.to_string(),
 			&payment_hash.to_string(),
+			&amount_sat,
 			&checkpoint,
 			&mailbox_type_str,
 		]).await?;
-		debug_assert_eq!(rows_updated, 1);
 
-		Ok(checkpoint as u64)
+		if rows_inserted == 1 {
+			Ok(Some(checkpoint as u64))
+		} else {
+			Ok(None)
+		}
 	}
 
 	/// Store a lightning send finished notification in the mailbox.
@@ -829,6 +897,7 @@ impl<'t> Tx<'t> {
 		input_vtxos: &[&'a Vtxo<Full, P>],
 		offboard_tx: &Transaction,
 		forfeit_result: &OffboardForfeitResult,
+		user_fee_sat: u64,
 	) -> anyhow::Result<()>
 	where
 		P: ark::vtxo::Policy,
@@ -836,12 +905,13 @@ impl<'t> Tx<'t> {
 		let offboard_txid = offboard_tx.compute_txid();
 		let offboard_txid_str = offboard_txid.to_string();
 		let offboard_tx_bytes = bitcoin::consensus::serialize(offboard_tx);
+		let user_fee_sat_i64 = i64::try_from(user_fee_sat)?;
 
 		let stmt = self.prepare_typed(
-			"INSERT INTO offboards (txid, signed_tx, wallet_commit, created_at)
-			VALUES ($1, $2, FALSE, NOW());",
-			&[Type::TEXT, Type::BYTEA]).await?;
-		self.execute(&stmt, &[&offboard_txid_str, &offboard_tx_bytes]).await?;
+			"INSERT INTO offboards (txid, signed_tx, wallet_commit, created_at, user_fee_sat)
+			VALUES ($1, $2, FALSE, NOW(), $3);",
+			&[Type::TEXT, Type::BYTEA, Type::INT8]).await?;
+		self.execute(&stmt, &[&offboard_txid_str, &offboard_tx_bytes, &user_fee_sat_i64]).await?;
 
 		// update the virtual tx tree
 		let connector_txs = forfeit_result.connector_tx.iter().cloned();
@@ -863,30 +933,49 @@ impl<'t> Tx<'t> {
 			.mark_vtxos_offboard_spent(offboard_triples);
 		tree::execute_vtxo_tree_update(&self, update).await?;
 
+		// register the connector output vtxo directly into the frontier, so
+		// the watchman can sweep it once the input vtxos have expired
+		self.add_funding_vtxos_to_frontier(offboard_txid, None).await?;
+
 		Ok(())
 	}
 
-	pub async fn mark_offboard_committed(&self, offboard_txid: Txid) -> anyhow::Result<()> {
+	/// Flip `wallet_commit` from FALSE to TRUE for the given offboard.
+	/// Returns whether this call actually did the transition (`true`) or
+	/// found the row already committed (`false`). Errors if the row is
+	/// missing. The conditional UPDATE lets callers hang fee telemetry off
+	/// the returned bool for exactly-once recording under retry.
+	pub async fn mark_offboard_committed(&self, offboard_txid: Txid) -> anyhow::Result<bool> {
+		// `before` snapshots the pre-UPDATE `wallet_commit` in the same
+		// snapshot as the conditional UPDATE, so one round-trip
+		// distinguishes "not found" (no row) from "already committed"
+		// (row with was_committed = TRUE).
 		let stmt = self.prepare_typed(
-			"UPDATE offboards SET wallet_commit = TRUE WHERE txid = $1;",
+			"WITH before AS (SELECT wallet_commit FROM offboards WHERE txid = $1),
+			     upd AS (
+			         UPDATE offboards SET wallet_commit = TRUE
+			         WHERE txid = $1 AND wallet_commit = FALSE
+			     )
+			SELECT wallet_commit AS was_committed FROM before;",
 			&[Type::TEXT],
 		).await?;
-		ensure!(self.execute(&stmt, &[&offboard_txid.to_string()]).await? > 0,
-			"no offboard with txid {}", offboard_txid,
-		);
-		Ok(())
+		let row = self.query_opt(&stmt, &[&offboard_txid.to_string()]).await?;
+		ensure!(row.is_some(), "no offboard with txid {}", offboard_txid);
+		Ok(!row.unwrap().get::<_, bool>("was_committed"))
 	}
 
-	pub async fn get_uncommitted_offboards(&self) -> anyhow::Result<Vec<StoredBitcoinTx>> {
+	pub async fn get_uncommitted_offboards(&self) -> anyhow::Result<Vec<StoredUncommittedOffboard>> {
 		let stmt = self.prepare_typed(
-			"SELECT txid, signed_tx FROM offboards WHERE wallet_commit IS FALSE;", &[],
+			"SELECT txid, signed_tx, user_fee_sat FROM offboards WHERE wallet_commit IS FALSE;", &[],
 		).await?;
 		let rows = self.query(&stmt, &[]).await?;
 		let mut ret = Vec::with_capacity(rows.len());
 		for row in rows {
-			ret.push(StoredBitcoinTx {
+			ret.push(StoredUncommittedOffboard {
 				txid: row.get::<_, &str>("txid").parse().expect("corrupt db: invalid txid"),
 				tx: deserialize(row.get("signed_tx")).expect("corrupt db: invalid tx"),
+				user_fee_sat: row.get::<_, Option<i64>>("user_fee_sat")
+					.map(|v| u64::try_from(v).expect("negative user_fee_sat in offboards row")),
 			});
 		}
 		Ok(ret)
@@ -930,54 +1019,6 @@ impl<'t> Tx<'t> {
 		}
 
 		Ok(ret)
-	}
-
-	// ***********
-	// * TXINDEX *
-	// ***********
-
-	/// Adds a [bitcoin::Transaction] to the database
-	/// that can be queried by [bitcoin::Txid].
-	pub async fn upsert_bitcoin_transaction(
-		&self,
-		txid: Txid,
-		tx: &Transaction
-	) -> anyhow::Result<()> {
-		let statement = self.prepare_typed(
-			"INSERT INTO bitcoin_transaction
-				(txid, tx, created_at)
-			VALUES
-				($1, $2, NOW())
-			ON CONFLICT DO NOTHING"
-			, &[Type::TEXT, Type::BYTEA]).await?;
-
-		// Prepare the data
-
-		self.execute(
-			&statement,
-			&[&txid.to_string(), &serialize(&tx)]
-		).await?;
-
-		Ok(())
-	}
-
-	pub async fn get_bitcoin_transaction_by_id(
-		&self,
-		txid: Txid,
-	) -> anyhow::Result<Option<Transaction>> {
-		let statement = self.prepare(
-			"SELECT tx FROM bitcoin_transaction WHERE txid = $1",
-		).await?;
-
-		match self.query_opt(&statement, &[&txid.to_string()]).await? {
-			Some(row) => {
-				let tx_bytes: &[u8] = row.get("tx");
-				let tx = deserialize(tx_bytes)
-					.expect("Corrupt transaction in database");
-				Ok(Some(tx))
-			},
-			None => Ok(None)
-		}
 	}
 
 	// ********************
@@ -1104,6 +1145,33 @@ impl bb8::ErrorSink<tokio_postgres::Error> for PoolErrorSink {
 
 	fn boxed_clone(&self) -> Box<dyn bb8::ErrorSink<tokio_postgres::Error>> {
 		Box::new(PoolErrorSink)
+	}
+}
+
+/// Pool manager that never grants a connection with an open transaction.
+///
+/// A dropped future (e.g. an rpc timeout) can return its connection to the
+/// pool with a transaction still open, and the next borrower would silently
+/// run inside it. The checkout check clears this: on a clean session
+/// `BEGIN; ROLLBACK` is a silent no-op, on a session with an open
+/// transaction the `BEGIN` warns and the `ROLLBACK` aborts it. The round
+/// trip doubles as the liveness check.
+pub struct ConnectionManager(PostgresConnectionManager<NoTls>);
+
+impl ManageConnection for ConnectionManager {
+	type Connection = Client;
+	type Error = tokio_postgres::Error;
+
+	async fn connect(&self) -> Result<Self::Connection, Self::Error> {
+		self.0.connect().await
+	}
+
+	async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
+		conn.batch_execute("BEGIN; ROLLBACK").await
+	}
+
+	fn has_broken(&self, conn: &mut Self::Connection) -> bool {
+		self.0.has_broken(conn)
 	}
 }
 

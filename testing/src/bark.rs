@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 
 use ark::{ProtocolEncoding, Vtxo, VtxoId};
 use ark::vtxo::Full;
-use bark::{BarkNetwork, Config};
+use bark::{BarkNetwork, Config, OpenWalletArgs, WalletSeed};
 use bark::lock_manager::memory::MemoryLockManager;
 use bark::onchain::OnchainWallet;
 use bark::persist::BarkPersister;
@@ -28,11 +28,11 @@ use bark::persist::adaptor::StorageAdaptorWrapper;
 use bark::persist::adaptor::filestore::FileStorageAdaptor;
 use bark::persist::sqlite::SqliteClient;
 use bark_json::cli::{InvoiceInfo, LightningReceiveInfo, RoundStatus};
-use bark_json::primitives::{UtxoInfo, WalletVtxoInfo};
+use bark_json::primitives::{UtxoInfo, VtxoStateInfo, WalletVtxoInfo};
 use bitcoin_ext::{BlockHeight, FeeRateExt};
 
-use crate::constants::BOARD_CONFIRMATIONS;
 use crate::{Bitcoind, TestContext};
+use crate::constants::BOARD_CONFIRMATIONS;
 use crate::context::ToArkUrl;
 use crate::constants::env::{BARK_COMMAND_TIMEOUT_MILLIS, BARK_EXEC, BARK_TOKIO_WORKER_THREADS, USE_FILESTORE};
 use crate::util::resolve_path;
@@ -52,15 +52,24 @@ pub struct Bark {
 }
 
 impl Bark {
-	fn cmd() -> TokioCommand {
+	pub fn cmd() -> TokioCommand {
 		let e = env::var(BARK_EXEC).expect("BARK_EXEC env not set");
 		let exec = resolve_path(e).expect("failed to resolve BARK_EXEC");
 		TokioCommand::new(exec)
 	}
 
+	pub fn try_cmd() -> Option<TokioCommand> {
+		let e = env::var(BARK_EXEC).ok()?;
+		if e.is_empty() {
+			return None;
+		}
+		let exec = resolve_path(e).ok()?;
+		Some(TokioCommand::new(exec))
+	}
+
 	/// Extract the version from the BARK_EXEC binary.
 	///
-	/// Returns the version string, e.g. "0.1.0-beta.8" or "DIRTY".
+	/// Returns the version string, e.g. "0.1.0-beta.8" or "0.6.0-dev".
 	pub async fn version() -> String {
 		let output = Self::cmd()
 			.arg("--version")
@@ -184,6 +193,17 @@ impl Bark {
 		&self.config
 	}
 
+	/// Point the wallet at a new Ark server address.
+	///
+	/// Useful after a server restart, which makes the server listen on a
+	/// new port.
+	pub async fn set_server_address(&mut self, address: impl Into<String>) {
+		self.config.server_address = address.into();
+		let config_path = self.datadir.join("config.toml");
+		fs::write(&config_path, toml::to_string_pretty(&self.config).unwrap()).await
+			.expect("error writing bark config file");
+	}
+
 	pub fn timeout(&self) -> Option<Duration> {
 		self.timeout
 	}
@@ -196,24 +216,19 @@ impl Bark {
 		self.timeout = None;
 	}
 
-	pub async fn try_client(&self) -> anyhow::Result<bark::Wallet> {
+	async fn mnemonic(&self) -> anyhow::Result<bip39::Mnemonic> {
 		const MNEMONIC_FILE: &str = "mnemonic";
-		const DB_FILE: &str = "db.sqlite";
-		const FILESTORE_FILE: &str = "wallet.json";
-		const CONFIG_FILE: &str = "config.toml";
-
-		// read mnemonic file
 		let mnemonic_path = self.datadir.join(MNEMONIC_FILE);
+
 		let mnemonic_str = fs::read_to_string(&mnemonic_path).await
 			.with_context(|| format!("failed to read mnemonic file at {}", mnemonic_path.display()))?;
 		let mnemonic = bip39::Mnemonic::from_str(&mnemonic_str).context("broken mnemonic")?;
+		Ok(mnemonic)
+	}
 
-		// Read the config file
-		let config_path = self.datadir.join(CONFIG_FILE);
-		let config_str = fs::read_to_string(&config_path).await
-			.with_context(|| format!("Failed to read config file at {}", config_path.display()))?;
-		let config: bark::Config = toml::from_str(&config_str)
-			.with_context(|| format!("Failed to parse config file at {}", config_path.display()))?;
+	async fn db_client(&self) -> anyhow::Result<Arc<dyn BarkPersister + Send + Sync>> {
+		const DB_FILE: &str = "db.sqlite";
+		const FILESTORE_FILE: &str = "wallet.json";
 
 		let use_filestore = self.datadir.join(FILESTORE_FILE).exists();
 		let db: Arc<dyn BarkPersister + Send + Sync> = if use_filestore {
@@ -224,12 +239,55 @@ impl Bark {
 			Arc::new(SqliteClient::open(self.datadir.join(DB_FILE))?)
 		};
 
+		Ok(db)
+	}
+
+	pub async fn try_client(&self) -> anyhow::Result<bark::Wallet> {
+		const CONFIG_FILE: &str = "config.toml";
+
+		// read mnemonic file
+		let mnemonic = self.mnemonic().await?;
+
+		// read the config file
+		let config_path = self.datadir.join(CONFIG_FILE);
+		let config_str = fs::read_to_string(&config_path).await
+			.with_context(|| format!("Failed to read config file at {}", config_path.display()))?;
+		let config: bark::Config = toml::from_str(&config_str)
+			.with_context(|| format!("Failed to parse config file at {}", config_path.display()))?;
+
+		let db = self.db_client().await?;
+
 		let lock_manager = Box::new(MemoryLockManager::new());
-		Ok(bark::Wallet::open(&mnemonic, db, config, lock_manager).await?)
+		Ok(bark::Wallet::open(
+			Network::Regtest,
+			WalletSeed::new_from_mnemonic(Network::Regtest, &mnemonic),
+			config,
+			OpenWalletArgs {
+				persister: Some(db),
+				lock_manager: Some(lock_manager),
+				run_daemon: false,
+				..Default::default()
+			},
+		).await?)
 	}
 
 	pub async fn client(&self) -> bark::Wallet {
 		self.try_client().await.expect("failed to create bark::Wallet client")
+	}
+
+	pub async fn try_onchain_client(&self) -> anyhow::Result<bark::onchain::OnchainWallet> {
+		let mnemonic = self.mnemonic().await?;
+		let db = self.db_client().await?;
+
+		Ok(bark::onchain::OnchainWallet::load_or_create(
+			Network::Regtest,
+			mnemonic.to_seed(""),
+			db,
+		).await?)
+	}
+
+	pub async fn onchain_client(&self) -> bark::onchain::OnchainWallet {
+		self.try_onchain_client().await.expect("failed to create bark::onchain::OnchainWallet client")
 	}
 
 	pub async fn estimate_board_offchain_fee(&self, amount: Amount) -> bark::FeeEstimate {
@@ -310,7 +368,7 @@ impl Bark {
 		self.try_parse_payment_request(payment_str).await.unwrap()
 	}
 
-	/// Estimate fees for all payment options in a [`PaymentRequest`].
+	/// Estimate fees for all payment options in a [`PaymentRequest`](bark::payment_request::PaymentRequest).
 	///
 	/// You can get a payment request from [`Self::parse_payment_request`].
 	pub async fn estimate_payment_fees(
@@ -448,6 +506,21 @@ impl Bark {
 		serde_json::from_str(&res).expect("json error")
 	}
 
+	/// Assert a refused action left every vtxo spendable and the balance
+	/// unchanged. Checked without syncing, so a sync can't mask a stuck vtxo.
+	pub async fn assert_unchanged_after_refusal(&self, spendable_before: Amount) {
+		let vtxos = self.vtxos_no_sync().await;
+		let stuck = vtxos.iter()
+			.filter(|v| v.state != VtxoStateInfo::Spendable)
+			.collect::<Vec<_>>();
+		assert!(stuck.is_empty(),
+			"{}: a refused action left vtxos unspendable: {stuck:?}", self.name,
+		);
+		assert_eq!(self.spendable_balance_no_sync().await, spendable_before,
+			"{}: a refused action changed the spendable balance", self.name,
+		);
+	}
+
 	pub async fn raw_vtxo(&self, vtxo_id: VtxoId) -> Vtxo<Full> {
 		let hex = self.run(["raw-vtxo", &vtxo_id.to_string()]).await;
 		Vtxo::deserialize_hex(&hex).expect("invalid raw vtxo")
@@ -511,15 +584,7 @@ impl Bark {
 		let destination = destination.to_string();
 		let amount_str = amount.map(|a| a.to_string());
 
-		// In 0.1.0-beta.8 and before the command was `lightning pay <invoice>`.
-		// Since 0.1.0-beta.9 and onwards it is `lightning pay invoice <invoice>`.
-		let version = crate::util::BarkVersion::parse(&Bark::version().await);
-		let cutoff = crate::util::BarkVersion::parse("0.1.0-beta.8");
-		let mut args = if version > cutoff {
-			vec!["lightning", "pay", "invoice", &destination, "--verbose"]
-		} else {
-			vec!["lightning", "pay", &destination, "--verbose"]
-		};
+		let mut args = vec!["lightning", "pay", "invoice", &destination, "--verbose"];
 		if let Some(amount) = amount_str.as_ref() {
 			args.push(amount);
 		}
@@ -578,6 +643,44 @@ impl Bark {
 			.expect("bolt11 invoice command failed")
 	}
 
+	pub async fn try_bolt11_invoice_with_token(&self, amount: Amount, token: &str) -> anyhow::Result<InvoiceInfo> {
+		let amount = amount.to_string();
+		let args: Vec<&str> = vec!["lightning", "invoice", &amount, "--verbose", "--token", token];
+		let res = self.try_run(args).await?;
+		Ok(serde_json::from_str(&res).expect("json error"))
+	}
+
+	pub async fn bolt11_invoice_with_token(&self, amount: Amount, token: &str) -> InvoiceInfo {
+		self.try_bolt11_invoice_with_token(amount, token).await
+			.expect("bolt11 invoice command failed")
+	}
+
+	pub async fn try_bolt11_invoice_for_address(
+		&self,
+		address: impl fmt::Display,
+		amount: Amount,
+	) -> anyhow::Result<InvoiceInfo> {
+		let address = address.to_string();
+		let amount = amount.to_string();
+		let res = self.try_run([
+			"lightning",
+			"invoice-for-address",
+			&address,
+			&amount,
+			"--verbose",
+		]).await?;
+		Ok(serde_json::from_str(&res).expect("json error"))
+	}
+
+	pub async fn bolt11_invoice_for_address(
+		&self,
+		address: impl fmt::Display,
+		amount: Amount,
+	) -> InvoiceInfo {
+		self.try_bolt11_invoice_for_address(address, amount).await
+			.expect("bolt11 invoice-for-address command failed")
+	}
+
 	pub async fn try_lightning_receive(&self, invoice: &str) -> anyhow::Result<()> {
 		self.try_run(["lightning", "claim", invoice, "--wait", "--verbose", "--no-sync"]).await?;
 		Ok(())
@@ -587,22 +690,8 @@ impl Bark {
 		self.try_lightning_receive(invoice).await.unwrap();
 	}
 
-	pub async fn try_lightning_receive_with_token(&self, invoice: &str, token: &str) -> anyhow::Result<()> {
-		self.try_run([
-			"lightning", "claim", invoice, "--token", token, "--wait", "--verbose", "--no-sync",
-		]).await?;
-		Ok(())
-	}
-
 	pub async fn try_lightning_receive_no_wait(&self, invoice: &str) -> anyhow::Result<()> {
 		self.try_run(["lightning", "claim", invoice, "--verbose", "--no-sync"]).await?;
-		Ok(())
-	}
-
-	pub async fn try_lightning_receive_with_token_no_wait(&self, invoice: &str, token: &str) -> anyhow::Result<()> {
-		self.try_run([
-			"lightning", "claim", invoice, "--token", token, "--verbose", "--no-sync",
-		]).await?;
 		Ok(())
 	}
 
@@ -636,24 +725,22 @@ impl Bark {
 	pub async fn lightning_receive_status(&self, filter: impl fmt::Display)
 		-> Option<LightningReceiveInfo>
 	{
-		// In 0.1.0-beta.8 and before the command was `lightning status <filter>`.
-		// Since 0.1.0-beta.9 and onwards it is `lightning receive status <filter>`.
-		let version = crate::util::BarkVersion::parse(&Bark::version().await);
-		let cutoff = crate::util::BarkVersion::parse("0.1.0-beta.8");
 		let filter = filter.to_string();
-		let args: Vec<&str> = if version > cutoff {
-			vec!["lightning", "receive", "status", &filter]
-		} else {
-			vec!["lightning", "status", &filter]
-		};
+		let args = vec!["lightning", "receive", "status", &filter];
 		let res = self.run(args).await;
 		if res.is_empty() { return None; }
-		serde_json::from_str(&res).expect("json error")
+		let info = serde_json::from_str::<LightningReceiveInfo>(&res).expect("json error");
+		// The command now always emits a status; treat "unknown" as absent so
+		// callers keep the previous Option semantics.
+		if info.state == "unknown" { None } else { Some(info) }
 	}
 
 	pub async fn try_board(&self, amount: Amount) -> anyhow::Result<json::cli::PendingBoardInfo> {
+		tokio::time::sleep(Duration::from_millis(500)).await;
 		info!("{}: Board {}", self.name, amount);
-		self.try_run_json(["board", &amount.to_string()]).await
+		let ret = self.try_run_json(["board", &amount.to_string()]).await;
+		tokio::time::sleep(Duration::from_millis(500)).await;
+		ret
 	}
 
 	pub async fn board(&self, amount: Amount) -> json::cli::PendingBoardInfo {
@@ -665,6 +752,7 @@ impl Bark {
 	}
 
 	pub async fn try_board_all(&self) -> anyhow::Result<json::cli::PendingBoardInfo> {
+		tokio::time::sleep(Duration::from_millis(500)).await;
 		info!("{}: Boarding all on-chain funds", self.name);
 		self.try_run_json(["board", "--all"]).await
 	}
@@ -743,6 +831,21 @@ impl Bark {
 		self.run(["refresh", "--counterparty"]).await;
 	}
 
+	/// Request a delegated (non-interactive) refresh of all VTXOs without syncing
+	/// first. Returns once the participation has been submitted to the server;
+	/// the server completes the actual refresh in a later round.
+	pub async fn refresh_all_delegated_no_sync(&self) {
+		self.run(["refresh", "--all", "--delegated", "--no-sync"]).await;
+	}
+
+	/// Like [Bark::refresh_all_delegated_no_sync], but returns the command output
+	/// instead of panicking, so tests can assert that the server refused to
+	/// register the participation.
+	pub async fn try_refresh_all_delegated_no_sync(&self) -> anyhow::Result<String> {
+		self.try_run(["refresh", "--all", "--delegated", "--no-sync"]).await
+			.context("running refresh --all --delegated --no-sync command failed")
+	}
+
 	pub async fn try_offboard_all(&self, address: impl fmt::Display) -> anyhow::Result<json::cli::OffboardResult> {
 		Ok(self.try_run_json(
 			["offboard", "--all", "--address", &address.to_string()],
@@ -751,6 +854,16 @@ impl Bark {
 
 	pub async fn offboard_all(&self, address: impl fmt::Display) -> json::cli::OffboardResult {
 		self.try_offboard_all(address).await.expect("offboard --all command failed")
+	}
+
+	/// Offboard everything without syncing first, so that a stale wallet
+	/// doesn't notice its vtxos already went on chain. Returns the command
+	/// output instead of panicking, so tests can assert that the server
+	/// refused.
+	pub async fn try_offboard_all_no_sync(&self, address: impl fmt::Display) -> anyhow::Result<String> {
+		self.try_run(
+			["offboard", "--all", "--no-sync", "--address", &address.to_string()],
+		).await.context("running offboard --all --no-sync command failed")
 	}
 
 	pub async fn offboard_vtxo(
@@ -768,10 +881,23 @@ impl Bark {
 	}
 
 	pub async fn try_import_vtxos(&self, vtxo_hexes: &[&str]) -> anyhow::Result<Vec<bark_json::primitives::WalletVtxoInfo>> {
+		self.try_import_vtxos_with_gap_limit(vtxo_hexes, None).await
+	}
+
+	pub async fn try_import_vtxos_with_gap_limit(
+		&self,
+		vtxo_hexes: &[&str],
+		gap_limit: Option<u32>,
+	) -> anyhow::Result<Vec<bark_json::primitives::WalletVtxoInfo>> {
 		let mut args: Vec<&str> = vec!["dev", "vtxo", "import"];
 		for hex in vtxo_hexes {
 			args.push("--vtxo");
 			args.push(hex);
+		}
+		let gap_limit = gap_limit.map(|g| g.to_string());
+		if let Some(ref g) = gap_limit {
+			args.push("--gap-limit");
+			args.push(g);
 		}
 		self.try_run_json(args).await
 	}
@@ -792,6 +918,14 @@ impl Bark {
 
 	pub async fn start_exit_all(&self) {
 		self.run(["exit", "start", "--all"]).await;
+	}
+
+	pub async fn estimate_exit_fee_all(&self) -> json::web::EmergencyExitFeeEstimateResponse {
+		self.run_json(["exit", "estimate-fee", "--all"]).await
+	}
+
+	pub async fn estimate_exit_fee_vtxo(&self, vtxo: impl fmt::Display) -> json::web::EmergencyExitFeeEstimateResponse {
+		self.run_json(["exit", "estimate-fee", "--vtxo", &vtxo.to_string()]).await
 	}
 
 	pub async fn start_exit_vtxos<I, T>(&self, vtxos: I)
@@ -815,12 +949,16 @@ impl Bark {
 		self.run_json(["exit", "list", "--no-sync"]).await
 	}
 
-	pub async fn list_exits_with_details(&self) -> Vec<json::cli::ExitTransactionStatus> {
-		self.run_json(["exit", "list", "--transactions", "--history"]).await
+	pub async fn list_exits_including_finished(&self) -> Vec<json::cli::ExitTransactionStatus> {
+		self.run_json(["exit", "list", "--include-finished"]).await
 	}
 
-	pub async fn list_exits_with_details_no_sync(&self) -> Vec<json::cli::ExitTransactionStatus> {
-		self.run_json(["exit", "list", "--transactions", "--history", "--no-sync"]).await
+	pub async fn list_exits_with_txs(&self) -> Vec<json::cli::ExitTransactionStatus> {
+		self.run_json(["exit", "list", "--transactions"]).await
+	}
+
+	pub async fn list_exits_with_txs_no_sync(&self) -> Vec<json::cli::ExitTransactionStatus> {
+		self.run_json(["exit", "list", "--transactions", "--no-sync"]).await
 	}
 
 	pub async fn claim_all_exits(&self, destination: impl fmt::Display) {
@@ -890,7 +1028,24 @@ impl Bark {
 				DEFAULT_CMD_TIMEOUT
 			}
 		});
-		let exit_result = tokio::time::timeout(timeout, child.wait()).await;
+
+		// Take stdout out so we can drain it concurrently with `wait`. If the child
+		// produces enough output to fill the kernel pipe buffer (≈8 KiB on some
+		// container runtimes, 64 KiB on a typical desktop Linux) and we only read
+		// after `wait` returns, the child blocks on its next write and the wait
+		// deadlocks until the timeout fires. Joining a `read_to_string` future with
+		// `wait` keeps the pipe drained for the whole lifetime of the child.
+		let mut stdout = child.stdout.take().expect("stdout was piped");
+		let read_fut = async move {
+			let mut buf = String::new();
+			stdout.read_to_string(&mut buf).await.unwrap();
+			buf
+		};
+
+		let (exit_result, read_result) = tokio::join!(
+			tokio::time::timeout(timeout, child.wait()),
+			read_fut,
+		);
 
 		// on timeout, kill the child
 		if exit_result.is_err() {
@@ -898,13 +1053,7 @@ impl Bark {
 			command_log.write_all("TIMED OUT\n".as_bytes()).await?;
 			child.kill().await.map_err(|e| anyhow!("can't kill timedout child: {}", e))?;
 		}
-		let out = {
-			let mut buf = String::new();
-			if let Some(mut o) = child.stdout {
-				o.read_to_string(&mut buf).await?;
-			}
-			buf
-		};
+		let out = read_result;
 		trace!("output of command '{}': {}", command_str, out);
 		let outfile = folder.join("stdout.log");
 		if let Err(e) = fs::write(&outfile, &out).await {

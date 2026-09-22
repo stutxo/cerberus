@@ -6,6 +6,7 @@ use clap;
 use lightning::offers::offer::Offer;
 use lightning_invoice::Bolt11Invoice;
 use lnurl::lightning_address::LightningAddress;
+use lnurl::lnurl::LnUrl;
 use log::info;
 
 use ark::lightning::{PaymentHash, Preimage};
@@ -39,6 +40,24 @@ pub enum LightningCommand {
 		#[arg(long)]
 		token: Option<String>,
 	},
+	/// Creates a bolt11 invoice that forwards the received Ark VTXO to an Ark address
+	#[command()]
+	InvoiceForAddress {
+		/// Ark address that will receive the claimed VTXO
+		address: ark::Address,
+		/// Invoice amount
+		amount: Amount,
+		/// Optional description to embed in the invoice as its memo
+		#[arg(long)]
+		description: Option<String>,
+		/// Wait for the incoming payment to settle and be delivered
+		#[arg(long)]
+		wait: bool,
+		/// Provide a lightning receive token for authentication of this claim if the server requires one
+		/// and there are no existing spendable VTXOs to prove ownership of
+		#[arg(long)]
+		token: Option<String>,
+	},
 	/// List all generated invoices
 	#[command()]
 	Invoices,
@@ -53,10 +72,6 @@ pub enum LightningCommand {
 		/// Skip syncing wallet
 		#[arg(long)]
 		no_sync: bool,
-		/// Provide a lightning receive token for authentication of this claim if the server requires one
-		/// and there are no existing spendable VTXOs to prove ownership of
-		#[arg(long)]
-		token: Option<String>,
 	},
 }
 
@@ -142,20 +157,26 @@ pub async fn execute_lightning_command(
 			execute_receive_command(receive_cmd, wallet).await?;
 		},
 		LightningCommand::Invoice { amount, description, wait, token } => {
-			let invoice = wallet.bolt11_invoice(amount, description).await?;
+			let invoice = wallet.bolt11_invoice(amount, description, token).await?;
 			output_json(&InvoiceInfo { invoice: invoice.to_string() });
 			if wait {
-				let token = token.as_ref().map(|c| c.as_str());
-				wallet.try_claim_lightning_receive(invoice.into(), true, token).await?;
+				wallet.try_claim_lightning_receive(invoice.into(), true).await?;
+			}
+		},
+		LightningCommand::InvoiceForAddress { address, amount, description, wait, token } => {
+			let invoice = wallet.bolt11_invoice_for_address(amount, address, description, token).await?;
+			output_json(&InvoiceInfo { invoice: invoice.to_string() });
+			if wait {
+				wallet.try_claim_lightning_receive(invoice.into(), true).await?;
 			}
 		},
 		LightningCommand::Invoices => {
 			let mut receives = wallet.pending_lightning_receives().await?;
 			// receives are ordered from newest to oldest, so we reverse them so last terminal item is newest
 			receives.reverse();
-			output_json(&receives.into_iter().map(LightningReceiveInfo::from).collect::<Vec<_>>());
+			output_json(&receives.iter().map(LightningReceiveInfo::from).collect::<Vec<_>>());
 		},
-		LightningCommand::Claim { payment, wait, no_sync, token } => {
+		LightningCommand::Claim { payment, wait, no_sync } => {
 			if !no_sync {
 				info!("Syncing wallet...");
 				wallet.sync().await;
@@ -170,8 +191,7 @@ pub async fn execute_lightning_command(
 					}
 				};
 
-				let token = token.as_ref().map(|c| c.as_str());
-				wallet.try_claim_lightning_receive(payment_hash, wait, token).await?;
+				wallet.try_claim_lightning_receive(payment_hash, wait).await?;
 			} else {
 				info!("no invoice provided, trying to claim all open invoices");
 				wallet.try_claim_all_lightning_receives(wait).await?;
@@ -193,27 +213,25 @@ async fn execute_pay_command(
 				wallet.sync().await;
 			}
 
-			let payment = if let Ok(invoice) = Bolt11Invoice::from_str(&invoice) {
+			if let Ok(invoice) = Bolt11Invoice::from_str(&invoice) {
 				if comment.is_some() {
 					bail!("comment is not supported for BOLT-11 invoices");
 				}
-				wallet.pay_lightning_invoice(invoice, amount).await?
+				wallet.pay_lightning_invoice(invoice, amount, wait).await?;
 			} else if let Ok(offer) = Offer::from_str(&invoice) {
 				if comment.is_some() {
 					bail!("comment is not supported for BOLT-12 offers");
 				}
-				wallet.pay_lightning_offer(offer, amount).await?
+				wallet.pay_lightning_offer(offer, amount, wait).await?;
 			} else if let Ok(lnaddr) = LightningAddress::from_str(&invoice) {
 				let amount = amount.context("amount is required for Lightning addresses")?;
-				wallet.pay_lightning_address(&lnaddr, amount, comment).await?
+				wallet.pay_lightning_address(&lnaddr, amount, comment, wait).await?;
+			} else if let Ok(lnurl) = LnUrl::from_str(&invoice) {
+				let amount = amount.context("amount is required for LNURL")?;
+				wallet.pay_lnurl(&lnurl, amount, comment, wait).await?;
 			} else {
-				bail!("argument is not a valid BOLT-11 invoice, BOLT-12 offer or \
-					Lightning address");
-			};
-
-			if wait {
-				let payment_hash = payment.invoice.payment_hash();
-				wallet.check_lightning_payment(payment_hash, true).await?;
+				bail!("argument is not a valid BOLT-11 invoice, BOLT-12 offer, \
+					Lightning address or LNURL");
 			}
 		},
 		PayCommand::Status { filter_args: LightningStatusFilterGroup { filter, preimage }, no_sync } => {
@@ -229,11 +247,8 @@ async fn execute_pay_command(
 				(Some(_), Some(_)) => bail!("cannot provide both filter and preimage"),
 			};
 
-			if let Some(ret) = wallet.check_lightning_payment(payment_hash, false).await? {
-				output_json(&LightningSendInfo::from(ret));
-			} else {
-				info!("No outgoing payment found for this payment hash");
-			}
+			let state = wallet.check_lightning_payment(payment_hash, false).await?;
+			output_json(&LightningSendInfo::from_state(payment_hash, &state));
 		},
 	}
 
@@ -258,11 +273,8 @@ async fn execute_receive_command(
 				(Some(_), Some(_)) => bail!("cannot provide both filter and preimage"),
 			};
 
-			if let Some(ret) = wallet.lightning_receive_status(payment_hash).await? {
-				output_json(&LightningReceiveInfo::from(ret));
-			} else {
-				info!("No incoming payment found for this payment hash");
-			}
+			let state = wallet.lightning_receive_state(payment_hash).await?;
+			output_json(&LightningReceiveInfo::from_state(&state));
 		},
 		ReceiveCommand::Cancel { payment } => {
 			let payment_hash = payment_hash_from_filter(&payment)?;

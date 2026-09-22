@@ -13,7 +13,7 @@ use chrono::{DateTime, Local};
 use tokio_postgres::Row;
 
 use ark::{ProtocolEncoding, ServerVtxoPolicy, Vtxo, VtxoId, VtxoPolicy};
-use ark::vtxo::policy::{check_block_delta, check_block_height};
+use ark::vtxo::policy::{check_block_delta, check_block_height, VtxoPolicyKind};
 
 // Used by mailbox as an always increasing number for data sorting.
 pub type Checkpoint = u64;
@@ -31,6 +31,8 @@ pub enum SpendState {
 	Pool,
 	/// The VTXO is an htlc-recv that hasn't been claimed yet
 	HtlcRecvUnclaimed,
+	/// The vtxo is an htlc-send HTLC to the server
+	LnSpent,
 	/// The vtxo is a forfeit for a round input
 	RoundForfeit,
 	/// The vtxo is a forfeit for an offboard input
@@ -52,6 +54,7 @@ impl SpendState {
 			SpendState::Spent => "spent",
 			SpendState::Pool => "pool",
 			SpendState::HtlcRecvUnclaimed => "htlc-recv-unclaimed",
+			SpendState::LnSpent => "ln-spent",
 			SpendState::RoundForfeit => "round-forfeit",
 			SpendState::OffboardForfeit => "offboard-forfeit",
 			SpendState::OffboardConnector => "offboard-connector",
@@ -76,6 +79,7 @@ impl FromStr for SpendState {
 			"spent" => Ok(SpendState::Spent),
 			"pool" => Ok(SpendState::Pool),
 			"htlc-recv-unclaimed" => Ok(SpendState::HtlcRecvUnclaimed),
+			"ln-spent" => Ok(SpendState::LnSpent),
 			"round-forfeit" => Ok(SpendState::RoundForfeit),
 			"offboard-forfeit" => Ok(SpendState::OffboardForfeit),
 			"offboard-connector" => Ok(SpendState::OffboardConnector),
@@ -111,6 +115,13 @@ pub struct VtxoState<G = Full, P: Policy = VtxoPolicy> {
 	/// this so unregistered vtxos can't be used as inputs.
 	pub spend_state: SpendState,
 
+	/// If this vtxo exited onchain, the height at which its onchain
+	/// transaction confirmed.
+	///
+	/// We never serve an exited vtxo and will not sign any forfeit,
+	/// arkoor or other transaction anymore.
+	pub confirmed_height: Option<BlockHeight>,
+
 	/// If this is a board vtxo, the time at which it was swept.
 	pub created_at: DateTime<Local>,
 	pub updated_at: DateTime<Local>,
@@ -128,6 +139,7 @@ impl VtxoState<Full, ServerVtxoPolicy> {
 					spent_in_round: self.spent_in_round,
 					offboarded_in: self.offboarded_in,
 					banned_until_height: self.banned_until_height,
+					confirmed_height: self.confirmed_height,
 					spend_state: self.spend_state,
 					created_at: self.created_at,
 					updated_at: self.updated_at,
@@ -142,6 +154,7 @@ impl VtxoState<Full, ServerVtxoPolicy> {
 					spent_in_round: self.spent_in_round,
 					offboarded_in: self.offboarded_in,
 					banned_until_height: self.banned_until_height,
+					confirmed_height: self.confirmed_height,
 					spend_state: self.spend_state,
 					created_at: self.created_at,
 					updated_at: self.updated_at,
@@ -152,19 +165,81 @@ impl VtxoState<Full, ServerVtxoPolicy> {
 }
 
 impl<G, P: Policy> VtxoState<G, P> {
+	/// Whether this vtxo exited: its onchain transaction is confirmed.
+	pub fn is_exited(&self) -> bool {
+		self.confirmed_height.is_some()
+	}
+
+	/// Whether this vtxo may be spent as a freely chosen input: a round, an
+	/// offboard or an arkoor. HTLC VTXOs are refused.
+	///
+	/// The lightning circuits that legitimately spend them don't come through
+	/// here: sending uses [Self::check_htlc_send_spendable], revoking and
+	/// claiming are gated on the payment instead.
 	pub fn check_spendable(&self, chain_tip: BlockHeight) -> anyhow::Result<()> {
-		if self.spend_state != SpendState::Spendable {
-			bail!("vtxo {} is not spendable (state: {})", self.vtxo_id, self.spend_state);
+		let policy = self.vtxo.policy().policy_type();
+		if policy != VtxoPolicyKind::Pubkey {
+			return badarg!("vtxo {} is not spendable as a round, offboard or arkoor input \
+				(policy: {})", self.vtxo_id, policy,
+			);
 		}
+		self.check_state_spendable(chain_tip)
+	}
+
+	/// Whether this htlc-send vtxo may fund the lightning payment
+	///
+	/// Deliberately not reachable through [Self::check_spendable]: this is the
+	/// one gate where an HTLC vtxo is the expected input.
+	pub fn check_htlc_send_spendable(&self, chain_tip: BlockHeight) -> anyhow::Result<()> {
+		let policy = self.vtxo.policy().policy_type();
+		if policy != VtxoPolicyKind::ServerHtlcSend {
+			return badarg!("vtxo {} is not an htlc-send vtxo (policy: {})", self.vtxo_id, policy);
+		}
+		self.check_state_spendable(chain_tip)
+	}
+
+	/// The spend-lifecycle half of the checks above, shared by both.
+	fn check_state_spendable(&self, chain_tip: BlockHeight) -> anyhow::Result<()> {
+		if self.is_exited() {
+			return badarg!("vtxo {} has exited onchain", self.vtxo_id);
+		}
+		if self.spend_state != SpendState::Spendable {
+			return badarg!("vtxo {} is not spendable (state: {})", self.vtxo_id, self.spend_state);
+		}
+		self.check_not_banned(chain_tip)
+	}
+
+	/// Checks whether this vtxo is acceptable as a lightning-receive anti-DoS
+	/// ownership proof.
+	///
+	/// Unlike [Self::check_spendable] this also accepts `Unregistered` vtxos.
+	/// The proof only demonstrates that the user controls a genuine stake in
+	/// the Ark (one the server itself cosigned); it never spends the vtxo, so
+	/// requiring the signed transaction chain to be uploaded first is
+	/// unnecessary. Banned and exited vtxos are still rejected: an exited
+	/// vtxo no longer represents a stake in the Ark.
+	pub fn check_valid_anti_dos_proof(&self, chain_tip: BlockHeight) -> anyhow::Result<()> {
+		if self.is_exited() {
+			return badarg!("vtxo {} has exited onchain", self.vtxo_id);
+		}
+		if !matches!(self.spend_state, SpendState::Spendable | SpendState::Unregistered) {
+			return badarg!(
+				"vtxo {} is not a valid anti-dos proof (state: {})", self.vtxo_id, self.spend_state,
+			);
+		}
+		self.check_not_banned(chain_tip)
+	}
+
+	fn check_not_banned(&self, chain_tip: BlockHeight) -> anyhow::Result<()> {
 		if let Some(until) = self.banned_until_height {
-			if chain_tip < until {
-				bail!("vtxo {} is banned until block {}", self.vtxo_id, until);
+			if chain_tip.to_u32() < until {
+				return badarg!("vtxo {} is banned until block {}", self.vtxo_id, until);
 			}
 		}
 		Ok(())
 	}
 
-	/// Like [check_spendable] but tolerates a vtxo that was already
+	/// Like [Self::check_spendable] but tolerates a vtxo that was already
 	/// OOR-spent by the same `oor_txid` (idempotent cosign retry).
 	pub fn check_spendable_for_oor(&self, chain_tip: BlockHeight, oor_txid: Txid) -> anyhow::Result<()> {
 		let idempotent = self.spend_state == SpendState::Spent
@@ -206,6 +281,10 @@ impl<P: Policy + ProtocolEncoding> TryFrom<Row> for VtxoState<Full, P> {
 			banned_until_height: row.get::<_, Option<i32>>("banned_until_height")
 				.map(|h| u32::try_from(h))
 				.transpose()?,
+			confirmed_height: row.get::<_, Option<i32>>("confirmed_height")
+				.map(|h| BlockHeight::try_from(h))
+				.transpose()
+				.context("invalid confirmed_height in DB")?,
 			spend_state: SpendState::from_str(row.get::<_, &str>("spend_state"))?,
 			created_at: row.get("created_at"),
 			updated_at: row.get("updated_at"),
@@ -251,6 +330,10 @@ impl<P: Policy + ProtocolEncoding> TryFrom<Row> for VtxoState<Bare, P> {
 				.get::<_, Option<i32>>("banned_until_height")
 				.map(|h| u32::try_from(h))
 				.transpose()?,
+			confirmed_height: row.get::<_, Option<i32>>("confirmed_height")
+				.map(|h| BlockHeight::try_from(h))
+				.transpose()
+				.context("invalid confirmed_height in DB")?,
 			spend_state: SpendState::from_str(row.get::<_, &str>("spend_state"))?,
 			created_at: row.get("created_at"),
 			updated_at: row.get("updated_at"),
@@ -339,47 +422,116 @@ impl TryFrom<Row> for VirtualTransaction<'static> {
 	}
 }
 
+pub struct BannedVtxo {
+	pub vtxo_id: VtxoId,
+	pub banned_until_height: BlockHeight,
+}
+
+impl TryFrom<Row> for BannedVtxo {
+	type Error = anyhow::Error;
+
+	fn try_from(row: Row) -> Result<Self, Self::Error> {
+		let vtxo_id = VtxoId::from_str(row.get::<_, &str>("vtxo_id"))?;
+		let banned_until_height = BlockHeight::try_from(row.get::<_, i32>("banned_until_height"))
+			.context("banned_until_height out of range for u32")?;
+
+		Ok(Self { vtxo_id, banned_until_height })
+	}
+}
+
 #[cfg(test)]
 mod test {
 	use super::*;
 
 	use bitcoin::hashes::Hash;
 
-	/// A spendable, unbanned vtxo state for testing.
-	///
-	/// SAFETY: The vtxo field is uninitialized and must not be accessed.
-	/// The test methods only look at spend_state/banned/spent fields.
-	#[allow(invalid_value)]
-	fn spendable() -> VtxoState {
-		let vtxo = unsafe {
-			std::mem::MaybeUninit::<Vtxo<Full, VtxoPolicy>>::uninit().assume_init()
-		};
+	use ark::test_util::VTXO_VECTORS;
+
+	fn state(vtxo: Vtxo<Full, VtxoPolicy>) -> VtxoState {
 		VtxoState {
 			id: 0,
-			vtxo_id: VtxoId::from_slice(&[0; 36]).unwrap(),
+			vtxo_id: vtxo.id(),
 			vtxo,
 			oor_spent_txid: None,
 			spent_in_round: None,
 			offboarded_in: None,
 			banned_until_height: None,
+			confirmed_height: None,
 			spend_state: SpendState::Spendable,
 			created_at: Local::now(),
 			updated_at: Local::now(),
 		}
 	}
 
+	/// A spendable, unbanned pubkey vtxo state for testing.
+	fn spendable() -> VtxoState {
+		state(VTXO_VECTORS.board_vtxo.clone())
+	}
+
+	/// A spendable, unbanned htlc-send vtxo, the shape a lightning payment
+	/// funds itself with.
+	fn htlc_send() -> VtxoState {
+		state(VTXO_VECTORS.arkoor_htlc_out_vtxo.clone())
+	}
+
+	/// A spendable, unbanned htlc-recv vtxo. Its real spend state is
+	/// `htlc-recv-unclaimed`, but the policy gate must not depend on that.
+	fn htlc_recv() -> VtxoState {
+		state(VTXO_VECTORS.round2_vtxo.clone())
+	}
+
 	#[test]
 	fn spendable_unbanned_is_spendable() {
 		let v = spendable();
-		assert!(v.check_spendable(100).is_ok());
+		assert!(v.check_spendable(BlockHeight::new(100)).is_ok());
 	}
 
 	#[test]
 	fn unregistered_is_not_spendable() {
 		let mut v = spendable();
 		v.spend_state = SpendState::Unregistered;
-		let err = v.check_spendable(100).unwrap_err();
+		let err = v.check_spendable(BlockHeight::new(100)).unwrap_err();
 		assert!(format!("{err}").contains("unregistered"), "got: {err}");
+	}
+
+	#[test]
+	fn unregistered_is_valid_anti_dos_proof() {
+		let mut v = spendable();
+		v.spend_state = SpendState::Unregistered;
+		assert!(v.check_valid_anti_dos_proof(BlockHeight::new(100)).is_ok());
+	}
+
+	#[test]
+	fn spent_is_not_valid_anti_dos_proof() {
+		let mut v = spendable();
+		v.spend_state = SpendState::Spent;
+		v.oor_spent_txid = Some(Txid::all_zeros());
+		assert!(v.check_valid_anti_dos_proof(BlockHeight::new(100)).is_err());
+	}
+
+	#[test]
+	fn exited_is_not_spendable() {
+		let mut v = spendable();
+		v.confirmed_height = Some(BlockHeight::new(90));
+		let err = v.check_spendable(BlockHeight::new(100)).unwrap_err();
+		assert!(format!("{err}").contains("exited"), "got: {err}");
+	}
+
+	#[test]
+	fn exited_is_not_valid_anti_dos_proof() {
+		let mut v = spendable();
+		v.confirmed_height = Some(BlockHeight::new(90));
+		let err = v.check_valid_anti_dos_proof(BlockHeight::new(100)).unwrap_err();
+		assert!(format!("{err}").contains("exited"), "got: {err}");
+	}
+
+	#[test]
+	fn banned_is_not_valid_anti_dos_proof() {
+		let mut v = spendable();
+		v.spend_state = SpendState::Unregistered;
+		v.banned_until_height = Some(200);
+		assert!(v.check_valid_anti_dos_proof(BlockHeight::new(100)).is_err());
+		assert!(v.check_valid_anti_dos_proof(BlockHeight::new(200)).is_ok());
 	}
 
 	#[test]
@@ -387,16 +539,16 @@ mod test {
 		let mut v = spendable();
 		v.spend_state = SpendState::Spent;
 		v.oor_spent_txid = Some(Txid::all_zeros());
-		assert!(v.check_spendable(100).is_err());
+		assert!(v.check_spendable(BlockHeight::new(100)).is_err());
 	}
 
 	#[test]
 	fn banned_is_not_spendable() {
 		let mut v = spendable();
 		v.banned_until_height = Some(200);
-		assert!(v.check_spendable(100).is_err());
+		assert!(v.check_spendable(BlockHeight::new(100)).is_err());
 		// At tip == 200 the ban has expired (not strictly greater).
-		assert!(v.check_spendable(200).is_ok());
+		assert!(v.check_spendable(BlockHeight::new(200)).is_ok());
 	}
 
 	#[test]
@@ -406,9 +558,9 @@ mod test {
 		v.spend_state = SpendState::Spent;
 		v.oor_spent_txid = Some(txid);
 		// check_spendable rejects it
-		assert!(v.check_spendable(100).is_err());
+		assert!(v.check_spendable(BlockHeight::new(100)).is_err());
 		// but check_spendable_for_oor allows it when the txid matches
-		assert!(v.check_spendable_for_oor(100, txid).is_ok());
+		assert!(v.check_spendable_for_oor(BlockHeight::new(100), txid).is_ok());
 	}
 
 	#[test]
@@ -418,13 +570,54 @@ mod test {
 		v.oor_spent_txid = Some(Txid::all_zeros());
 		let other_txid = "0000000000000000000000000000000000000000000000000000000000000001"
 			.parse().unwrap();
-		assert!(v.check_spendable_for_oor(100, other_txid).is_err());
+		assert!(v.check_spendable_for_oor(BlockHeight::new(100), other_txid).is_err());
 	}
 
 	#[test]
 	fn unregistered_is_not_spendable_for_oor() {
 		let mut v = spendable();
 		v.spend_state = SpendState::Unregistered;
-		assert!(v.check_spendable_for_oor(100, Txid::all_zeros()).is_err());
+		assert!(v.check_spendable_for_oor(BlockHeight::new(100), Txid::all_zeros()).is_err());
+	}
+
+	#[test]
+	fn htlc_vtxos_are_never_generically_spendable() {
+		for (v, policy) in [
+			(htlc_send(), "server-htlc-send-v1"),
+			(htlc_recv(), "server-htlc-receive-v1"),
+		] {
+			let err = format!("{}", v.check_spendable(BlockHeight::new(100)).unwrap_err());
+			assert!(err.contains("not spendable as a") && err.contains(policy), "got: {err}");
+			// And the oor gate, which every arkoor path funnels through.
+			let err = format!("{}", v.check_spendable_for_oor(BlockHeight::new(100), Txid::all_zeros()).unwrap_err());
+			assert!(err.contains("not spendable as a") && err.contains(policy), "got: {err}");
+		}
+	}
+
+	#[test]
+	fn htlc_send_is_spendable_by_the_lightning_send() {
+		assert!(htlc_send().check_htlc_send_spendable(BlockHeight::new(100)).is_ok());
+	}
+
+	/// The lightning-send gate is not a way around the policy gate: it only
+	/// takes the one policy it exists for.
+	#[test]
+	fn only_htlc_send_is_spendable_by_the_lightning_send() {
+		for v in [spendable(), htlc_recv()] {
+			let err = v.check_htlc_send_spendable(BlockHeight::new(100)).unwrap_err();
+			assert!(format!("{err}").contains("not an htlc-send vtxo"), "got: {err}");
+		}
+	}
+
+	/// State still gates the lightning send: a vtxo already consumed by a
+	/// settled payment can't fund another one.
+	#[test]
+	fn spent_htlc_send_is_not_spendable_by_the_lightning_send() {
+		let mut v = htlc_send();
+		v.spend_state = SpendState::LnSpent;
+		assert!(v.check_htlc_send_spendable(BlockHeight::new(100)).is_err());
+		v.spend_state = SpendState::Spendable;
+		v.banned_until_height = Some(200);
+		assert!(v.check_htlc_send_spendable(BlockHeight::new(100)).is_err());
 	}
 }

@@ -132,6 +132,19 @@ impl_slog!(RoundUserBadOutputAmount, TRACE,
 );
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundUserBadParticipationAmount {
+	pub round_seq: RoundSeq,
+	pub attempt_seq: usize,
+	#[serde(with = "bitcoin::amount::serde::as_sat")]
+	pub amount: Amount,
+	#[serde(with = "crate::serde_utils::duration_millis")]
+	pub client_duration: Duration,
+}
+impl_slog!(RoundUserBadParticipationAmount, TRACE,
+	"user requested a participation with a total output amount exceeding maximum round amount",
+);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoundPaymentRegistered {
 	pub round_seq: RoundSeq,
 	pub attempt_seq: usize,
@@ -142,6 +155,18 @@ pub struct RoundPaymentRegistered {
 	pub unlock_hash: UnlockHash,
 }
 impl_slog!(RoundPaymentRegistered, TRACE, "Registered payment from a participant");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegatedRoundParticipationRegistered {
+	pub input_vtxos: Vec<VtxoId>,
+	pub unlock_hash: UnlockHash,
+	/// Block height at which the refresh is scheduled,
+	/// [None] for the next round.
+	pub scheduled_height: Option<BlockHeight>,
+}
+impl_slog!(DelegatedRoundParticipationRegistered, TRACE,
+	"Registered a non-interactive (delegated) round participation",
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FullRound {
@@ -314,6 +339,9 @@ pub struct RoundFinished {
 	#[serde(with = "crate::serde_utils::duration_millis")]
 	pub server_duration: Duration,
 	pub nb_input_vtxos: usize,
+	pub nb_output_vtxos: usize,
+	#[serde(with = "bitcoin::amount::serde::as_sat")]
+	pub total_output_amount: Amount,
 }
 impl_slog!(RoundFinished, INFO, "Round finished");
 
@@ -357,12 +385,6 @@ pub struct RoundError {
 	pub error: String,
 }
 impl_slog!(RoundError, ERROR, "error during round, restarting");
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoundSyncError {
-	pub error: String,
-}
-impl_slog!(RoundSyncError, WARN, "onchain wallet sync failed during round");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FatalStoringRound {

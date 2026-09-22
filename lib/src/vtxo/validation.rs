@@ -32,6 +32,10 @@ pub enum VtxoValidationError {
 		policy: VtxoPolicyKind,
 		msg: &'static str,
 	},
+	#[error("Expected genesis items but found none")]
+	MissingGenesisItems,
+	#[error("Genesis items were found but none were expected")]
+	UnexpectedGenesisItems,
 }
 
 impl VtxoValidationError {
@@ -70,7 +74,7 @@ fn verify_transition<P: Policy>(
 		vtxo.policy.txout(vtxo.amount, vtxo.server_pubkey, vtxo.exit_delta, vtxo.expiry_height)
 	});
 
-	let prevout = OutPoint::new(prev_tx.compute_txid(), prev_vout as u32);
+	let prevout = OutPoint::new(prev_tx.compute_txid(), u32::try_from(prev_vout).expect("vout fits in u32"));
 	let tx = item.tx(prevout, next_output, vtxo.server_pubkey, vtxo.expiry_height);
 
 	if check_signatures {
@@ -79,9 +83,12 @@ fn verify_transition<P: Policy>(
 				inner.validate_sigs(&tx, 0, prev_txout, vtxo.server_pubkey, vtxo.expiry_height)?
 			}
 			GenesisTransition::Arkoor(inner) => {
-				inner.validate_sigs(&tx, 0, prev_txout, vtxo.server_pubkey())?
+				inner.validate_sigs(&tx, 0, prev_txout, vtxo.server_pubkey)?
 			}
 			GenesisTransition::HashLockedCosigned(inner) => {
+				inner.validate_sigs(&tx, 0, prev_txout, vtxo.server_pubkey, vtxo.expiry_height)?
+			}
+			GenesisTransition::HashLockedCosigned_v0(inner) => {
 				inner.validate_sigs(&tx, 0, prev_txout, vtxo.server_pubkey, vtxo.expiry_height)?
 			}
 		};
@@ -161,7 +168,7 @@ fn validate_inner<P: Policy>(
 	}
 
 	// Verify the point field matches the computed exit outpoint
-	let expected_point = OutPoint::new(prev.0.compute_txid(), prev.1 as u32);
+	let expected_point = OutPoint::new(prev.0.compute_txid(), u32::try_from(prev.1).expect("vout fits in u32"));
 	if vtxo.point != expected_point {
 		return Err(VtxoValidationError::Invalid("point doesn't match computed exit outpoint"));
 	}
@@ -191,6 +198,10 @@ pub fn validate_unsigned<P: Policy>(
 
 #[cfg(test)]
 mod test {
+	use bitcoin::{OutPoint, Transaction};
+
+	use crate::{ProtocolEncoding, Vtxo};
+	use crate::vtxo::Full;
 	use crate::test_util::VTXO_VECTORS;
 
 	#[test]
@@ -220,5 +231,40 @@ mod test {
 		assert!(vtxos.arkoor3_vtxo.is_standard());
 		let err = vtxos.arkoor3_vtxo.validate(&vtxos.round_tx).err();
 		assert!(err.is_none(), "err: {err:?}");
+	}
+
+	#[test]
+	fn terminal_output_idx_out_of_range_is_rejected() {
+		fn check(mut vtxo: Vtxo<Full>, anchor: &Transaction) {
+			// Baseline: the fixture validates and places its funds at vout 0.
+			vtxo.validate(anchor).expect("baseline vtxo must validate");
+			assert_eq!(vtxo.point().vout, 0, "fixtures place the funds at vout 0");
+			let genesis_txid = vtxo.point().txid;
+
+			// Craft the malicious encoding: bump the terminal item's output_idx
+			// to nb_outputs and move `point` to the same (out-of-range) vout.
+			let nb_outputs = {
+				let item = vtxo.genesis.items.last_mut().unwrap();
+				let nb = item.other_outputs.len() + 1;
+				item.output_idx = nb as u8; // == nb_outputs: out of range
+				nb
+			};
+			vtxo.point = OutPoint::new(genesis_txid, nb_outputs as u32);
+
+			// The decoder MUST reject it. Before the fix this returned Ok, and
+			// the decoded VTXO's id was the P2A fee-anchor outpoint while
+			// validate() still passed.
+			let bytes = vtxo.serialize();
+			let res = Vtxo::<Full>::deserialize(&bytes);
+			assert!(res.is_err(),
+				"decoder must reject a genesis item with output_idx >= nb_outputs; \
+				accepted a VTXO whose point is the fee anchor: {:?}",
+				res.map(|v| v.point()));
+		}
+
+		// A board VTXO (single cosigned item) and an arkoor VTXO (the real
+		// delivery vector, terminal `arkoor` item) both exercise the gap.
+		check(VTXO_VECTORS.board_vtxo.clone(), &VTXO_VECTORS.anchor_tx);
+		check(VTXO_VECTORS.arkoor2_vtxo.clone(), &VTXO_VECTORS.anchor_tx);
 	}
 }

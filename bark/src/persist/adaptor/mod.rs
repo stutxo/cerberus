@@ -60,23 +60,23 @@ use chrono::{DateTime, Local};
 use lightning_invoice::Bolt11Invoice;
 use serde::{de::DeserializeOwned, Serialize};
 
-use ark::lightning::{Invoice, PaymentHash, Preimage};
+use ark::lightning::{PaymentHash, Preimage};
 use ark::{Vtxo, VtxoId};
 use ark::vtxo::Full;
-use bitcoin_ext::BlockDelta;
 
-use crate::exit::ExitTxOrigin;
+use crate::actions::{WalletActionCheckpoint, WalletActionId};
+use crate::exit::{ExitStateKind, ExitTxOrigin};
 use crate::movement::{
 	Movement, MovementId, MovementStatus, MovementSubsystem, PaymentMethod,
 };
+use crate::movement::update::MovementUpdate;
 use crate::persist::BarkPersister;
 use crate::persist::models::{
-	LightningReceive, LightningSend, PendingBoard, PendingOffboard,
-	RoundStateId, SerdeExitChildTx, SerdeRoundState, SerdeVtxo, SerdeVtxoKey, StoredExit,
-	StoredRoundState, Unlocked, wallet_vtxo_from_full,
+	PaidInvoice, RoundStateId, SerdeExitChildTx, SerdeRoundState, SerdeVtxo, SerdeVtxoKey,
+	SettledLightningReceive, StoredExit, StoredRoundState, Unlocked, wallet_vtxo_from_full,
 };
 use crate::round::RoundState;
-use crate::vtxo::{VtxoState, VtxoStateKind};
+use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind};
 use crate::{WalletProperties, WalletVtxo};
 
 
@@ -89,14 +89,34 @@ pub mod partition {
 	pub const PENDING_BOARD: u8 = 4;
 	pub const ROUND_STATE: u8 = 5;
 	pub const MOVEMENT: u8 = 6;
-	pub const LIGHTNING_SEND: u8 = 7;
-	pub const LIGHTNING_RECEIVE: u8 = 8;
+	/// was used by the now-removed `bark_lightning_send`. Do not reuse.
+	#[allow(unused)]
+	pub const LEGACY_LIGHTNING_SEND: u8 = 7;
+	/// was used by the now-removed legacy `bark_pending_lightning_receive`.
+	/// Do not reuse. In-flight receives now live in WALLET_ACTION_CHECKPOINT
+	/// and settled ones in SETTLED_LIGHTNING_RECEIVE.
+	#[allow(unused)]
+	pub const LEGACY_LIGHTNING_RECEIVE: u8 = 8;
 	pub const EXIT_VTXO: u8 = 9;
 	pub const EXIT_CHILD_TX: u8 = 10;
 	pub const MAILBOX_CHECKPOINT: u8 = 11;
-	pub const PENDING_OFFBOARD: u8 = 12;
+	/// was used by the now-removed `PENDING_OFFBOARD`; superseded by
+	/// [`WALLET_ACTION_CHECKPOINT`]. Do not reuse.
+	#[allow(unused)]
+	pub const LEGACY_PENDING_OFFBOARD: u8 = 12;
 	/// An index table for payment method to movement
 	pub const MOVEMENT_PAYMENT_METHOD: u8 = 13;
+	/// Per-action checkpoint payloads keyed by [crate::actions::WalletActionId].
+	pub const WALLET_ACTION_CHECKPOINT: u8 = 14;
+	/// Permanent record of every settled outgoing lightning payment,
+	/// keyed by payment hash.
+	pub const PAID_INVOICE: u8 = 15;
+	/// Permanent record of every settled incoming lightning receive,
+	/// keyed by payment hash.
+	pub const SETTLED_LIGHTNING_RECEIVE: u8 = 16;
+	/// An index from [WalletActionId] to the movement that action owns, so a
+	/// re-driven action step reuses its movement instead of duplicating it.
+	pub const MOVEMENT_ACTION: u8 = 17;
 
 	pub const LAST_IDS: u8 = u8::MAX;
 }
@@ -204,6 +224,44 @@ fn serialize_payment_method(pm: &PaymentMethod) -> Vec<u8> {
 	buf
 }
 
+/// Write a movement record and its payment-method index records through the
+/// given adaptor guard. Shared by the plain update path and the atomic
+/// action-owned create path.
+async fn write_movement_records<S: StorageAdaptor>(
+	guard: &mut S,
+	movement: &Movement,
+) -> anyhow::Result<()> {
+	let record = Record::from_data(
+		partition::MOVEMENT,
+		&movement.id.to_bytes(),
+		Some(sort::movement_sort_key(&movement.time.created_at)),
+		movement,
+	)?;
+	guard.put(record).await?;
+
+	// then add records for each payment method
+	let sent = movement.sent_to.iter().map(|d| &d.destination);
+	let rcvd = movement.received_on.iter().map(|d| &d.destination);
+	for pm in sent.chain(rcvd) {
+		let pm_bytes = serialize_payment_method(pm);
+		let primary_key = {
+			// We just need a unique key, but we will never query using this
+			let mut buf = Vec::with_capacity(pm_bytes.len() + 4);
+			buf.extend(pm_bytes.iter().copied());
+			buf.extend(movement.id.to_bytes());
+			buf
+		};
+		let record = Record::from_data(
+			partition::MOVEMENT_PAYMENT_METHOD,
+			&primary_key,
+			Some(SortKey::from_bytes(pm_bytes)),
+			&movement.id.0,
+		)?;
+		guard.put(record).await?;
+	}
+	Ok(())
+}
+
 /// Storage adaptor trait for persistence backends.
 ///
 /// This trait provides a minimal interface (5 methods) that can be efficiently
@@ -304,22 +362,41 @@ async fn get_vtxo<S: StorageAdaptor>(adaptor: &S, id: VtxoId) -> anyhow::Result<
 	}
 }
 
+/// Whether a checked state update still has anything to write.
+enum StateTransition {
+	/// The vtxo already carries the exact target state; re-appending it
+	/// would only grow the state history.
+	AlreadyApplied,
+	/// The vtxo is in an allowed old state and must be moved.
+	Apply,
+}
+
+/// Fetch `vtxo_id` and decide whether it may move to `new_state`.
+///
+/// A vtxo that already carries `new_state` is accepted regardless of
+/// `allowed_states`, so repeating a transition is a no-op rather than an
+/// error. Any other vtxo must currently be in one of `allowed_states`.
 async fn get_check_vtxo_state<S: StorageAdaptor>(
 	adaptor: &S,
 	vtxo_id: VtxoId,
+	new_state: &VtxoState,
 	allowed_states: &[VtxoStateKind],
-) -> anyhow::Result<SerdeVtxo> {
+) -> anyhow::Result<(SerdeVtxo, StateTransition)> {
 	let vtxo = get_vtxo(adaptor, vtxo_id).await?
 		.context("vtxo not found")?;
 
 	let current_state = vtxo.current_state().context("vtxo has no state")?;
-	if !allowed_states.contains(&current_state.kind()) {
+	let transition = if current_state == new_state {
+		StateTransition::AlreadyApplied
+	} else if allowed_states.contains(&current_state.kind()) {
+		StateTransition::Apply
+	} else {
 		bail!("current state {:?} not in allowed states {:?}",
 			current_state.kind(), allowed_states
 		);
-	}
+	};
 
-	Ok(vtxo)
+	Ok((vtxo, transition))
 }
 
 async fn update_vtxo_state_checked<S: StorageAdaptor>(
@@ -328,23 +405,26 @@ async fn update_vtxo_state_checked<S: StorageAdaptor>(
 	new_state: VtxoState,
 	allowed_old_states: &[VtxoStateKind],
 ) -> anyhow::Result<WalletVtxo> {
-	let mut serde_vtxo = get_check_vtxo_state(adaptor, vtxo_id, allowed_old_states).await?;
+	let (mut serde_vtxo, transition) =
+		get_check_vtxo_state(adaptor, vtxo_id, &new_state, allowed_old_states).await?;
 
-	let sk = sort::vtxo_sort_key(
-		new_state.kind(), serde_vtxo.vtxo.expiry_height(), serde_vtxo.vtxo.amount()
-	);
+	if let StateTransition::Apply = transition {
+		let sk = sort::vtxo_sort_key(
+			new_state.kind(), serde_vtxo.vtxo.expiry_height().to_u32(), serde_vtxo.vtxo.amount()
+		);
 
-	serde_vtxo.states.push(new_state.clone());
-	let updated_record = Record::from_data(
-		partition::VTXO,
-		&vtxo_id.to_bytes(),
-		Some(sk),
-		&serde_vtxo,
-	)?;
+		serde_vtxo.states.push(new_state.clone());
+		let updated_record = Record::from_data(
+			partition::VTXO,
+			&vtxo_id.to_bytes(),
+			Some(sk),
+			&serde_vtxo,
+		)?;
 
-	adaptor.put(updated_record).await?;
+		adaptor.put(updated_record).await?;
+	}
 
-	Ok(wallet_vtxo_from_full(&serde_vtxo.vtxo, new_state))
+	Ok(wallet_vtxo_from_full(&serde_vtxo.vtxo, new_state, serde_vtxo.registered))
 }
 
 pub struct StorageAdaptorWrapper<S: StorageAdaptor> {
@@ -433,6 +513,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		status: MovementStatus,
 		subsystem: &MovementSubsystem,
 		time: DateTime<Local>,
+		action_id: Option<&str>,
 	) -> anyhow::Result<MovementId> {
 		let mut lock = self.inner.write().await;
 
@@ -447,42 +528,56 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		)?;
 		lock.put(record).await?;
 
+		// Index by owning action so the movement can be reused on re-drive.
+		if let Some(action_id) = action_id {
+			let idx = Record::from_data(
+				partition::MOVEMENT_ACTION,
+				action_id.as_bytes(),
+				None,
+				&id.0,
+			)?;
+			lock.put(idx).await?;
+		}
+
 		Ok(id)
+	}
+
+	async fn get_or_create_movement_for_action(
+		&self,
+		subsystem: &MovementSubsystem,
+		time: DateTime<Local>,
+		action_id: &str,
+		update: MovementUpdate,
+	) -> anyhow::Result<(MovementId, bool)> {
+		let mut guard = self.inner.write().await;
+
+		// Reuse the movement already owned by this action, if any.
+		if let Some(rec) = guard.get(partition::MOVEMENT_ACTION, action_id.as_bytes()).await? {
+			let id = MovementId::new(
+				rec.to_data::<u32>().context("corrupt db: movement action index value")?);
+			return Ok((id, false));
+		}
+
+		let id = MovementId(guard.incremental_id(partition::MOVEMENT).await?);
+		let mut movement = Movement::new(id, MovementStatus::Pending, subsystem, time);
+		update.apply_to(&mut movement, time);
+		write_movement_records(&mut *guard, &movement).await?;
+
+		// Index by owning action so the movement can be reused on re-drive.
+		let idx = Record::from_data(
+			partition::MOVEMENT_ACTION,
+			action_id.as_bytes(),
+			None,
+			&id.0,
+		)?;
+		guard.put(idx).await?;
+
+		Ok((id, true))
 	}
 
 	async fn update_movement(&self, movement: &Movement) -> anyhow::Result<()> {
 		let mut guard = self.inner.write().await;
-
-		let record = Record::from_data(
-			partition::MOVEMENT,
-			&movement.id.to_bytes(),
-			Some(sort::movement_sort_key(&movement.time.created_at)),
-			movement,
-		)?;
-		guard.put(record).await?;
-
-		// then add records for each payment method
-		let sent = movement.sent_to.iter().map(|d| &d.destination);
-		let rcvd = movement.received_on.iter().map(|d| &d.destination);
-		for pm in sent.chain(rcvd) {
-			let pm_bytes = serialize_payment_method(pm);
-			let primary_key = {
-				// We just need a unique key, but we will never query using this
-				let mut buf = Vec::with_capacity(pm_bytes.len() + 4);
-				buf.extend(pm_bytes.iter().copied());
-				buf.extend(movement.id.to_bytes());
-				buf
-			};
-			let record = Record::from_data(
-				partition::MOVEMENT_PAYMENT_METHOD,
-				&primary_key,
-				Some(SortKey::from_bytes(pm_bytes)),
-				&movement.id.0,
-			)?;
-			guard.put(record).await?;
-		}
-
-		Ok(())
+		write_movement_records(&mut *guard, movement).await
 	}
 
 	async fn get_movement_by_id(&self, movement_id: MovementId) -> anyhow::Result<Movement> {
@@ -526,79 +621,10 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		Ok(ret)
 	}
 
-	async fn store_pending_board(
-		&self,
-		vtxo: &Vtxo<Full>,
-		funding_tx: &Transaction,
-		movement_id: MovementId,
-	) -> anyhow::Result<()> {
-		let pending_board = PendingBoard {
-			vtxos: vec![vtxo.id()],
-			amount: vtxo.amount(),
-			funding_tx: funding_tx.clone(),
-			movement_id,
-		};
-
-		let record = Record::from_data(
-			partition::PENDING_BOARD,
-			&vtxo.id().to_bytes(),
-			None,
-			&pending_board,
-		)?;
-
-		self.inner.write().await.put(record).await
-	}
-
-	async fn remove_pending_board(&self, vtxo_id: &VtxoId) -> anyhow::Result<()> {
-		self.inner.write().await.delete(partition::PENDING_BOARD, &vtxo_id.to_bytes()).await?;
-		Ok(())
-	}
-
-	async fn get_all_pending_board_ids(&self) -> anyhow::Result<Vec<VtxoId>> {
-		let records = self.inner.read().await.get_all(partition::PENDING_BOARD).await?;
-		records
-			.into_iter()
-			.map(|r| {
-				let board = r.to_data::<PendingBoard>()?;
-				Ok(board.vtxos.into_iter().next().context("empty vtxos")?)
-			})
-			.collect()
-	}
-
-	async fn get_pending_board_by_vtxo_id(
-		&self,
-		vtxo_id: VtxoId,
-	) -> anyhow::Result<Option<PendingBoard>> {
-		match self.inner.read().await.get(partition::PENDING_BOARD, &vtxo_id.to_bytes()).await? {
-			Some(record) => Ok(Some(record.to_data()?)),
-			None => Ok(None),
-		}
-	}
-
-	async fn store_round_state_lock_vtxos(
-		&self,
-		round_state: &RoundState,
-	) -> anyhow::Result<RoundStateId> {
+	async fn store_round_state(&self, round_state: &RoundState) -> anyhow::Result<RoundStateId> {
 		let mut lock = self.inner.write().await;
 
 		let id = RoundStateId(lock.incremental_id(partition::ROUND_STATE).await?);
-
-		let allowed_states = &[VtxoStateKind::Spendable];
-
-		// First check that the inputs are spendable
-		for vtxo in round_state.participation().inputs.iter() {
-			get_check_vtxo_state(&mut *lock, vtxo.id(), allowed_states).await?;
-		}
-
-		for vtxo in round_state.participation().inputs.iter() {
-			update_vtxo_state_checked(
-				&mut *lock,
-				vtxo.id(),
-				VtxoState::Locked { movement_id: round_state.movement_id },
-				allowed_states,
-			).await?;
-		}
-
 		let serde_state = SerdeRoundState::from(round_state);
 		let record = Record::from_data(
 			partition::ROUND_STATE,
@@ -660,10 +686,11 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			let serde_vtxo = SerdeVtxo {
 				vtxo: (*vtxo).clone(),
 				states: vec![(*state).clone()],
+				registered: false,
 			};
 
 			let sk = sort::vtxo_sort_key(
-				state.kind(), vtxo.expiry_height(), vtxo.amount(),
+				state.kind(), vtxo.expiry_height().to_u32(), vtxo.amount(),
 			);
 			let record = Record::from_data(
 				partition::VTXO,
@@ -682,10 +709,27 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			Some(serde_vtxo) => {
 				let state = serde_vtxo.current_state()
 					.context("vtxo has no state")?.clone();
-				Ok(Some(wallet_vtxo_from_full(&serde_vtxo.vtxo, state)))
+				Ok(Some(wallet_vtxo_from_full(
+					&serde_vtxo.vtxo, state, serde_vtxo.registered,
+				)))
 			},
 			None => Ok(None),
 		}
+	}
+
+	async fn get_wallet_vtxos(&self, ids: &[VtxoId]) -> anyhow::Result<Vec<WalletVtxo>> {
+		let lock = self.inner.read().await;
+		let mut out = Vec::with_capacity(ids.len());
+		for id in ids {
+			let serde_vtxo = get_vtxo(&*lock, *id).await?
+				.with_context(|| format!("vtxo {id} not found"))?;
+			let state = serde_vtxo.current_state()
+				.context("vtxo has no state")?.clone();
+			out.push(wallet_vtxo_from_full(
+				&serde_vtxo.vtxo, state, serde_vtxo.registered,
+			));
+		}
+		Ok(out)
 	}
 
 	async fn get_all_vtxos(&self) -> anyhow::Result<Vec<WalletVtxo>> {
@@ -700,7 +744,9 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 					.current_state()
 					.cloned()
 					.context("vtxo has no state")?;
-				Ok(wallet_vtxo_from_full(&serde_vtxo.vtxo, state))
+				Ok(wallet_vtxo_from_full(
+					&serde_vtxo.vtxo, state, serde_vtxo.registered,
+				))
 			})
 			.collect()
 	}
@@ -727,9 +773,19 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 				let current_state = serde_vtxo.current_state()
 					.context("vtxo has no current state")?.clone();
 				debug_assert_eq!(current_state.kind(), *state);
-				records.push(wallet_vtxo_from_full(&serde_vtxo.vtxo, current_state));
+				records.push(wallet_vtxo_from_full(
+					&serde_vtxo.vtxo, current_state, serde_vtxo.registered,
+				));
 			}
 		}
+
+		// Each per-state range comes back in sort-key order, but
+		// concatenating the ranges groups results by state. Re-sort to the
+		// order the trait documents: expiry height ASC, amount DESC.
+		records.sort_by(|a, b| {
+			a.vtxo.expiry_height().cmp(&b.vtxo.expiry_height())
+				.then(b.vtxo.amount().cmp(&a.vtxo.amount()))
+		});
 
 		Ok(records)
 	}
@@ -772,6 +828,103 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 	) -> anyhow::Result<WalletVtxo> {
 		let mut lock = self.inner.write().await;
 		update_vtxo_state_checked(&mut *lock, vtxo_id, new_state, allowed_old_states).await
+	}
+
+	async fn release_vtxo_lock(
+		&self,
+		vtxo_id: VtxoId,
+		holder: Option<&VtxoLockHolder>,
+	) -> anyhow::Result<()> {
+		let mut lock = self.inner.write().await;
+		let Some(mut serde_vtxo) = get_vtxo(&*lock, vtxo_id).await? else {
+			return Ok(());
+		};
+		let expected = VtxoState::Locked { holder: holder.cloned() };
+		let current_state = serde_vtxo.current_state()
+			.context("vtxo has no state")?;
+		if current_state != &expected {
+			return Ok(());
+		}
+		let new_state = VtxoState::Spendable;
+		let sk = sort::vtxo_sort_key(
+			new_state.kind(), serde_vtxo.vtxo.expiry_height().to_u32(), serde_vtxo.vtxo.amount(),
+		);
+		serde_vtxo.states.push(new_state);
+		let updated_record = Record::from_data(
+			partition::VTXO,
+			&vtxo_id.to_bytes(),
+			Some(sk),
+			&serde_vtxo,
+		)?;
+		lock.put(updated_record).await?;
+		Ok(())
+	}
+
+	async fn update_vtxo_states_checked(
+		&self,
+		vtxo_ids: &[VtxoId],
+		new_state: VtxoState,
+		allowed_old_states: &[VtxoStateKind],
+	) -> anyhow::Result<()> {
+		let mut lock = self.inner.write().await;
+		// Validate every vtxo before mutating anything, so a state-kind
+		// mismatch can't leave the batch half-applied. Concurrent batches
+		// are serialized by the write lock above. Storage errors during
+		// the put loop cannot be rolled back from here — that is a
+		// fundamental limitation of the adaptor.
+		for id in vtxo_ids {
+			get_check_vtxo_state(&*lock, *id, &new_state, allowed_old_states).await?;
+		}
+		for id in vtxo_ids {
+			update_vtxo_state_checked(&mut *lock, *id, new_state.clone(), allowed_old_states).await?;
+		}
+		Ok(())
+	}
+
+	async fn mark_vtxos_registered(&self, vtxo_ids: &[VtxoId]) -> anyhow::Result<()> {
+		let mut lock = self.inner.write().await;
+		for id in vtxo_ids {
+			let mut serde_vtxo = get_vtxo(&*lock, *id).await?
+				.with_context(|| format!("vtxo {id} not found"))?;
+			if serde_vtxo.registered {
+				continue;
+			}
+			serde_vtxo.registered = true;
+
+			// Keep the record's sort key unchanged: it is derived from the
+			// current state, which this update doesn't touch.
+			let state = serde_vtxo.current_state().context("vtxo has no state")?;
+			let sk = sort::vtxo_sort_key(
+				state.kind(), serde_vtxo.vtxo.expiry_height().to_u32(), serde_vtxo.vtxo.amount(),
+			);
+			let record = Record::from_data(
+				partition::VTXO,
+				&id.to_bytes(),
+				Some(sk),
+				&serde_vtxo,
+			)?;
+			lock.put(record).await?;
+		}
+		Ok(())
+	}
+
+	async fn get_unregistered_vtxo_ids(&self) -> anyhow::Result<Vec<VtxoId>> {
+		let records = self.inner.read().await
+			.query_sorted(Query::new_full_range(partition::VTXO)).await?;
+
+		let mut ids = Vec::new();
+		for record in records {
+			let serde_vtxo = record.to_data::<SerdeVtxo>()?;
+			if serde_vtxo.registered {
+				continue;
+			}
+			let state = serde_vtxo.current_state()
+				.context("vtxo has no state")?;
+			if state.kind() != VtxoStateKind::Spent {
+				ids.push(serde_vtxo.vtxo.id());
+			}
+		}
+		Ok(ids)
 	}
 
 	async fn store_vtxo_key(&self, index: u32, public_key: PublicKey) -> anyhow::Result<()> {
@@ -832,250 +985,117 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		Ok(())
 	}
 
-	async fn store_new_pending_lightning_send(
+	async fn upsert_wallet_action_checkpoint(
 		&self,
-		invoice: &Invoice,
-		amount: Amount,
-		fee: Amount,
-		vtxo_ids: &[VtxoId],
-		movement_id: MovementId,
-	) -> anyhow::Result<LightningSend> {
-		let mut lock = self.inner.write().await;
-		let mut htlc_vtxos = Vec::with_capacity(vtxo_ids.len());
-		for vtxo_id in vtxo_ids {
-			let vtxo = get_vtxo(&*lock, *vtxo_id).await?
-				.context("vtxo not found")?;
-			htlc_vtxos.push(vtxo.to_wallet_vtxo()?);
-		}
-
-		let lightning_send = LightningSend {
-			invoice: invoice.clone(),
-			amount,
-			fee,
-			htlc_vtxos,
-			preimage: None,
-			movement_id,
-			finished_at: None,
-		};
-
-		let record = Record::from_data(
-			partition::LIGHTNING_SEND,
-			&invoice.payment_hash().to_byte_array(),
-			None,
-			&lightning_send,
-		)?;
-
-		lock.put(record).await?;
-
-		Ok(lightning_send)
-	}
-
-	async fn get_all_pending_lightning_send(&self) -> anyhow::Result<Vec<LightningSend>> {
-		let records = self.inner.read().await
-			.get_all(partition::LIGHTNING_SEND).await?;
-		records
-			.into_iter()
-			.filter_map(|r| {
-				let send = r.to_data::<LightningSend>().ok()?;
-				if send.finished_at.is_none() {
-					Some(Ok(send))
-				} else {
-					None
-				}
-			})
-			.collect()
-	}
-
-	async fn finish_lightning_send(
-		&self,
-		payment_hash: PaymentHash,
-		preimage: Option<Preimage>,
+		id: &WalletActionId,
+		checkpoint: &WalletActionCheckpoint,
 	) -> anyhow::Result<()> {
-		let mut lock = self.inner.write().await;
-
-		let pk = payment_hash.to_byte_array();
-		let record = lock
-			.get(partition::LIGHTNING_SEND, &pk).await?.context("lightning send not found")?;
-		let mut lightning_send: LightningSend = record.to_data()?;
-
-		lightning_send.preimage = preimage;
-		lightning_send.finished_at = Some(Local::now());
-
-		let updated_record = Record::from_data(
-			partition::LIGHTNING_SEND,
-			&pk,
+		let record = Record::from_data(
+			partition::WALLET_ACTION_CHECKPOINT,
+			id.as_bytes(),
 			None,
-			&lightning_send,
+			checkpoint,
 		)?;
-		lock.put(updated_record).await?;
-
-		Ok(())
+		self.inner.write().await.put(record).await
 	}
 
-	async fn remove_lightning_send(&self, payment_hash: PaymentHash) -> anyhow::Result<()> {
-		self.inner.write().await.delete(partition::LIGHTNING_SEND, &payment_hash.to_byte_array()).await?;
-		Ok(())
-	}
-
-	async fn get_lightning_send(
+	async fn get_wallet_action_checkpoint(
 		&self,
-		payment_hash: PaymentHash,
-	) -> anyhow::Result<Option<LightningSend>> {
+		id: &WalletActionId,
+	) -> anyhow::Result<Option<WalletActionCheckpoint>> {
 		match self.inner.read().await
-			.get(partition::LIGHTNING_SEND, &payment_hash.to_byte_array()).await?
+			.get(partition::WALLET_ACTION_CHECKPOINT, id.as_bytes()).await?
 		{
 			Some(record) => Ok(Some(record.to_data()?)),
 			None => Ok(None),
 		}
 	}
 
-	async fn store_lightning_receive(
+	async fn get_all_wallet_action_checkpoints(
+		&self,
+	) -> anyhow::Result<Vec<WalletActionCheckpoint>> {
+		let records = self.inner.read().await
+			.get_all(partition::WALLET_ACTION_CHECKPOINT).await?;
+		records.into_iter().map(|r| r.to_data()).collect()
+	}
+
+	async fn remove_wallet_action_checkpoint(
+		&self,
+		id: &WalletActionId,
+	) -> anyhow::Result<()> {
+		self.inner.write().await
+			.delete(partition::WALLET_ACTION_CHECKPOINT, id.as_bytes()).await?;
+		Ok(())
+	}
+
+	async fn record_paid_invoice(
+		&self,
+		payment_hash: PaymentHash,
+		preimage: Preimage,
+	) -> anyhow::Result<()> {
+		let key = payment_hash.to_byte_array();
+		// Idempotent: preserve the original paid_at across retries.
+		let mut lock = self.inner.write().await;
+		if lock.get(partition::PAID_INVOICE, &key).await?.is_some() {
+			return Ok(());
+		}
+		let paid = PaidInvoice {
+			payment_hash,
+			preimage,
+			paid_at: chrono::Local::now(),
+		};
+		let record = Record::from_data(partition::PAID_INVOICE, &key, None, &paid)?;
+		lock.put(record).await
+	}
+
+	async fn get_paid_invoice(
+		&self,
+		payment_hash: PaymentHash,
+	) -> anyhow::Result<Option<PaidInvoice>> {
+		match self.inner.read().await
+			.get(partition::PAID_INVOICE, &payment_hash.to_byte_array()).await?
+		{
+			Some(record) => Ok(Some(record.to_data()?)),
+			None => Ok(None),
+		}
+	}
+
+	async fn record_settled_lightning_receive(
 		&self,
 		payment_hash: PaymentHash,
 		preimage: Preimage,
 		invoice: &Bolt11Invoice,
-		htlc_recv_cltv_delta: BlockDelta,
+		amount: Amount,
 	) -> anyhow::Result<()> {
-		let lightning_receive = LightningReceive {
-			payment_hash,
-			payment_preimage: preimage,
-			invoice: invoice.clone(),
-			htlc_recv_cltv_delta,
-			htlc_vtxos: vec![],
-			movement_id: None,
-			finished_at: None,
-			preimage_revealed_at: None,
-		};
+		let key = payment_hash.to_byte_array();
 
-		let record = Record::from_data(
-			partition::LIGHTNING_RECEIVE,
-			&payment_hash.to_byte_array(),
-			None,
-			&lightning_receive,
-		)?;
-		self.inner.write().await.put(record).await
-	}
-
-	async fn get_all_pending_lightning_receives(&self) -> anyhow::Result<Vec<LightningReceive>> {
-		let records = self.inner.read().await
-			.get_all(partition::LIGHTNING_RECEIVE).await?;
-		records
-			.into_iter()
-			.filter_map(|r| {
-				let receive = r.to_data::<LightningReceive>().ok()?;
-				if receive.finished_at.is_none() {
-					Some(Ok(receive))
-				} else {
-					None
-				}
-			})
-			.collect()
-	}
-
-	async fn set_preimage_revealed(&self, payment_hash: PaymentHash) -> anyhow::Result<()> {
 		let mut lock = self.inner.write().await;
-
-		let pk = payment_hash.to_byte_array();
-		let record = lock.get(partition::LIGHTNING_RECEIVE, &pk).await?
-			.context("lightning receive not found")?;
-		let mut lightning_receive: LightningReceive = record.to_data()?;
-
-		lightning_receive.preimage_revealed_at = Some(Local::now());
-
-		let updated_record = Record::from_data(
-			partition::LIGHTNING_RECEIVE,
-			&pk,
-			None,
-			&lightning_receive,
-		)?;
-		lock.put(updated_record).await
-	}
-
-	async fn update_lightning_receive(
-		&self,
-		payment_hash: PaymentHash,
-		vtxo_ids: &[VtxoId],
-		movement_id: MovementId,
-	) -> anyhow::Result<()> {
-		let mut lock = self.inner.write().await;
-		let pk = payment_hash.to_byte_array();
-		let record = lock.get(partition::LIGHTNING_RECEIVE, &pk).await?
-			.context("lightning receive not found")?;
-		let mut lightning_receive: LightningReceive = record.to_data()?;
-
-		let mut htlc_vtxos = Vec::with_capacity(vtxo_ids.len());
-		for vtxo_id in vtxo_ids {
-			let vtxo = get_vtxo(&*lock, *vtxo_id).await?
-				.context("vtxo not found")?;
-			htlc_vtxos.push(vtxo.to_wallet_vtxo()?);
+		if lock.get(partition::SETTLED_LIGHTNING_RECEIVE, &key).await?.is_some() {
+			return Ok(());
 		}
-
-		lightning_receive.htlc_vtxos = htlc_vtxos;
-		lightning_receive.movement_id = Some(movement_id);
-
-		let updated_record = Record::from_data(
-			partition::LIGHTNING_RECEIVE,
-			&pk,
-			None,
-			&lightning_receive,
-		)?;
-		lock.put(updated_record).await
+		let settled = SettledLightningReceive {
+			payment_hash,
+			preimage,
+			invoice: invoice.clone(),
+			amount,
+			settled_at: chrono::Local::now(),
+		};
+		let record = Record::from_data(partition::SETTLED_LIGHTNING_RECEIVE, &key, None, &settled)?;
+		lock.put(record).await
 	}
 
-	async fn fetch_lightning_receive_by_payment_hash(
+	async fn get_settled_lightning_receive(
 		&self,
 		payment_hash: PaymentHash,
-	) -> anyhow::Result<Option<LightningReceive>> {
+	) -> anyhow::Result<Option<SettledLightningReceive>> {
 		match self.inner.read().await
-			.get(partition::LIGHTNING_RECEIVE, &payment_hash.to_byte_array()).await?
+			.get(partition::SETTLED_LIGHTNING_RECEIVE, &payment_hash.to_byte_array()).await?
 		{
 			Some(record) => Ok(Some(record.to_data()?)),
 			None => Ok(None),
 		}
 	}
 
-	async fn finish_pending_lightning_receive(
-		&self,
-		payment_hash: PaymentHash,
-	) -> anyhow::Result<()> {
-		let mut lock = self.inner.write().await;
-		let pk = payment_hash.to_byte_array();
-		let record = lock.get(partition::LIGHTNING_RECEIVE, &pk).await?
-			.context("lightning receive not found")?;
-		let mut lightning_receive: LightningReceive = record.to_data()?;
-
-		lightning_receive.finished_at = Some(Local::now());
-
-		let updated_record = Record::from_data(
-			partition::LIGHTNING_RECEIVE,
-			&pk,
-			None,
-			&lightning_receive,
-		)?;
-		lock.put(updated_record).await
-	}
-
-	async fn store_pending_offboard(&self, pending: &PendingOffboard) -> anyhow::Result<()> {
-		let record = Record::from_data(
-			partition::PENDING_OFFBOARD,
-			&pending.movement_id.to_bytes(),
-			None,
-			pending,
-		)?;
-		self.inner.write().await.put(record).await
-	}
-
-	async fn get_pending_offboards(&self) -> anyhow::Result<Vec<PendingOffboard>> {
-		let records = self.inner.read().await
-			.get_all(partition::PENDING_OFFBOARD).await?;
-		records.into_iter().map(|r| r.to_data()).collect()
-	}
-
-	async fn remove_pending_offboard(&self, movement_id: MovementId) -> anyhow::Result<()> {
-		self.inner.write().await
-			.delete(partition::PENDING_OFFBOARD, &movement_id.to_bytes()).await?;
-		Ok(())
-	}
 
 	async fn store_exit_vtxo_entry(&self, exit: &StoredExit) -> anyhow::Result<()> {
 		let record = Record::from_data(
@@ -1095,6 +1115,26 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 	async fn get_exit_vtxo_entries(&self) -> anyhow::Result<Vec<StoredExit>> {
 		let records = self.inner.read().await.get_all(partition::EXIT_VTXO).await?;
 		records.into_iter().map(|r| r.to_data()).collect()
+	}
+
+	async fn get_exit_vtxo_entries_with_states(
+		&self,
+		states: &[ExitStateKind],
+	) -> anyhow::Result<Vec<StoredExit>> {
+		// The state lives inside the serialized record and adaptors only key by primary/sort key,
+		// so there's no filter to push down — read the partition and filter here.
+		let records = self.inner.read().await.get_all(partition::EXIT_VTXO).await?;
+		records.into_iter()
+			.map(|r| r.to_data::<StoredExit>())
+			.filter(|e| e.as_ref().map_or(true, |e| states.contains(&e.state.kind())))
+			.collect()
+	}
+
+	async fn get_exit_vtxo_entry(&self, id: &VtxoId) -> anyhow::Result<Option<StoredExit>> {
+		match self.inner.read().await.get(partition::EXIT_VTXO, &id.to_bytes()).await? {
+			Some(record) => Ok(Some(record.to_data::<StoredExit>()?)),
+			None => Ok(None),
+		}
 	}
 
 	async fn store_exit_child_tx(
@@ -1135,6 +1175,8 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::persist::adaptor::memory::MemoryStorageAdaptor;
+	use crate::persist::test_suite::bark_persister_tests;
 
 	#[test]
 	fn storage_query_builder() {
@@ -1144,6 +1186,12 @@ mod tests {
 		assert_eq!(query.limit, Some(10));
 		assert_eq!(query.range, ..);
 	}
+
+	async fn setup(_test: &str) -> ((), StorageAdaptorWrapper<MemoryStorageAdaptor>) {
+		((), StorageAdaptorWrapper::new(MemoryStorageAdaptor::new()))
+	}
+
+	bark_persister_tests!(setup);
 }
 
 /// This module provides comprehensive tests for all four methods of the
@@ -2072,3 +2120,4 @@ pub mod test_suite {
 		assert!(!has_deleted, "deleted record should not appear");
 	}
 }
+

@@ -34,6 +34,27 @@ pub struct OnchainFeeRates {
 	pub slow: FeeRate,
 }
 
+impl OnchainFeeRates {
+	/// Apply a max fee rate to all rates
+	pub fn clamp(&mut self, max_fee_rate: FeeRate) {
+		*self = OnchainFeeRates {
+			fast: self.fast.min(max_fee_rate),
+			regular: self.regular.min(max_fee_rate),
+			slow: self.slow.min(max_fee_rate),
+		};
+	}
+}
+
+/// Why a client-supplied offboard fee rate was rejected by
+/// [FeeEstimator::check_offboard_fee_rate].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffboardFeeRateError {
+	/// Above every regular rate seen within the history window.
+	TooHigh,
+	/// Below the slow target, so the offboard tx could not confirm.
+	TooLow,
+}
+
 /// Configuration for the fee estimator process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +75,13 @@ pub struct Config {
 	/// Fallback fee rate for slow transactions when estimation fails.
 	#[serde(with = "crate::utils::serde::fee_rate")]
 	pub fallback_fee_rate_slow: FeeRate,
+	/// Optional ceiling applied to every fetched fee rate.
+	///
+	/// If the backend returns a rate above this value (e.g. due to a bad
+	/// mempool spike), it is clamped down to this maximum instead of being
+	/// used verbatim.  Leave unset to impose no ceiling.
+	#[serde(default, with = "crate::utils::serde::fee_rate::opt")]
+	pub max_fee_rate: Option<FeeRate>,
 }
 
 impl Config {
@@ -73,13 +101,18 @@ impl Config {
 pub struct FeeEstimator {
 	fee_rates: parking_lot::RwLock<VecDeque<(OnchainFeeRates, Instant)>>,
 	history_duration: Duration,
+	max_fee_rate: Option<FeeRate>,
 }
 
 impl FeeEstimator {
-	fn new(initial: OnchainFeeRates, history_duration: Duration) -> Self {
+	fn new(
+		initial: OnchainFeeRates,
+		history_duration: Duration,
+		max_fee_rate: Option<FeeRate>,
+	) -> Self {
 		Self {
 			fee_rates: parking_lot::RwLock::new([(initial, Instant::now())].into()),
-			history_duration,
+			history_duration, max_fee_rate,
 		}
 	}
 
@@ -128,6 +161,28 @@ impl FeeEstimator {
 		self.is_historical_rate(fee_rate, duration, |rates| rates.slow)
 	}
 
+	/// Validate a client-supplied offboard fee rate.
+	///
+	/// The client picks the rate the offboard tx is built at and the
+	/// server can't RBF it (the forfeit commits to the txid), so the
+	/// rate must be recent (at or below a regular rate seen within
+	/// `duration`) and at least the current slow target so the tx can
+	/// still confirm. The slow floor tracks the network, so honest
+	/// clients on a quiet mempool still pass.
+	pub fn check_offboard_fee_rate(
+		&self,
+		fee_rate: FeeRate,
+		duration: Duration,
+	) -> Result<(), OffboardFeeRateError> {
+		if !self.is_historical_regular_rate(fee_rate, duration) {
+			return Err(OffboardFeeRateError::TooHigh);
+		}
+		if fee_rate < self.slow() {
+			return Err(OffboardFeeRateError::TooLow);
+		}
+		Ok(())
+	}
+
 	fn get_current_rates(&self) -> OnchainFeeRates {
 		self.fee_rates.read().front().expect("FeeEstimator is not initialized yet").0
 	}
@@ -149,12 +204,17 @@ impl FeeEstimator {
 		false
 	}
 
-	fn update(&self, rates: OnchainFeeRates) {
+	fn update(&self, mut rates: OnchainFeeRates) {
+		if let Some(max) = self.max_fee_rate {
+			rates.clamp(max);
+		}
+
 		let mut deque = self.fee_rates.write();
 		let now = Instant::now();
 		while deque.back().is_some_and(|(_, timestamp)| now - *timestamp >= self.history_duration) {
 			deque.pop_back();
 		}
+
 		deque.push_front((rates, Instant::now()));
 	}
 }
@@ -193,22 +253,41 @@ impl Process {
 			Ok(rates) => (rates, false),
 			Err(e) => {
 				slog!(FeeEstimateFallback, err: e.to_string());
-				let rates = self.config.fallback_fee_rates();
-				self.fee_estimator.update(rates);
 				(self.config.fallback_fee_rates(), true)
 			}
 		};
 
+		// grab the latest and then update
+		let latest = self.fee_estimator.fee_rates.read().front().map(|(v, _)| v).cloned()
+			.unwrap_or(OnchainFeeRates {
+				fast: FeeRate::ZERO,
+				regular: FeeRate::ZERO,
+				slow: FeeRate::ZERO,
+			});
+		self.fee_estimator.update(rates);
+		let _ = rates;
+		let current = self.fee_estimator.fee_rates.read().front().unwrap().0;
+
 		// Convert sat/kwu to sat/vb: 1 vbyte = 4 weight units, so sat/vb = sat/kwu / 250
 		let to_sat_per_vb = |rate: FeeRate| rate.to_sat_per_kwu() as f64 / 250.0;
 		telemetry::set_fee_estimator_metrics(
-			to_sat_per_vb(rates.fast),
-			to_sat_per_vb(rates.regular),
-			to_sat_per_vb(rates.slow),
+			to_sat_per_vb(current.fast),
+			to_sat_per_vb(current.regular),
+			to_sat_per_vb(current.slow),
 			using_fallback,
 		);
 
-		self.fee_estimator.update(rates);
+		// Slog when the rates are updated
+		if latest != current {
+			slog!(FeeRatesUpdated,
+				new_fast: current.fast,
+				new_regular: current.regular,
+				new_slow: current.slow,
+				old_fast: latest.fast,
+				old_regular: latest.regular,
+				old_slow: latest.slow,
+			);
+		}
 	}
 
 	async fn fetch_fee_rates(&self) -> anyhow::Result<OnchainFeeRates> {
@@ -217,7 +296,7 @@ impl Process {
 				"estimatesmartfee",
 				&[
 					target.into(),
-					bcd::json_arg(rpc::json::EstimateMode::Conservative)?,
+					bcd::json_arg(rpc::json::EstimateMode::Economical)?,
 				],
 			).await?;
 			if let Some(fee_rate) = fee.fee_rate {
@@ -249,7 +328,7 @@ pub fn start(
 ) -> Arc<FeeEstimator> {
 	// Initialize with fallback rates
 	let fee_estimator = Arc::new(FeeEstimator::new(
-		config.fallback_fee_rates(), config.history_duration,
+		config.fallback_fee_rates(), config.history_duration, config.max_fee_rate,
 	));
 
 	let process = Process {
@@ -261,4 +340,53 @@ pub fn start(
 	tokio::spawn(process.run(rtmgr));
 
 	fee_estimator
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	fn rate(sat_per_vb: u64) -> FeeRate {
+		FeeRate::from_sat_per_vb(sat_per_vb).unwrap()
+	}
+
+	fn estimator(fast: u64, regular: u64, slow: u64) -> FeeEstimator {
+		FeeEstimator::new(
+			OnchainFeeRates { fast: rate(fast), regular: rate(regular), slow: rate(slow) },
+			Duration::from_secs(3600),
+			None,
+		)
+	}
+
+	#[test]
+	fn offboard_fee_rate_bounds() {
+		let est = estimator(10, 5, 2);
+		let d = Duration::from_secs(3600);
+
+		// Below the slow target is rejected: this is the drain vector.
+		assert_eq!(est.check_offboard_fee_rate(rate(1), d), Err(OffboardFeeRateError::TooLow));
+
+		// The slow target itself, and anything up to the regular rate, pass.
+		assert_eq!(est.check_offboard_fee_rate(rate(2), d), Ok(()));
+		assert_eq!(est.check_offboard_fee_rate(rate(3), d), Ok(()));
+		assert_eq!(est.check_offboard_fee_rate(rate(5), d), Ok(()));
+
+		// Above the regular rate is still rejected as too high.
+		assert_eq!(est.check_offboard_fee_rate(rate(6), d), Err(OffboardFeeRateError::TooHigh));
+	}
+
+	#[test]
+	fn offboard_floor_tracks_current_slow() {
+		// The floor is the current slow rate, not a historically low one:
+		// a rate that cleared yesterday's floor is rejected once the
+		// network moves up.
+		let est = estimator(10, 5, 2);
+		est.update(OnchainFeeRates { fast: rate(20), regular: rate(10), slow: rate(4) });
+		let d = Duration::from_secs(3600);
+
+		// 3 was >= the old slow (2) but is below the new slow (4).
+		assert_eq!(est.check_offboard_fee_rate(rate(3), d), Err(OffboardFeeRateError::TooLow));
+		// 4 meets the new floor and stays within a regular rate in history.
+		assert_eq!(est.check_offboard_fee_rate(rate(4), d), Ok(()));
+	}
 }

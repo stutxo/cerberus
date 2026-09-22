@@ -10,23 +10,27 @@ use ark::arkoor::state::{ServerCanCosign, ServerSigned};
 use ark::arkoor::package::{
 	ArkoorPackageCosignRequest, ArkoorPackageCosignResponse, ArkoorPackageBuilder,
 };
-use bitcoin_ext::P2TR_DUST;
 
+use crate::database::htlc_vtxo::{self, HtlcResolution};
 use crate::database::tree::VtxoTreeUpdate;
 use crate::error::ContextExt;
-use crate::Server;
+use crate::{check_max_amount, Server};
 
 pub(crate) struct ArkoorCosignRequestValidationParams {
 	/// whether checkpoints should be used
 	pub use_checkpoints: bool,
 	/// maximum number of outputs from a single input
 	pub max_outputs_per_input: usize,
-	/// Don't allow mixing dust and non-dust outputs when not necessary
-	pub disallow_unnecessary_dust: bool,
 	/// maximum allowed exit depth (genesis items) of each input VTXO;
 	/// requests where any input exceeds this are rejected to prevent
-	/// unbounded genesis chain growth
-	pub max_input_exit_depth: u16,
+	/// unbounded genesis chain growth.
+	///
+	/// `None` disables the check and is reserved for recovery operations
+	/// (lightning receive claims and payment revocations): they unwind an
+	/// existing contract into a single claim-all output, so they can't
+	/// grow a chain, while refusing them would leave the vtxo with no
+	/// spend path other than a unilateral exit.
+	pub max_input_exit_depth: Option<u16>,
 }
 
 impl Server {
@@ -62,13 +66,15 @@ impl Server {
 		};
 
 		for (idx, b) in ret.builders.iter().enumerate() {
-			let depth = b.input().exit_depth();
-			if depth >= params.max_input_exit_depth {
-				bail!(
-					"input VTXO {} (#{}) exit depth {} meets or exceeds the maximum of {}; \
-					 refresh the VTXO in a round before making further OOR payments",
-					b.input().id(), idx, depth, params.max_input_exit_depth,
-				);
+			if let Some(max_exit_depth) = params.max_input_exit_depth {
+				let depth = b.input().exit_depth();
+				if depth >= max_exit_depth {
+					bail!(
+						"input VTXO {} (#{}) exit depth {} meets or exceeds the maximum of {}; \
+						 refresh the VTXO in a round before making further OOR payments",
+						b.input().id(), idx, depth, max_exit_depth,
+					);
+				}
 			}
 
 			let nb_outputs = b.all_outputs().count();
@@ -77,43 +83,33 @@ impl Server {
 					b.input().id(), idx, nb_outputs, params.max_outputs_per_input,
 				);
 			}
-
-			if params.disallow_unnecessary_dust {
-				let non_dust_limit = P2TR_DUST * 2;
-				if b.normal_outputs().iter().any(|o| o.total_amount < P2TR_DUST)
-					&& b.normal_outputs().iter().any(|o| o.total_amount >= non_dust_limit)
-				{
-					bail!(
-						"invalid mix of dust and non-dust outputs for input {} (#{})",
-						b.input().id(), idx,
-					);
-				}
-
-				if b.isolated_outputs().iter().any(|o| o.total_amount < P2TR_DUST)
-					&& b.isolated_outputs().iter().any(|o| o.total_amount >= non_dust_limit)
-				{
-					bail!(
-						"invalid mix of dust and non-dust isolated outputs for input {} (#{})",
-						b.input().id(), idx,
-					);
-				}
-			}
 		}
 
 		Ok(ret)
 	}
 
+	/// Returns the signed builder along with the number of VTXO rows actually
+	/// inserted by the tree update. Callers gate retry-sensitive metrics on
+	/// this count: `> 0` means the inputs/outputs were freshly persisted,
+	/// `0` means the update collapsed onto an existing row (idempotent retry).
 	pub async fn cosign_oor_with_builder(
 		&self,
 		builder: ArkoorPackageBuilder<ServerCanCosign>,
-	) -> anyhow::Result<ArkoorPackageBuilder<ServerSigned>> {
+	) -> anyhow::Result<(ArkoorPackageBuilder<ServerSigned>, u64)> {
 		let vtxo_guard = self.vtxos_in_flux.try_lock(builder.input_ids()).map_err(|e| {
 			slog!(ArkoorInputAlreadyInFlux, vtxo: e.id);
 			badarg_err!("some VTXO is already locked by another process: {}", e.id)
 		})?;
 
-		// Check if the vtxo is not exited
-		self.check_vtxos_not_exited(builder.input_ids()).await?;
+		// The only cosign path that spends htlc-recv vtxos is the lightning
+		// receive claim, so cosigning their spend resolves them as fulfilled.
+		let claimed_htlc_recvs = builder.builders.iter()
+			.filter_map(|b| match b.input().policy() {
+				VtxoPolicy::ServerHtlcRecv(..) | VtxoPolicy::ServerHtlcRecv_v0(..) =>
+					Some(b.input().id()),
+				_ => None,
+			})
+			.collect::<Vec<_>>();
 
 		// Output user vtxos go in as `unregistered`. They become spendable
 		// once the sender uploads the signed transaction chain via
@@ -124,13 +120,19 @@ impl Server {
 			.insert_oor_spent_vtxos(builder.build_unsigned_internal_vtxos())
 			.insert_unregistered_vtxos(builder.build_unsigned_vtxos().map(ServerVtxo::from))
 			.mark_vtxos_oor_spent(builder.input_spend_info());
-		self.db.write(async |t| t.execute_vtxo_tree_update(update).await).await?;
+		let inserted = self.db.write(async |t| {
+			let inserted = t.execute_vtxo_tree_update(update).await?;
+			htlc_vtxo::set_htlc_vtxo_resolutions(
+				&t, &claimed_htlc_recvs, HtlcResolution::Fulfilled,
+			).await?;
+			Ok(inserted)
+		}).await?;
 		drop(vtxo_guard);
 
 		// Only now it's safe to sign
 		let builder = builder.server_cosign(self.server_key.leak_ref())
 			.context("failed to sign arkoor")?;
-		Ok(builder)
+		Ok((builder, inserted))
 	}
 
 	pub async fn cosign_oor(
@@ -140,22 +142,29 @@ impl Server {
 		let input_vtxo_ids = request.inputs().cloned().collect::<Vec<VtxoId>>();
 		let input_vtxo_states = self.db.read(async |t| t.get_user_vtxos_by_id(&input_vtxo_ids).await).await?;
 
-		// Validate policies
+		// Keep this even though check_spendable refuses htlc vtxos too: the
+		// idempotent-replay branch below skips it, this check always runs.
 		for v in &input_vtxo_states {
 			match v.vtxo.policy() {
 				VtxoPolicy::Pubkey( ..) => {},
-				VtxoPolicy::ServerHtlcSend( ..) => bail!("server htlc send vtxo not supported"),
-				VtxoPolicy::ServerHtlcRecv( ..) => bail!("server htlc recv vtxo not supported"),
+				VtxoPolicy::ServerHtlcSend(..) | VtxoPolicy::ServerHtlcSend_v0(..) => {
+					return badarg!("server htlc send vtxo not supported");
+				},
+				VtxoPolicy::ServerHtlcRecv( ..) | VtxoPolicy::ServerHtlcRecv_v0(..) => {
+					return badarg!("server htlc recv vtxo not supported");
+				},
 			}
 		}
 
+		let total_input_amount = input_vtxo_states.iter().map(|v| v.vtxo.amount()).sum();
 		let request = request.set_vtxos(input_vtxo_states.into_iter().map(|v| v.vtxo))?;
+
+		check_max_amount("arkoor send", total_input_amount, self.config.max_arkoor_amount)?;
 
 		let validation = ArkoorCosignRequestValidationParams {
 			use_checkpoints: true,
 			max_outputs_per_input: self.config.max_arkoor_fanout,
-			disallow_unnecessary_dust: true,
-			max_input_exit_depth: self.config.max_vtxo_exit_depth,
+			max_input_exit_depth: Some(self.config.max_vtxo_exit_depth),
 		};
 		let builder = self.validate_cosign_request(validation, request)
 			.badarg("invalid cosign request")?;
@@ -167,16 +176,35 @@ impl Server {
 		let spend_map: HashMap<VtxoId, Txid> = builder.spend_info().collect();
 		let input_vtxo_states = self.db.read(async |t| t.get_user_vtxos_by_id(&input_vtxo_ids).await).await?;
 		for v in &input_vtxo_states {
+			// An expired vtxo can only leave the Ark through a round or an
+			// offboard. Passing it on as an arkoor would hand the receiver
+			// a coin it cannot exit while the server can already sweep it.
+			if !self.config.allow_expired_arkoor && v.vtxo.expiry_height() <= chain_tip {
+				return badarg!("vtxo {} expired at height {} (tip = {})",
+					v.vtxo_id, v.vtxo.expiry_height(), chain_tip,
+				);
+			}
 			let spending_txid = spend_map.get(&v.vtxo_id)
 				.context("missing spend info for input vtxo")?;
 			v.check_spendable_for_oor(chain_tip, *spending_txid)?;
 		}
 
-		let builder = self.cosign_oor_with_builder(builder).await?;
+		let (builder, inserted) = self.cosign_oor_with_builder(builder).await?;
 
 		slog!(ArkoorCosign, input_ids: input_vtxo_ids,
 			output_ids: builder.build_unsigned_vtxos().into_iter().map(|v| v.id()).collect(),
+			amount: total_input_amount,
 		);
+
+		// inserted == 0 means the tree update collapsed onto rows that already
+		// exist — i.e. an idempotent retry of an already-cosigned arkoor.
+		// Counting again would double-count the payment metric.
+		if inserted > 0 {
+			let volume_sats = input_vtxo_states.iter()
+				.map(|v| v.vtxo.amount().to_sat())
+				.sum::<u64>();
+			crate::telemetry::add_arkoor_payment(volume_sats);
+		}
 
 		Ok(builder.cosign_response())
 	}

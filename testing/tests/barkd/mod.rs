@@ -1,9 +1,15 @@
+mod bip321;
 mod boards;
 mod core;
 mod exits;
 mod helpers;
+mod history;
+mod lifecycle;
 mod lightning;
+mod mnemonic;
 mod notifications;
 mod onchain;
+mod recovery;
 mod rounds;
+mod signmessage;
 mod vtxo;

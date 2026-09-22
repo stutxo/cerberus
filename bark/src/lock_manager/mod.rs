@@ -28,7 +28,7 @@
 //! | [`MemoryLockManager`](memory::MemoryLockManager)         |   ✓   |   ✓   |  ✓  |    ✓    |    ✓    |      ✓       |
 //! | [`FlockPidLockManager`](pid_flock::FlockPidLockManager)  |   ✓   |   ✓   |     |    ✓    |    ✓    |              |
 //! | [`FcntlPidLockManager`](pid_fcntl::FcntlPidLockManager)  |   ✓   |   ✓   |  ✓  |    ✓    |         |              |
-//! | [`WebLockManager`](web_locks::WebLockManager)            |       |       |     |         |         |      ✓       |
+//! | `WebLockManager`                                         |       |       |     |         |         |      ✓       |
 //!
 //! # Safety scope
 //!
@@ -63,7 +63,7 @@
 //!   datadir may live on networked storage. One OS-level lock on
 //!   `<datadir>/LOCK` guarantees single-process exclusivity; per-key
 //!   locking is in-memory.
-//! - **Web (wasm32)** — only [`WebLockManager`](web_locks::WebLockManager)
+//! - **Web (wasm32)** — only `WebLockManager`
 //!   (which delegates to `navigator.locks`) is available. Prevents
 //!   concurrent access across same-origin tabs in the same browser;
 //!   gives no guarantees across different browsers or incognito
@@ -89,7 +89,9 @@ pub mod pid_fcntl;
 
 use std::time::Duration;
 use std::path::PathBuf;
+
 use anyhow::bail;
+use bitcoin::bip32::Fingerprint;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -133,11 +135,12 @@ pub trait LockGuard: Send + Sync + std::fmt::Debug {}
 /// Acquire and release named locks.
 ///
 /// Implementations only need to provide [`try_lock`](Self::try_lock); the
-/// default [`lock`](Self::lock) polls it under a [`tokio::time::timeout`].
-#[async_trait::async_trait]
+/// default [`lock`](Self::lock) polls it under a [`bark_runtime::timeout`].
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait LockManager: Send + Sync + std::fmt::Debug {
 	/// Try to acquire the named lock without waiting. Returns `None` if
-	/// it is already held, the key is rejected by [`validate_key`], or
+	/// it is already held, the key is rejected by `validate_key`, or
 	/// the backend cannot acquire the lock for any other reason.
 	async fn try_lock(&self, key: &str) -> Option<Box<dyn LockGuard>>;
 
@@ -150,12 +153,12 @@ pub trait LockManager: Send + Sync + std::fmt::Debug {
 	async fn lock(&self, key: &str, timeout: Duration)
 		-> anyhow::Result<Box<dyn LockGuard>>
 	{
-		let result = tokio::time::timeout(timeout, async {
+		let result = bark_runtime::timeout(timeout, async {
 			loop {
 				if let Some(g) = self.try_lock(key).await {
 					return g;
 				}
-				tokio::time::sleep(POLL_INTERVAL).await;
+				bark_runtime::sleep(POLL_INTERVAL).await;
 			}
 		}).await;
 		match result {
@@ -167,8 +170,14 @@ pub trait LockManager: Send + Sync + std::fmt::Debug {
 
 /// Return the recommended [`LockManager`] backend for the current
 /// build target. Most platforms will result a `LockManager` that
-/// can only be instantiated once.
-pub fn platform_default(datadir: impl Into<PathBuf>) -> anyhow::Result<Box<dyn LockManager>> {
+/// can only be instantiated once per wallet.
+///
+/// UNIX and Windows platforms require datadir, wasm32 requires fingerprint.
+#[allow(unreachable_code)]
+pub fn platform_default(
+	datadir: Option<impl Into<PathBuf>>,
+	fingerprint: Option<Fingerprint>,
+) -> anyhow::Result<Box<dyn LockManager>> {
 	#[cfg(target_arch = "wasm32")]
 	{
 		// Use navigator.locks via WebLockManager. An in-memory variant
@@ -177,46 +186,60 @@ pub fn platform_default(datadir: impl Into<PathBuf>) -> anyhow::Result<Box<dyn L
 		// only cross-tab coordination primitive in the browser.
 		// `datadir` is ignored.
 		let _ = datadir;
-		return Ok(Box::new(web_locks::WebLockManager::new()));
+		let mgr = if let Some(fp) = fingerprint {
+			self::web_locks::WebLockManager::new_with_fingerprint(fp)
+		} else {
+			self::web_locks::WebLockManager::new()
+		};
+		return Ok(Box::new(mgr));
 	}
 
 	#[cfg(all(unix, not(target_arch = "wasm32")))]
 	{
-		// Use fcntl: it has wider support than flock across the unix
-		// family.
-		//
-		// We pick a PidLock variant over per-key fcntl files because:
-		// 1. It doesn't pollute the datadir with `<key>.lock` files.
-		// 2. It's faster — one OS-level lock at construction, then
-		//    in-memory locking per key (no syscall per try_lock).
-		// 3. It avoids cross-process footguns like notifications not
-		//    firing when a second process is doing the work.
-		return Ok(Box::new(pid_fcntl::FcntlPidLockManager::new(datadir)?));
+		let _ = fingerprint;
+		if let Some(datadir) = datadir {
+			// Use fcntl: it has wider support than flock across the unix
+			// family.
+			//
+			// We pick a PidLock variant over per-key fcntl files because:
+			// 1. It doesn't pollute the datadir with `<key>.lock` files.
+			// 2. It's faster — one OS-level lock at construction, then
+			//    in-memory locking per key (no syscall per try_lock).
+			// 3. It avoids cross-process footguns like notifications not
+			//    firing when a second process is doing the work.
+			//
+			return Ok(Box::new(self::pid_fcntl::FcntlPidLockManager::new(datadir)?));
+		} else {
+			return Ok(Box::new(self::memory::MemoryLockManager::new()));
+		}
 	}
 
 	#[cfg(all(windows, not(target_arch = "wasm32")))]
 	{
-		// Use std::fs::File::try_lock (LockFileEx under the hood):
-		// fcntl doesn't exist on Windows, and LockFileEx is the
-		// direct equivalent.
-		//
-		// We pick a PidLock variant over per-key file locks because:
-		// 1. It doesn't pollute the datadir with `<key>.lock` files.
-		// 2. It's faster — one OS-level lock at construction, then
-		//    in-memory locking per key (no syscall per try_lock).
-		// 3. It avoids cross-process footguns like notifications not
-		//    firing when a second process is doing the work.
-		return Ok(Box::new(pid_flock::FlockPidLockManager::new(datadir)?));
+		let _ = fingerprint;
+		if let Some(datadir) = datadir {
+			// Use std::fs::File::try_lock (LockFileEx under the hood):
+			// fcntl doesn't exist on Windows, and LockFileEx is the
+			// direct equivalent.
+			//
+			// We pick a PidLock variant over per-key file locks because:
+			// 1. It doesn't pollute the datadir with `<key>.lock` files.
+			// 2. It's faster — one OS-level lock at construction, then
+			//    in-memory locking per key (no syscall per try_lock).
+			// 3. It avoids cross-process footguns like notifications not
+			//    firing when a second process is doing the work.
+			return Ok(Box::new(self::pid_flock::FlockPidLockManager::new(datadir)?));
+		} else {
+			return Ok(Box::new(self::memory::MemoryLockManager::new()));
+		}
 	}
 
-	#[cfg(not(any(target_arch = "wasm32", unix, windows)))]
-	panic!("lock_manager::platform_default: no default backend for this target");
+	bail!("lock_manager::platform_default: no default backend for this target");
 }
 
-// The shared test harness uses `tokio::spawn` / `tokio::sync::Barrier`
-// / `tokio::time::timeout`, all of which require the `rt` feature that
-// is desktop-only. The web_locks backend has its own wasm-bindgen-test
-// suite in its module.
+// The shared test harness uses `tokio::spawn` / `tokio::sync::Barrier`,
+// both of which require the `rt` feature that is desktop-only. The
+// web_locks backend has its own wasm-bindgen-test suite in its module.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod test {
 	use super::*;
@@ -353,10 +376,10 @@ mod test {
 				mgr.lock("k", TEST_TIMEOUT).await.unwrap()
 			});
 
-			tokio::time::sleep(Duration::from_millis(150)).await;
+			bark_runtime::sleep(Duration::from_millis(150)).await;
 			drop(g);
 
-			let result = tokio::time::timeout(Duration::from_secs(2), waiter).await;
+			let result = bark_runtime::timeout(Duration::from_secs(2), waiter).await;
 			assert!(result.is_ok(), "{}: waiter should succeed after holder dropped", tb.name);
 		}
 	}
@@ -385,7 +408,7 @@ mod test {
 					let guard = mgr.try_lock("contested").await;
 					let acquired = guard.is_some();
 					if acquired {
-						tokio::time::sleep(Duration::from_millis(100)).await;
+						bark_runtime::sleep(Duration::from_millis(100)).await;
 					}
 					acquired
 				}));
@@ -445,7 +468,7 @@ mod test {
 	#[tokio::test]
 	async fn platform_default_returns_a_working_manager() {
 		let dir = tmp_dir();
-		let mgr = super::platform_default(&dir)
+		let mgr = super::platform_default(Some(&dir), None)
 			.expect("platform_default should construct a manager");
 		let g = mgr.try_lock("bark.platform.default.test").await;
 		assert!(g.is_some(), "platform_default's manager should grant a fresh lock");

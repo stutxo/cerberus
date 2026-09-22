@@ -3,7 +3,9 @@ use std::time::Duration;
 pub const BOARD_CONFIRMATIONS: u32 = 3;
 pub const ROUND_CONFIRMATIONS: u32 = 6;
 pub const OFFBOARD_CONFIRMATIONS: u32 = 0;
-pub const TX_PROPAGATION_SLEEP_TIME: Duration = Duration::from_millis(1000);
+/// Default interval between attempts in poll loops.
+/// Can be overridden with the TEST_POLL_INTERVAL_MS env var.
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub mod env {
 	pub const TEST_DIRECTORY: &str = "TEST_DIRECTORY";
@@ -17,6 +19,10 @@ pub mod env {
 	pub const BARK_EXEC: &str = "BARK_EXEC";
 	pub const BARKD_EXEC: &str = "BARKD_EXEC";
 	pub const CAPTAIND_EXEC: &str = "CAPTAIND_EXEC";
+	/// Path to a previous captaind release binary. Used by the
+	/// server-migrations tests to start a server on the old version
+	/// and upgrade it to the current binary mid-test.
+	pub const OLD_CAPTAIND_EXEC: &str = "OLD_CAPTAIND_EXEC";
 	pub const WATCHMAND_EXEC: &str = "WATCHMAND_EXEC";
 	pub const LIGHTNINGD_DOCKER_IMAGE: &str = "LIGHTNINGD_DOCKER_IMAGE";
 	pub const LIGHTNINGD_EXEC: &str = "LIGHTNINGD_EXEC";
@@ -32,6 +38,9 @@ pub mod env {
 	pub const BARK_TOKIO_WORKER_THREADS: &str = "BARK_TOKIO_WORKER_THREADS";
 	// The maximum time to wait for a transaction to be propagated to a node, in milliseconds.
 	pub const TX_PROPAGATION_TIMEOUT_MILLIS: &str = "TX_PROPAGATION_TIMEOUT_MILLIS";
+	/// The interval between attempts in poll loops, in milliseconds.
+	/// Defaults to [super::DEFAULT_POLL_INTERVAL].
+	pub const TEST_POLL_INTERVAL_MS: &str = "TEST_POLL_INTERVAL_MS";
 	/// The env var to reach postgres binaries folder
 	pub const POSTGRES_BINS: &str = "POSTGRES_BINS";
 	/// By default, all artifacts of a tests are deleted after a succesful run.
@@ -46,6 +55,9 @@ pub mod env {
 	/// Path to a pre-generated bitcoind snapshot directory.
 	/// When set, tests copy the snapshot instead of generating blocks from scratch.
 	pub const BITCOIND_SNAPSHOT_DIR: &str = "BITCOIND_SNAPSHOT_DIR";
+	/// When set, the wallet executor runs every action step twice to check
+	/// reentrancy (debug builds only). See `just int-bark-int-action-reentrancy`.
+	pub const BARK_DOUBLE_DRIVE_ACTIONS: &str = "BARK_DOUBLE_DRIVE_ACTIONS";
 	pub const TOR_EXEC: &str = "TOR_EXEC";
 }
 

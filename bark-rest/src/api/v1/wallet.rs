@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::Context;
 use axum::extract::{Path, Query, State};
@@ -6,30 +7,37 @@ use axum::routing::{get, post};
 use axum::{Json, Router, debug_handler};
 
 use bitcoin::Amount;
-use tracing::info;
+use bitcoin_ext::BlockHeight;
 use utoipa::OpenApi;
 
 use ark::VtxoId;
 use ark::lightning::{Bolt11Invoice, Offer};
 use ark::ProtocolEncoding;
+
+use bark::ImportVtxoError;
 use bark::lnurllib::lightning_address::LightningAddress;
+use bark::lnurllib::lnurl::LnUrl;
+use bark::payment_request::ArkAddressType;
+use bark::round::RoundStatus;
 use bark::subsystem::RoundMovement;
 use bark::vtxo::VtxoFilter;
 use bark_json::web::PendingRoundInfo;
 
-use crate::{ServerState, error};
-use crate::error::{ContextExt, HandlerResult, badarg, not_found};
+use crate::{ServerState, ServerWallet, error};
+use crate::error::{ContextExt, HandlerResult, badarg, not_found, unprocessable};
 
-pub fn router() -> Router<ServerState> {
+pub fn router() -> Router<Arc<ServerState>> {
 	#[allow(deprecated)]
 	Router::new()
 		.route("/", get(wallet_exists).post(create_wallet).delete(wallet_delete))
 		.route("/connected", get(connected))
 		.route("/create", post(create_wallet))
+		.route("/mnemonic", get(mnemonic))
 		.route("/ark-info", get(ark_info))
 		.route("/next-round", get(next_round))
 		.route("/addresses/next", post(address))
 		.route("/addresses/index/{index}", get(peek_address))
+		.route("/bip321", post(bip321_uri))
 		.route("/balance", get(balance))
 		.route("/vtxos", get(vtxos))
 		.route("/vtxos/{id}", get(get_vtxo))
@@ -38,6 +46,7 @@ pub fn router() -> Router<ServerState> {
 		.route("/history", get(history))
 		.route("/send", post(send))
 		.route("/refresh/vtxos", post(refresh_vtxos))
+		.route("/refresh/delegated/vtxos", post(refresh_delegated))
 		.route("/refresh/all", post(refresh_all))
 		.route("/refresh/counterparty", post(refresh_counterparty))
 		.route("/offboard/vtxos", post(offboard_vtxos))
@@ -56,10 +65,12 @@ pub fn router() -> Router<ServerState> {
 		wallet_delete,
 		connected,
 		create_wallet,
+		mnemonic,
 		ark_info,
 		next_round,
 		address,
 		peek_address,
+		bip321_uri,
 		balance,
 		vtxos,
 		get_vtxo,
@@ -68,6 +79,7 @@ pub fn router() -> Router<ServerState> {
 		history,
 		send,
 		refresh_vtxos,
+		refresh_delegated,
 		refresh_all,
 		refresh_counterparty,
 		offboard_vtxos,
@@ -80,12 +92,16 @@ pub fn router() -> Router<ServerState> {
 	),
 	components(schemas(
 		bark_json::web::ArkAddressResponse,
+		bark_json::web::Bip321UriRequest,
+		bark_json::web::Bip321UriQuery,
+		bark_json::web::Bip321UriResponse,
 		bark_json::web::WalletExistsResponse,
 		bark_json::web::WalletDeleteRequest,
 		bark_json::web::WalletDeleteResponse,
 		bark_json::web::ConnectedResponse,
 		bark_json::web::CreateWalletRequest,
 		bark_json::web::CreateWalletResponse,
+		bark_json::web::MnemonicResponse,
 		bark_json::cli::ArkInfo,
 		bark_json::cli::NextRoundStart,
 		bark_json::web::VtxosQuery,
@@ -96,6 +112,7 @@ pub fn router() -> Router<ServerState> {
 		bark_json::web::SendRequest,
 		bark_json::web::SendResponse,
 		bark_json::web::RefreshRequest,
+		bark_json::web::DelegatedRefreshRequest,
 		bark_json::web::OffboardVtxosRequest,
 		bark_json::web::OffboardAllRequest,
 		bark_json::web::ImportVtxoRequest,
@@ -127,7 +144,9 @@ pub struct WalletApiDoc;
 	tag = "wallet"
 )]
 #[debug_handler]
-pub async fn connected(State(state): State<ServerState>) -> HandlerResult<Json<bark_json::web::ConnectedResponse>> {
+pub async fn connected(
+	State(state): State<Arc<ServerState>>,
+) -> HandlerResult<Json<bark_json::web::ConnectedResponse>> {
 	let wallet = state.require_wallet()?;
 	Ok(axum::Json(bark_json::web::ConnectedResponse {
 		connected: wallet.ark_info().await?.is_some(),
@@ -144,51 +163,79 @@ pub async fn connected(State(state): State<ServerState>) -> HandlerResult<Json<b
 	tag = "wallet"
 )]
 #[debug_handler]
-pub async fn wallet_exists(State(state): State<ServerState>) -> HandlerResult<Json<bark_json::web::WalletExistsResponse>> {
+pub async fn wallet_exists(
+	State(state): State<Arc<ServerState>>,
+) -> HandlerResult<Json<bark_json::web::WalletExistsResponse>> {
 	let wallet = state.wallet.read();
 	Ok(Json(bark_json::web::WalletExistsResponse {
-		fingerprint: wallet.as_ref().map(|w| w.wallet.fingerprint().to_string()),
+		fingerprint: wallet.as_ref().map(|w| w.fingerprint().to_string()),
 	}))
 }
 
 #[utoipa::path(
 	delete,
 	path = "",
+	summary = "Delete the wallet",
 	request_body = bark_json::web::WalletDeleteRequest,
 	responses(
 		(status = 200, description = "Wallet deletion status", body = bark_json::web::WalletDeleteResponse),
 		(status = 400, description = "Invalid request", body = error::BadRequestError),
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
+	description = "Stops the wallet and removes every wallet file from the datadir; barkd's \
+		own files survive. Requires `dangerous: true` and, while a wallet is loaded, the \
+		wallet's fingerprint. With no wallet loaded, the call still removes any leftover \
+		wallet files. A retry completes an interrupted deletion.",
 	tag = "wallet"
 )]
 #[debug_handler]
-pub async fn wallet_delete(State(state): State<ServerState>, Json(req): Json<bark_json::web::WalletDeleteRequest>) -> HandlerResult<Json<bark_json::web::WalletDeleteResponse>> {
+pub async fn wallet_delete(
+	State(state): State<Arc<ServerState>>,
+	Json(req): Json<bark_json::web::WalletDeleteRequest>,
+) -> HandlerResult<Json<bark_json::web::WalletDeleteResponse>> {
 	if !req.dangerous {
 		badarg!("deletion not confirmed: set dangerous=true");
-	}
-
-	{
-		let wallet = state.wallet.read();
-		let Some(w) = wallet.as_ref() else {
-			return Ok(Json(bark_json::web::WalletDeleteResponse {
-				deleted: false,
-				message: "No wallet to delete".to_string(),
-			}));
-		};
-		if w.wallet.fingerprint().to_string() != req.fingerprint {
-			badarg!("Fingerprint does not match the loaded wallet");
-		}
 	}
 
 	let Some(hook) = state.on_wallet_delete.as_ref() else {
 		badarg!("No wallet deletion hook configured");
 	};
+
+	let _lifecycle = state.wallet_lifecycle.lock().await;
+
+	// Take the wallet out of the state before the wipe, so no new request
+	// reaches it, and stop its daemon: a daemon task that runs during the
+	// wipe can re-create wallet files.
+	let wallet = {
+		let mut guard = state.wallet.write();
+		if let Some(w) = guard.as_ref() {
+			if w.fingerprint().to_string() != req.fingerprint {
+				badarg!("Fingerprint does not match the loaded wallet");
+			}
+		}
+		guard.take()
+	};
+	let fingerprint = wallet.as_ref().map(|w| w.fingerprint().to_string());
+	let loaded = wallet.is_some();
+	if let Some(wallet) = wallet {
+		if let Err(e) = wallet.stop_wait().await {
+			log::warn!("Error stopping wallet tasks during delete: {:#}", e);
+		}
+	}
+
+	// The wipe also runs when no wallet is loaded: it completes a delete
+	// that failed midway and removes wallet files a failed create left.
 	hook().await.context("Couldn't delete wallet")?;
-	state.wallet.write().take();
+
+	let message = if loaded {
+		"Wallet deleted"
+	} else {
+		"No wallet was loaded; wiped any leftover wallet files"
+	};
 	Ok(Json(bark_json::web::WalletDeleteResponse {
-		deleted: true,
-		message: "Wallet deleted".to_string(),
+		deleted: loaded,
+		fingerprint,
+		message: message.to_string(),
 	}))
 }
 
@@ -208,22 +255,51 @@ pub async fn wallet_delete(State(state): State<ServerState>, Json(req): Json<bar
 )]
 #[debug_handler]
 pub async fn create_wallet(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Json(req): Json<bark_json::web::CreateWalletRequest>,
 ) -> HandlerResult<Json<bark_json::web::CreateWalletResponse>> {
+	let _lifecycle = state.wallet_lifecycle.lock().await;
+
 	if state.wallet.read().is_some() {
 		badarg!("Wallet already set");
 	}
 
 	if let Some(on_wallet_create) = state.on_wallet_create.as_ref() {
 		let wallet = on_wallet_create(req).await?;
-		let fingerprint = wallet.wallet.fingerprint().to_string();
+		let wallet = ServerWallet::new(wallet, state.shutdown.clone());
+
+		let fingerprint = wallet.fingerprint().to_string();
 		let _ = state.wallet.write().insert(wallet);
 
 		Ok(axum::Json(bark_json::web::CreateWalletResponse { fingerprint }))
 	} else {
 		badarg!("No wallet creation hook set");
 	}
+}
+
+#[utoipa::path(
+	get,
+	path = "/mnemonic",
+	summary = "Get wallet mnemonic",
+	responses(
+		(status = 200, description = "Returns the wallet's BIP-39 mnemonic phrase", body = bark_json::web::MnemonicResponse),
+		(status = 404, description = "Mnemonic retrieval is disabled", body = error::NotFoundError),
+		(status = 500, description = "Internal server error", body = error::InternalServerError)
+	),
+	description = "Returns the BIP-39 mnemonic phrase backing the wallet. Returns 404 when \
+		mnemonic exposure is disabled. Exposure is off by default; the endpoint returns \
+		404 unless barkd is started with the `--expose-mnemonic` flag.",
+	tag = "wallet"
+)]
+#[debug_handler]
+pub async fn mnemonic(
+	State(state): State<Arc<ServerState>>,
+) -> HandlerResult<Json<bark_json::web::MnemonicResponse>> {
+	let Some(hook) = state.on_get_mnemonic.as_ref() else {
+		not_found!(Vec::<String>::new(), "Mnemonic endpoint is disabled");
+	};
+	let mnemonic = hook().await?;
+	Ok(axum::Json(bark_json::web::MnemonicResponse { mnemonic }))
 }
 
 #[utoipa::path(
@@ -241,7 +317,9 @@ pub async fn create_wallet(
 	tag = "wallet"
 )]
 #[debug_handler]
-pub async fn ark_info(State(state): State<ServerState>) -> HandlerResult<Json<bark_json::cli::ArkInfo>> {
+pub async fn ark_info(
+	State(state): State<Arc<ServerState>>,
+) -> HandlerResult<Json<bark_json::cli::ArkInfo>> {
 	let wallet = state.require_wallet()?;
 	let ark_info = wallet.ark_info().await?;
 
@@ -265,7 +343,9 @@ pub async fn ark_info(State(state): State<ServerState>) -> HandlerResult<Json<ba
 	tag = "wallet"
 )]
 #[debug_handler]
-pub async fn next_round(State(state): State<ServerState>) -> HandlerResult<Json<bark_json::cli::NextRoundStart>> {
+pub async fn next_round(
+	State(state): State<Arc<ServerState>>,
+) -> HandlerResult<Json<bark_json::cli::NextRoundStart>> {
 	let wallet = state.require_wallet()?;
 	let time = wallet.next_round_start_time().await?;
 	Ok(axum::Json(bark_json::cli::NextRoundStart { start_time: time.into() }))
@@ -285,7 +365,7 @@ pub async fn next_round(State(state): State<ServerState>) -> HandlerResult<Json<
 )]
 #[debug_handler]
 pub async fn address(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 ) -> HandlerResult<Json<bark_json::web::ArkAddressResponse>> {
 	let wallet = state.require_wallet()?;
 	let ark_address = wallet.new_address().await
@@ -313,7 +393,7 @@ pub async fn address(
 )]
 #[debug_handler]
 pub async fn peek_address(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Path(index): Path<u32>,
 ) -> HandlerResult<Json<bark_json::web::ArkAddressResponse>> {
 	let wallet = state.require_wallet()?;
@@ -322,6 +402,78 @@ pub async fn peek_address(
 
 	Ok(axum::Json(bark_json::web::ArkAddressResponse {
 		address: ark_address.to_string(),
+	}))
+}
+
+#[utoipa::path(
+	post,
+	path = "/bip321",
+	summary = "Build a BIP 321 payment URI",
+	params(
+		("uppercase" = Option<bool>, Query, description = "Upper-case the returned `bip321` URI for compact QR encoding. Defaults to false. Fails with 400 if the URI carries case-sensitive data (a label, message, or base58 address)."),
+	),
+	request_body = bark_json::web::Bip321UriRequest,
+	responses(
+		(status = 200, description = "Returns the BIP 321 URI and its destinations", body = bark_json::web::Bip321UriResponse),
+		(status = 400, description = "Requested an upper-case URI that carries case-sensitive data", body = error::BadRequestError),
+		(status = 500, description = "Internal server error", body = error::InternalServerError)
+	),
+	description = "Builds a single BIP 321 `bitcoin:` URI bundling multiple ways to receive \
+		the same payment, so one call prepares everything needed for an incoming payment. \
+		A fresh Ark address is always included. When `amount_sat` is given, a BOLT11 invoice \
+		for that amount is generated and the amount is embedded in the URI. When `onchain` is \
+		`true`, a fresh on-chain address is added (placed in the URI body on mainnet, as a \
+		`tb=` parameter on test networks). Set the `uppercase` query parameter to upper-case \
+		the `bip321` URI so QR encoders can use the compact alphanumeric mode; this fails if \
+		the URI carries case-sensitive data. The individual `ark`, `bolt11`, and `onchain` \
+		destinations are always returned in their natural case for direct use.",
+	tag = "wallet"
+)]
+#[debug_handler]
+pub async fn bip321_uri(
+	State(state): State<Arc<ServerState>>,
+	Query(query): Query<bark_json::web::Bip321UriQuery>,
+	Json(body): Json<bark_json::web::Bip321UriRequest>,
+) -> HandlerResult<Json<bark_json::web::Bip321UriResponse>> {
+	let mut wallet = state.require_wallet()?;
+
+	let mut builder = wallet.bip321_uri();
+	if let Some(amount_sat) = body.amount_sat {
+		builder = builder.amount_sat(amount_sat);
+	}
+	if let Some(label) = body.label {
+		builder = builder.label(label);
+	}
+	if let Some(message) = body.message {
+		builder = builder.message(message);
+	}
+
+	// The builder borrows the onchain wallet for its whole lifetime, so the
+	// write guard must outlive the build() call.
+	let uri = if body.onchain.unwrap_or(false) {
+		let onchain = state.require_onchain()?;
+		let mut onchain = onchain.write().await;
+		builder.onchain_wallet(&mut *onchain).build().await
+			.context("Failed to build BIP 321 URI")?
+	} else {
+		builder.build().await
+			.context("Failed to build BIP 321 URI")?
+	};
+
+	let bip321 = if query.uppercase.unwrap_or(false) {
+		uri.checked_uppercase()
+			.badarg("cannot upper-case the URI: it carries a label, message, or base58 address")?
+	} else {
+		uri.to_string()
+	};
+
+	Ok(axum::Json(bark_json::web::Bip321UriResponse {
+		ark: uri.extensions().ark().first().map(|a| a.inner().to_string()),
+		bolt11: uri.lightning().first().map(|i| i.inner().to_string()),
+		// onchain addresses live in the URI body on mainnet and in `tb=` on test networks
+		onchain: uri.address().map(|a| a.to_string())
+			.or_else(|| uri.tb().first().map(|a| a.inner().to_string())),
+		bip321,
 	}))
 }
 
@@ -342,7 +494,9 @@ pub async fn peek_address(
 	tag = "wallet"
 )]
 #[debug_handler]
-pub async fn balance(State(state): State<ServerState>) -> HandlerResult<Json<bark_json::cli::Balance>> {
+pub async fn balance(
+	State(state): State<Arc<ServerState>>,
+) -> HandlerResult<Json<bark_json::cli::Balance>> {
 	let wallet = state.require_wallet()?;
 	let balance = wallet.balance().await
 		.context("Failed to get wallet balance")?;
@@ -368,7 +522,7 @@ pub async fn balance(State(state): State<ServerState>) -> HandlerResult<Json<bar
 )]
 #[debug_handler]
 pub async fn vtxos(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Query(query): Query<bark_json::web::VtxosQuery>,
 ) -> HandlerResult<Json<Vec<bark_json::primitives::WalletVtxoInfo>>> {
 	let wallet = state.require_wallet()?;
@@ -378,10 +532,9 @@ pub async fn vtxos(
 		wallet.vtxos().await.context("Failed to get VTXOs")?
 	};
 
-	let vtxo_infos = wallet_vtxos
-		.into_iter()
+	let vtxo_infos = wallet_vtxos.iter()
 		.map(bark_json::primitives::WalletVtxoInfo::from)
-		.collect::<Vec<_>>();
+		.collect();
 
 	Ok(axum::Json(vtxo_infos))
 }
@@ -405,7 +558,7 @@ pub async fn vtxos(
 )]
 #[debug_handler]
 pub async fn get_vtxo(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Path(id): Path<String>,
 ) -> HandlerResult<Json<bark_json::primitives::WalletVtxoInfo>> {
 	let wallet = state.require_wallet()?;
@@ -413,7 +566,7 @@ pub async fn get_vtxo(
 	let wallet_vtxo = wallet.get_vtxo_by_id(vtxo_id).await
 		.not_found([vtxo_id], "VTXO not found")?;
 
-	Ok(axum::Json(wallet_vtxo.into()))
+	Ok(axum::Json((&wallet_vtxo).into()))
 }
 
 #[utoipa::path(
@@ -435,7 +588,7 @@ pub async fn get_vtxo(
 )]
 #[debug_handler]
 pub async fn get_vtxo_encoded(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Path(id): Path<String>,
 ) -> HandlerResult<Json<bark_json::web::EncodedVtxoResponse>> {
 	let wallet = state.require_wallet()?;
@@ -460,7 +613,9 @@ pub async fn get_vtxo_encoded(
 )]
 #[debug_handler]
 #[deprecated(note = "Use `history` instead")]
-pub async fn movements(State(state): State<ServerState>) -> HandlerResult<Json<Vec<bark_json::movements::Movement>>> {
+pub async fn movements(
+	State(state): State<Arc<ServerState>>,
+) -> HandlerResult<Json<Vec<bark_json::movements::Movement>>> {
 	let wallet = state.require_wallet()?;
 	#[allow(deprecated)]
 	let movements = wallet.movements().await.context("Failed to get movements")?;
@@ -477,30 +632,20 @@ pub async fn movements(State(state): State<ServerState>) -> HandlerResult<Json<V
 #[utoipa::path(
 	get,
 	path = "/history",
-	summary = "Get wallet history",
+	summary = "Get wallet history (deprecated)",
 	responses(
 		(status = 200, description = "Returns the wallet history", body = Vec<bark_json::movements::Movement>),
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
-	description = "Returns the full history of wallet movements ordered from newest to \
-		oldest. A movement represents any wallet operation that affects VTXOs—an arkoor \
-		send or receive, Lightning send or receive, board, offboard, or refresh. Each \
-		entry records which VTXOs were consumed and produced, the effective balance \
-		change (if any), fees paid, and the operation status.",
+	description = "Deprecated: use `GET /api/v1/history` instead.",
 	tag = "wallet"
 )]
 #[debug_handler]
-pub async fn history(State(state): State<ServerState>) -> HandlerResult<Json<Vec<bark_json::movements::Movement>>> {
-	let wallet = state.require_wallet()?;
-	let movements = wallet.history().await.context("Failed to get movements")?;
-
-	let json_movements = movements
-		.into_iter()
-		.map(|m| bark_json::movements::Movement::try_from(m)
-			.context("Failed to convert movement to JSON")
-		).collect::<Result<Vec<_>, _>>()?;
-
-	Ok(axum::Json(json_movements))
+#[deprecated(note = "Use `GET /api/v1/history` instead")]
+pub async fn history(
+	state: State<Arc<ServerState>>,
+) -> HandlerResult<Json<Vec<bark_json::movements::Movement>>> {
+	crate::api::v1::history::list(state, axum::extract::Query(Default::default())).await
 }
 
 #[utoipa::path(
@@ -522,7 +667,7 @@ pub async fn history(State(state): State<ServerState>) -> HandlerResult<Json<Vec
 )]
 #[debug_handler]
 pub async fn pending_rounds(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 ) -> HandlerResult<Json<Vec<bark_json::web::PendingRoundInfo>>> {
 	let wallet = state.require_wallet()?;
 
@@ -563,31 +708,48 @@ pub async fn pending_rounds(
 )]
 #[debug_handler]
 pub async fn send(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Json(body): Json<bark_json::web::SendRequest>,
 ) -> HandlerResult<Json<bark_json::web::SendResponse>> {
 	let wallet = state.require_wallet()?;
 
 	let amount = body.amount_sat.map(|a| Amount::from_sat(a));
 
-	if let Ok(addr) = ark::Address::from_str(&body.destination) {
-		let amount = amount.context("amount missing")?;
+	match ArkAddressType::from_str(&body.destination) {
+		Ok(ArkAddressType::Bark(addr)) => {
+			let amount = amount.context("amount missing")?;
 
-		info!("Sending arkoor payment of {} to address {}", amount, addr);
-		wallet.send_arkoor_payment(&addr, amount).await?;
-	} else if let Ok(inv) = Bolt11Invoice::from_str(&body.destination) {
+			wallet.validate_arkoor_address(&addr).await
+				.badarg("invalid arkoor address")?;
+			log::info!("Sending arkoor payment of {} to address {}", amount, addr);
+			wallet.send_arkoor_payment(&addr, amount).await?;
+			return Ok(axum::Json(bark_json::web::SendResponse {
+				message: "Payment sent successfully".to_string(),
+				payment_hash: None,
+			}));
+		},
+		// Explicitly handle Arkade addresses
+		Ok(ArkAddressType::Arkade(_)) => badarg!("Ark address is for different server"),
+		// Ignore other errors, we want to check payment methods below
+		Err(_) => {}
+	};
+
+	let invoice = if let Ok(inv) = Bolt11Invoice::from_str(&body.destination) {
 		if body.comment.is_some() {
 			badarg!("comment is not supported for BOLT-11 invoices");
 		}
-		wallet.pay_lightning_invoice(inv, amount).await?;
+		wallet.pay_lightning_invoice(inv, amount, false).await?
 	} else if let Ok(offer) = Offer::from_str(&body.destination) {
 		if body.comment.is_some() {
 			badarg!("comment is not supported for BOLT-12 offers");
 		}
-		wallet.pay_lightning_offer(offer, amount).await?;
+		wallet.pay_lightning_offer(offer, amount, false).await?
 	} else if let Ok(addr) = LightningAddress::from_str(&body.destination) {
 		let amount = amount.badarg("amount is required for Lightning addresses")?;
-		wallet.pay_lightning_address(&addr, amount, body.comment).await?;
+		wallet.pay_lightning_address(&addr, amount, body.comment, false).await?
+	} else if let Ok(lnurl) = LnUrl::from_str(&body.destination) {
+		let amount = amount.badarg("amount is required for LNURL")?;
+		wallet.pay_lnurl(&lnurl, amount, body.comment, false).await?
 	} else if let Ok(addr) = bitcoin::Address::from_str(&body.destination) {
 		let _checked_addr = addr
 			.require_network(wallet.network().await?)
@@ -597,11 +759,12 @@ pub async fn send(
 		return Err(anyhow!("offboards are temporarily disabled").into());
 	} else {
 		badarg!("Argument is not a valid destination. Supported are: \
-			VTXO pubkeys, bolt11 invoices, bolt12 offers and lightning addresses");
-	}
+			ark addresses, bolt11 invoices, bolt12 offers and lightning addresses");
+	};
 
 	Ok(axum::Json(bark_json::web::SendResponse {
 		message: "Payment sent successfully".to_string(),
+		payment_hash: Some(invoice.payment_hash()),
 	}))
 }
 
@@ -626,7 +789,7 @@ pub async fn send(
 )]
 #[debug_handler]
 pub async fn refresh_vtxos(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Json(body): Json<bark_json::web::RefreshRequest>,
 ) -> HandlerResult<Json<bark_json::web::PendingRoundInfo>> {
 	let wallet = state.require_wallet()?;
@@ -661,6 +824,58 @@ pub async fn refresh_vtxos(
 
 #[utoipa::path(
 	post,
+	path = "/refresh/delegated/vtxos",
+	summary = "Refresh VTXOs in delegated mode",
+	request_body = bark_json::web::DelegatedRefreshRequest,
+	responses(
+		(status = 200, description = "Returns the refresh result", body = bark_json::web::PendingRoundInfo),
+		(status = 400, description = "No VTXO IDs provided, or one of the provided VTXO \
+			IDs is invalid", body = error::BadRequestError),
+		(status = 404, description = "One the VTXOs wasn't found", body = error::NotFoundError),
+		(status = 500, description = "Internal server error", body = error::InternalServerError)
+	),
+	description = "Registers the specified VTXOs for refresh as a delegated participation: \
+		the wallet hands the server a signed participation and the server carries it through \
+		the round, so the wallet doesn't need to follow the round interactively. The input \
+		VTXOs are locked immediately and will be forfeited once the round completes, yielding \
+		new VTXOs with a fresh expiry.\n\n\
+		Set `height` to schedule the refresh for a future block height: the refresh fee is \
+		priced at that height and the server includes the participation in the first round \
+		once the chain tip reaches it. When `height` is omitted, the participation is \
+		eligible for the next round. Use the `rounds` endpoint to track progress.",
+	tag = "wallet"
+)]
+#[debug_handler]
+pub async fn refresh_delegated(
+	State(state): State<Arc<ServerState>>,
+	Json(body): Json<bark_json::web::DelegatedRefreshRequest>,
+) -> HandlerResult<Json<bark_json::web::PendingRoundInfo>> {
+	let wallet = state.require_wallet()?;
+
+	if body.vtxos.is_empty() {
+		badarg!("No VTXO IDs provided");
+	}
+
+	let vtxo_ids = body.vtxos
+		.into_iter()
+		.map(|s| ark::VtxoId::from_str(&s).badarg("Invalid VTXO id"))
+		.collect::<Result<Vec<_>, _>>()?;
+
+	let round = match body.height {
+		Some(height) => wallet.refresh_vtxos_scheduled(vtxo_ids, BlockHeight::new(height)).await
+			.context("Failed to store round participation")?,
+		None => wallet.refresh_vtxos_delegated(vtxo_ids).await
+			.context("Failed to store round participation")?,
+	};
+
+	match round {
+		Some(round) => Ok(axum::Json(PendingRoundInfo::new(&round, Ok(RoundStatus::Pending)))),
+		None => badarg!("No VTXOs to refresh"),
+	}
+}
+
+#[utoipa::path(
+	post,
 	path = "/refresh/all",
 	summary = "Refresh all VTXOs",
 	responses(
@@ -676,7 +891,7 @@ pub async fn refresh_vtxos(
 )]
 #[debug_handler]
 pub async fn refresh_all(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 ) -> HandlerResult<Json<bark_json::web::PendingRoundInfo>> {
 	let wallet = state.require_wallet()?;
 
@@ -722,7 +937,7 @@ pub async fn refresh_all(
 )]
 #[debug_handler]
 pub async fn refresh_counterparty(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 ) -> HandlerResult<Json<bark_json::web::PendingRoundInfo>> {
 	let wallet = state.require_wallet()?;
 
@@ -773,7 +988,7 @@ pub async fn refresh_counterparty(
 )]
 #[debug_handler]
 pub async fn offboard_vtxos(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Json(body): Json<bark_json::web::OffboardVtxosRequest>,
 ) -> HandlerResult<Json<bark_json::cli::OffboardResult>> {
 	let wallet = state.require_wallet()?;
@@ -825,7 +1040,7 @@ pub async fn offboard_vtxos(
 )]
 #[debug_handler]
 pub async fn offboard_all(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Json(body): Json<bark_json::web::OffboardAllRequest>,
 ) -> HandlerResult<Json<bark_json::cli::OffboardResult>> {
 	let wallet = state.require_wallet()?;
@@ -866,7 +1081,7 @@ pub async fn offboard_all(
 )]
 #[debug_handler]
 pub async fn send_onchain(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Json(body): Json<bark_json::web::SendOnchainRequest>,
 ) -> HandlerResult<Json<bark_json::cli::OffboardResult>> {
 	let wallet = state.require_wallet()?;
@@ -899,7 +1114,7 @@ pub async fn send_onchain(
 	tag = "wallet"
 )]
 #[debug_handler]
-pub async fn sync(State(state): State<ServerState>) -> HandlerResult<()> {
+pub async fn sync(State(state): State<Arc<ServerState>>) -> HandlerResult<()> {
 	let wallet = state.require_wallet()?;
 	wallet.sync().await;
 	Ok(())
@@ -923,7 +1138,7 @@ pub async fn sync(State(state): State<ServerState>) -> HandlerResult<()> {
 )]
 #[debug_handler]
 pub async fn sync_mailbox(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 ) -> HandlerResult<Json<bark_json::web::MailboxSyncResponse>> {
 	let wallet = state.require_wallet()?;
 	wallet.sync_mailbox().await
@@ -940,18 +1155,31 @@ pub async fn sync_mailbox(
 	request_body = bark_json::web::ImportVtxoRequest,
 	responses(
 		(status = 200, description = "VTXO imported successfully", body = Vec<bark_json::primitives::WalletVtxoInfo>),
-		(status = 400, description = "Invalid VTXO hex or VTXO not owned by wallet", body = error::BadRequestError),
+		(status = 400, description = "Invalid VTXO hex, a VTXO that does not match the chain, or a VTXO whose user pubkey is not derivable from this seed within the gap limit", body = error::BadRequestError),
+		(status = 422, description = "The VTXO is neither spendable nor spent, so it cannot be imported yet", body = error::UnprocessableEntityError),
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
-	description = "Imports hex-encoded serialized VTXOs into the wallet. Validates that \
-		each VTXO is anchored on-chain, owned by this wallet, and has not expired. \
-		Useful for restoring VTXOs after database loss or re-importing from the \
-		server mailbox. The operation is idempotent.",
+	description = "Imports the hex-encoded serialized VTXOs in the request body into \
+		the wallet; it does not read them from the server mailbox. Validates that each \
+		VTXO is anchored on-chain and owned by this wallet. Useful for restoring VTXOs \
+		after database loss, or for re-importing ones obtained elsewhere. Ownership is \
+		resolved by scanning the seed-derived key space, bounded by `gap_limit` or the \
+		wallet's configured gap limit; a key the scan does not reach is a 400. Only \
+		VTXOs the server reports as spendable or spent are stored, in that state, so \
+		one that has already been spent is recorded as spent rather than rejected. A \
+		VTXO still in flight (unclaimed, unregistered, or awaiting a preimage) is \
+		rejected with a 422, because it becomes importable once that flow finishes. \
+		Pass `skip_status_check` to store them as spendable without asking the server. \
+		Expiry is not checked. The VTXOs are imported together, in one key scan and \
+		one transaction, so a rejected VTXO leaves none of them stored; pass \
+		`allow_partial` to keep the VTXOs that did import, and the response then \
+		lists only those. Already-imported VTXOs are skipped, so the operation is \
+		idempotent and a failed request can be retried.",
 	tag = "wallet"
 )]
 #[debug_handler]
 pub async fn import_vtxo(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Json(body): Json<bark_json::web::ImportVtxoRequest>,
 ) -> HandlerResult<Json<Vec<bark_json::primitives::WalletVtxoInfo>>> {
 	let wallet = state.require_wallet()?;
@@ -960,14 +1188,48 @@ pub async fn import_vtxo(
 		badarg!("No VTXOs provided");
 	}
 
-	let mut imported = Vec::with_capacity(body.vtxos.len());
+	// Caught here too so an out-of-range limit is a bad request rather than the
+	// 500 the wallet's own guard would surface.
+	if let Some(gap_limit) = body.gap_limit {
+		if gap_limit > bark::MAX_VTXO_KEY_GAP_LIMIT {
+			badarg!("gap_limit {} is above the maximum of {}",
+				gap_limit, bark::MAX_VTXO_KEY_GAP_LIMIT);
+		}
+	}
 
-	for vtxo_hex in body.vtxos {
-		let vtxo = ark::Vtxo::deserialize_hex(&vtxo_hex).badarg("invalid vtxo hex")?;
-		let vtxo_id = vtxo.id();
-		wallet.import_vtxo(&vtxo).await.context("Failed to import VTXO")?;
-		let wallet_vtxo = wallet.get_vtxo_by_id(vtxo_id).await.context("Failed to get imported VTXO")?;
-		imported.push(wallet_vtxo.into());
+	let vtxos = body.vtxos.iter()
+		.map(|hex| ark::Vtxo::deserialize_hex(hex))
+		.collect::<Result<Vec<_>, _>>()
+		.badarg("invalid vtxo hex")?;
+
+	let args = bark::ImportVtxoArgs {
+		gap_limit: body.gap_limit,
+		skip_status_check: body.skip_status_check,
+		allow_partial: body.allow_partial,
+	};
+
+	// One key scan covers the batch, so import them together rather than one at
+	// a time.
+	let ids = match wallet.import_vtxos(&vtxos, args).await {
+		Ok(ids) => ids,
+		Err(e) => {
+			match &e {
+				ImportVtxoError::Invalid { .. }
+					| ImportVtxoError::KeyNotFound { .. } => badarg!("{}", e),
+				// Not a bad request: the vtxo becomes importable once the server
+				// finishes the flow it is in.
+				ImportVtxoError::InFlight { .. } => unprocessable!("{}", e),
+				ImportVtxoError::Transient(..) => {},
+			}
+			return Err(anyhow::Error::new(e).context("Failed to import VTXOs").into());
+		},
+	};
+
+	let mut imported = Vec::with_capacity(ids.len());
+	for id in ids {
+		let wallet_vtxo = wallet.get_vtxo_by_id(id).await
+			.context("Failed to get imported VTXO")?;
+		imported.push((&wallet_vtxo).into());
 	}
 
 	Ok(axum::Json(imported))

@@ -51,14 +51,23 @@ impl VtxoSigner for Wallet {
 			VtxoClause::DelayedTimelockSign(c) => Some(c.witness(&signature, &control_block)),
 			VtxoClause::TimelockSign(c) => Some(c.witness(&signature, &control_block)),
 			VtxoClause::HashDelaySign(c) => {
-				let receive = self.db.fetch_lightning_receive_by_payment_hash(c.hash.into())
+				let preimage = self.lightning_receive_preimage(c.hash.into())
 					.await.ok().flatten();
 
-				receive.map(|r| c.witness(
-					&(signature, r.payment_preimage.to_byte_array()), &control_block,
+				preimage.map(|p| c.witness(
+					&(signature, p.to_byte_array()), &control_block,
+				))
+			},
+			VtxoClause::HashDelaySign_v0(c) => {
+				let preimage = self.lightning_receive_preimage(c.hash.into())
+					.await.ok().flatten();
+
+				preimage.map(|p| c.witness(
+					&(signature, p.to_byte_array()), &control_block,
 				))
 			},
 			VtxoClause::HashSign(_) => None, // Not used by bark
+			VtxoClause::HashSign_v0(_) => None, // Not used by bark
 		}
 	}
 }

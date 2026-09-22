@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
@@ -10,35 +11,42 @@ use utoipa::OpenApi;
 use ark::lightning::Offer;
 use bark::lightning_invoice::Bolt11Invoice;
 use bark::lnurllib::lightning_address::LightningAddress;
+use bark::lnurllib::lnurl::LnUrl;
 
-use crate::error::{self, badarg, not_found, ContextExt, HandlerResult};
+use crate::error::{self, badarg, ContextExt, HandlerResult};
 use crate::ServerState;
 
 #[derive(OpenApi)]
 #[openapi(
 	paths(
 		generate_invoice,
+		generate_invoice_for_address,
 		get_receive_status,
 		list_receive_statuses,
 		cancel_receive,
 		pay,
+		get_send_status,
 	),
 	components(schemas(
 		bark_json::web::LightningInvoiceRequest,
+		bark_json::web::LightningInvoiceForAddressRequest,
 		bark_json::cli::InvoiceInfo,
 		bark_json::cli::LightningReceiveInfo,
 		bark_json::web::LightningPayRequest,
 		bark_json::web::LightningPayResponse,
+		bark_json::cli::LightningSendInfo,
 	)),
 	tags((name = "lightning", description = "Create Lightning invoices and track receives."))
 )]
 pub struct LightningApiDoc;
 
-pub fn router() -> Router<ServerState> {
+pub fn router() -> Router<Arc<ServerState>> {
 	Router::new()
 		.route("/receives/invoice", post(generate_invoice))
+		.route("/receives/invoice/for-address", post(generate_invoice_for_address))
 		.route("/receives/{identifier}", get(get_receive_status).delete(cancel_receive))
 		.route("/receives", get(list_receive_statuses))
+		.route("/sends/{identifier}", get(get_send_status))
 		.route("/pay", post(pay))
 }
 
@@ -57,14 +65,48 @@ pub fn router() -> Router<ServerState> {
 )]
 #[debug_handler]
 pub async fn generate_invoice(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Json(body): Json<bark_json::web::LightningInvoiceRequest>,
 ) -> HandlerResult<Json<bark_json::cli::InvoiceInfo>> {
 	let wallet = state.require_wallet()?;
 
 	let amount = Amount::from_sat(body.amount_sat);
-	let invoice = wallet.bolt11_invoice(amount, body.description).await
+	let invoice = wallet.bolt11_invoice(amount, body.description, body.token).await
 		.context("Failed to create invoice")?;
+
+	Ok(axum::Json(bark_json::cli::InvoiceInfo {
+		invoice: invoice.to_string(),
+	}))
+}
+
+#[utoipa::path(
+	post,
+	path = "/receives/invoice/for-address",
+	summary = "Create a BOLT11 invoice for an Ark address",
+	request_body = bark_json::web::LightningInvoiceForAddressRequest,
+	responses(
+		(status = 200, description = "Returns the created invoice", body = bark_json::cli::InvoiceInfo),
+		(status = 400, description = "Bad request", body = error::BadRequestError),
+		(status = 500, description = "Internal server error", body = error::InternalServerError)
+	),
+	description = "Generates a new BOLT11 invoice. When paid, the wallet claims the Lightning \
+		receive and forwards the resulting Ark VTXO to the supplied Ark address mailbox.",
+	tag = "lightning"
+)]
+#[debug_handler]
+pub async fn generate_invoice_for_address(
+	State(state): State<Arc<ServerState>>,
+	Json(body): Json<bark_json::web::LightningInvoiceForAddressRequest>,
+) -> HandlerResult<Json<bark_json::cli::InvoiceInfo>> {
+	let wallet = state.require_wallet()?;
+
+	let amount = Amount::from_sat(body.amount_sat);
+	let address = ark::Address::from_str(&body.address)
+		.badarg("address is not a valid Ark address")?;
+	wallet.validate_arkoor_address(&address).await
+		.badarg("invalid arkoor address")?;
+	let invoice = wallet.bolt11_invoice_for_address(amount, address, body.description, None).await
+		.context("Failed to create invoice for address")?;
 
 	Ok(axum::Json(bark_json::cli::InvoiceInfo {
 		invoice: invoice.to_string(),
@@ -93,7 +135,7 @@ pub async fn generate_invoice(
 )]
 #[debug_handler]
 pub async fn get_receive_status(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Path(identifier): Path<String>,
 ) -> HandlerResult<Json<bark_json::cli::LightningReceiveInfo>> {
 	let wallet = state.require_wallet()?;
@@ -108,13 +150,49 @@ pub async fn get_receive_status(
 		badarg!("identifier is not a valid payment hash, invoice or preimage");
 	};
 
-	if let Some(status) = wallet.lightning_receive_status(payment_hash).await
-		.context("Failed to get lightning receive status")? {
+	let state = wallet.lightning_receive_state(payment_hash).await
+		.context("Failed to get lightning receive status")?;
+	Ok(axum::Json(bark_json::cli::LightningReceiveInfo::from_state(&state)))
+}
 
-		Ok(axum::Json(status.into()))
+#[utoipa::path(
+	get,
+	path = "/sends/{identifier}",
+	summary = "Get send status",
+	params(
+		("identifier" = String, Path, description = "Payment hash or invoice string to search for"),
+	),
+	responses(
+		(status = 200, description = "Returns the Lightning send status", body = bark_json::cli::LightningSendInfo),
+		(status = 400, description = "Bad request", body = error::BadRequestError),
+		(status = 500, description = "Internal server error", body = error::InternalServerError)
+	),
+	description = "Returns the status of a specified outgoing Lightning payment, identified by \
+		its payment hash or invoice string. The `state` field tracks the payment lifecycle \
+		from `start` through `paid`; the preimage is included once the payment succeeded. \
+		If the wallet does not recognize the payment hash, it will return `unknown`. \
+		This is a read on the status in the db, so it does not trigger any `sync` before \
+		checking the state.",
+	tag = "lightning"
+)]
+#[debug_handler]
+pub async fn get_send_status(
+	State(state): State<Arc<ServerState>>,
+	Path(identifier): Path<String>,
+) -> HandlerResult<Json<bark_json::cli::LightningSendInfo>> {
+	let wallet = state.require_wallet()?;
+
+	let payment_hash = if let Ok(h) = ark::lightning::PaymentHash::from_str(&identifier) {
+		h
+	} else if let Ok(i) = Bolt11Invoice::from_str(&identifier) {
+		i.into()
 	} else {
-		not_found!([payment_hash], "No invoice found");
-	}
+		badarg!("identifier is not a valid payment hash or invoice");
+	};
+
+	let state = wallet.lightning_send_state(payment_hash).await
+		.context("Failed to get lightning send status")?;
+	Ok(axum::Json(bark_json::cli::LightningSendInfo::from_state(payment_hash, &state)))
 }
 
 #[utoipa::path(
@@ -132,7 +210,7 @@ pub async fn get_receive_status(
 )]
 #[debug_handler]
 pub async fn list_receive_statuses(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 ) -> HandlerResult<Json<Vec<bark_json::cli::LightningReceiveInfo>>> {
 	let wallet = state.require_wallet()?;
 
@@ -141,7 +219,7 @@ pub async fn list_receive_statuses(
 	// receives are ordered from newest to oldest, so we reverse them so last terminal item is newest
 	receives.reverse();
 
-	let receives = receives.into_iter()
+	let receives = receives.iter()
 		.map(bark_json::cli::LightningReceiveInfo::from).collect::<Vec<_>>();
 
 	Ok(axum::Json(receives))
@@ -167,7 +245,7 @@ pub async fn list_receive_statuses(
 )]
 #[debug_handler]
 pub async fn cancel_receive(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Path(identifier): Path<String>,
 ) -> HandlerResult<()> {
 	let wallet = state.require_wallet()?;
@@ -206,31 +284,35 @@ pub async fn cancel_receive(
 )]
 #[debug_handler]
 pub async fn pay(
-	State(state): State<ServerState>,
+	State(state): State<Arc<ServerState>>,
 	Json(body): Json<bark_json::web::LightningPayRequest>,
 ) -> HandlerResult<Json<bark_json::web::LightningPayResponse>> {
 	let wallet = state.require_wallet()?;
 
 	let amount = body.amount_sat.map(|a| Amount::from_sat(a));
 
-	if let Ok(invoice) = Bolt11Invoice::from_str(&body.destination) {
+	let invoice = if let Ok(invoice) = Bolt11Invoice::from_str(&body.destination) {
 		if body.comment.is_some() {
 			badarg!("comment is not supported for BOLT-11 invoices");
 		}
-		wallet.pay_lightning_invoice(invoice, amount).await?
+		wallet.pay_lightning_invoice(invoice, amount, false).await?
 	} else if let Ok(offer) = Offer::from_str(&body.destination) {
 		if body.comment.is_some() {
 			badarg!("comment is not supported for BOLT-12 offers");
 		}
-		wallet.pay_lightning_offer(offer, amount).await?
+		wallet.pay_lightning_offer(offer, amount, false).await?
 	} else if let Ok(lnaddr) = LightningAddress::from_str(&body.destination) {
 		let amount = amount.badarg("amount is required for Lightning addresses")?;
-		wallet.pay_lightning_address(&lnaddr, amount, body.comment).await?
+		wallet.pay_lightning_address(&lnaddr, amount, body.comment, false).await?
+	} else if let Ok(lnurl) = LnUrl::from_str(&body.destination) {
+		let amount = amount.badarg("amount is required for LNURL")?;
+		wallet.pay_lnurl(&lnurl, amount, body.comment, false).await?
 	} else {
-		badarg!("argument is not a valid BOLT-11 invoice, BOLT-12 offer or Lightning address");
+		badarg!("argument is not a valid BOLT-11 invoice, BOLT-12 offer, Lightning address or LNURL");
 	};
 
 	Ok(axum::Json(bark_json::web::LightningPayResponse {
 		message: "Payment initiated successfully".to_string(),
+		payment_hash: Some(invoice.payment_hash()),
 	}))
 }

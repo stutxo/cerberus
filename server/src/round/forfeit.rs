@@ -44,8 +44,41 @@ impl Server {
 		unlock_hash: UnlockHash,
 		vtxos: &[VtxoId],
 	) -> anyhow::Result<Vec<musig::PublicNonce>> {
+		// only generate nonces for the inputs of the round participation with
+		// the given unlock hash, so that this endpoint can't be used to burn
+		// CPU on unbounded nonce generation
+		let part = self.db.read(async |t| {
+			t.get_round_participation_by_unlock_hash(unlock_hash).await
+		}).await?.badarg("unknown unlock hash")?;
+
+		// nb we deliberately don't reject already-forfeited participations:
+		// a wallet that crashed or lost its state after forfeiting will retry
+		// the whole swap, which starts by requesting nonces again. the
+		// forfeit_vtxos call that follows returns the unlock preimage without
+		// using the nonces, so the retry stays idempotent
+
+		let mut input_set = part.inputs.iter().map(|i| i.vtxo_id).collect::<HashSet<_>>();
+		for vtxo in vtxos {
+			if !input_set.remove(vtxo) {
+				return badarg!("vtxo with id {} is not part of this round participation",
+					vtxo);
+			}
+		}
+
 		let mut ret = Vec::with_capacity(vtxos.len());
 		for vtxo in vtxos {
+			// if we still hold nonces for this vtxo (e.g. the request was
+			// retried), return the existing public nonce: overwriting would
+			// invalidate a forfeit that is already being signed with them
+			let existing = self.forfeit_nonces.lock().get(vtxo)
+				.and_then(|opt| opt.as_ref())
+				.filter(|n| n.unlock_hash == unlock_hash)
+				.map(|n| n.public_nonce());
+			if let Some(pub_nonce) = existing {
+				ret.push(pub_nonce);
+				continue;
+			}
+
 			// nb this call is quite expensive computationally, so we don't want to
 			// keep the lock while doing it
 			let nonces = HarkForfeitNonces::generate(self.server_key.leak_ref(), unlock_hash);
@@ -147,12 +180,17 @@ impl Server {
 			// record the forfeit txid on the round inputs.
 			let round = t.get_round(round_id).await?
 				.context("round not found for participation")?;
-			let tree = round.signed_tree.into_cached_tree();
-			let output_vtxo_ids = part.outputs.iter().map(|output| {
-				let idx = tree.spec.spec.leaf_idx_of_req(&output.vtxo_request)
-					.with_context(|| format!("output req not in round {}", round_id))?;
-				Ok(tree.build_vtxo(idx).id())
-			}).collect::<anyhow::Result<Vec<_>>>()?;
+			// NB the round can predate the v1 hashlock clauses, so the tree's
+			// hashlock version has to be detected to build the correct vtxo ids
+			let tree = round.into_cached_tree()?;
+			// NB bind every output to its own leaf: identical requests within
+			// a participation correspond to distinct leaves in the tree
+			let leaf_idxs = tree.spec.spec.leaf_idxs_for_participation(
+				unlock_hash, part.outputs.iter().map(|o| &o.vtxo_request),
+			).with_context(|| format!("participation outputs not in round {}", round_id))?;
+			let output_vtxo_ids = leaf_idxs.into_iter()
+				.map(|idx| tree.build_vtxo(idx).id())
+				.collect::<Vec<_>>();
 
 			let update = VtxoTreeUpdate::new()
 				.upsert_signed_tx(ff_txs)

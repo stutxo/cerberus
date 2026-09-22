@@ -2,13 +2,15 @@ use ark::vtxo::policy::signing::VtxoSigner;
 use log::{debug, error, info, trace, warn};
 
 use bitcoin_ext::{BlockDelta, P2TR_DUST, TxStatus};
+use crate::chain::BroadcastError;
 use crate::exit::models::{
 	ExitError, ExitAwaitingDeltaState, ExitProcessingState, ExitClaimInProgressState, ExitClaimableState,
-	ExitClaimedState, ExitState, ExitStartState, ExitTx, ExitTxOrigin, ExitTxStatus,
+	ExitClaimedState, ExitState, ExitStartState, ExitTx, ExitTxStatus, ExitVtxoAlreadySpentState,
+	ExitCanceledState,
 };
 use crate::exit::progress::{ExitProgressError, ExitStateProgress, ProgressContext};
-use crate::exit::progress::util::{count_broadcast, count_confirmed, estimate_exit_cost};
-use crate::onchain::ExitUnilaterally;
+use crate::exit::progress::util::{count_broadcast, count_confirmed};
+use crate::vtxo::VtxoStateKind;
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -16,15 +18,28 @@ impl ExitStateProgress for ExitState {
 	async fn progress(
 		self,
 		ctx: &mut ProgressContext<'_>,
-		onchain: &mut dyn ExitUnilaterally,
 	) -> anyhow::Result<ExitState, ExitProgressError> {
+		// While the exit is still pre-broadcast another consumer (round forfeit, send, etc.)
+		// can still take the VTXO out from under us. If we notice that's happened, bail to
+		// the terminal `VtxoAlreadySpent` state so the caller can cancel the movement.
+		// Once all exit txs are in mempool the underlying outpoint is committed to the
+		// exit chain and a competing offchain spend would either lose in mempool or be
+		// refused server-side, so we stop checking.
+		if !self.warrants_exited_vtxo() && ctx.vtxo.state.kind() == VtxoStateKind::Spent {
+			warn!("VTXO {} was spent before its exit chain was fully broadcast, aborting exit",
+				ctx.vtxo.id());
+			let tip = ctx.tip_height().await?;
+			return Ok(ExitState::new_vtxo_already_spent(tip));
+		}
 		match self {
-			ExitState::Start(s) => s.progress(ctx, onchain).await,
-			ExitState::Processing(s) => s.progress(ctx, onchain).await,
-			ExitState::AwaitingDelta(s) => s.progress(ctx, onchain).await,
-			ExitState::Claimable(s) => s.progress(ctx, onchain).await,
-			ExitState::ClaimInProgress(s) => s.progress(ctx, onchain).await,
-			ExitState::Claimed(s) => s.progress(ctx, onchain).await,
+			ExitState::Start(s) => s.progress(ctx).await,
+			ExitState::Processing(s) => s.progress(ctx).await,
+			ExitState::AwaitingDelta(s) => s.progress(ctx).await,
+			ExitState::Claimable(s) => s.progress(ctx).await,
+			ExitState::ClaimInProgress(s) => s.progress(ctx).await,
+			ExitState::Claimed(s) => s.progress(ctx).await,
+			ExitState::VtxoAlreadySpent(s) => s.progress(ctx).await,
+			ExitState::Canceled(s) => s.progress(ctx).await,
 		}
 	}
 }
@@ -35,32 +50,18 @@ impl ExitStateProgress for ExitStartState {
 	async fn progress(
 		self,
 		ctx: &mut ProgressContext<'_>,
-		onchain: &mut dyn ExitUnilaterally,
 	) -> anyhow::Result<ExitState, ExitProgressError> {
 		let id = ctx.vtxo.id();
 		info!("Checking if VTXO can be exited: {}", id);
 
-		// Ensure the VTXO has a valid amount
 		if ctx.vtxo.amount() < P2TR_DUST {
-			return Err(ExitError::DustLimit { vtxo: ctx.vtxo.amount(), dust: P2TR_DUST }.into());
+			return Err(ExitError::DustLimit { vtxo: id, amount: ctx.vtxo.amount(), dust: P2TR_DUST }.into());
 		}
 
-		// Ensure we can afford to exit this VTXO
-		let total_fee = estimate_exit_cost([ctx.vtxo], ctx.fee_rate);
-		let balance = onchain.get_balance();
-		if balance < total_fee {
-			return Err(ExitError::InsufficientFeeToStart {
-				balance,
-				total_fee,
-				fee_rate: ctx.fee_rate
-			}.into());
-		}
 		info!("Validated VTXO {}, exit process can now begin", id);
 
-		Ok(ExitState::new_processing(
-			ctx.wallet.chain.tip().await.unwrap_or(self.tip_height),
-			ctx.exit_txids.iter().cloned(),
-		))
+		let tip = ctx.wallet.inner.chain.tip().await.unwrap_or(self.tip_height);
+		Ok(ExitState::new_processing(tip, ctx.exit_txids.iter().cloned()))
 	}
 }
 
@@ -70,7 +71,6 @@ impl ExitStateProgress for ExitProcessingState {
 	async fn progress(
 		self,
 		ctx: &mut ProgressContext<'_>,
-		onchain: &mut dyn ExitUnilaterally,
 	) -> anyhow::Result<ExitState, ExitProgressError> {
 		assert_eq!(self.transactions.len(), ctx.exit_txids.len());
 
@@ -78,7 +78,7 @@ impl ExitStateProgress for ExitProcessingState {
 		let mut transactions = self.transactions.clone();
 
 		for i in 0..transactions.len() {
-			match progress_exit_tx(&transactions[i], ctx, onchain).await {
+			match progress_exit_tx(&transactions[i], ctx).await {
 				Ok(status) => transactions[i].status = status,
 				Err(e) => {
 					// We may need to commit any changes we have
@@ -110,7 +110,7 @@ impl ExitStateProgress for ExitProcessingState {
 			let clause = ctx.wallet.find_signable_clause(ctx.vtxo).await
 				.ok_or_else(|| ExitError::ClaimMissingSignableClause { vtxo: ctx.vtxo.id() })?;
 
-			let wait_delta = clause.sequence().map_or(0, |csv| csv.0) as BlockDelta;
+			let wait_delta = BlockDelta::new(clause.sequence().map_or(0, |csv| csv.0) as u16);
 			return Ok(ExitState::new_awaiting_delta(tip, *conf_block, wait_delta));
 		}
 		if now_confirmed != prev_confirmed {
@@ -122,7 +122,7 @@ impl ExitStateProgress for ExitProcessingState {
 			let now_broadcast = count_broadcast(&transactions);
 			if now_broadcast == transactions.len() {
 				info!("Exit for VTXO ({}) has been fully broadcast, waiting for {} transactions \
-					to confirm...", ctx.vtxo.id(), now_confirmed,
+					to confirm...", ctx.vtxo.id(), transactions.len() - now_confirmed,
 				);
 			} else if prev_broadcast != now_broadcast {
 				let remaining = transactions.len() - now_broadcast;
@@ -149,7 +149,6 @@ impl ExitStateProgress for ExitProcessingState {
 async fn progress_exit_tx(
 	exit: &ExitTx,
 	ctx: &mut ProgressContext<'_>,
-	onchain: &mut dyn ExitUnilaterally,
 ) -> anyhow::Result<ExitTxStatus, ExitError> {
 	match &exit.status {
 		ExitTxStatus::VerifyInputs => {
@@ -163,116 +162,64 @@ async fn progress_exit_tx(
 			);
 			ctx.check_status_from_inputs(exit, &txids).await
 		}
-		ExitTxStatus::NeedsSignedPackage => {
-			// Before attempting to create a package, we should verify another party hasn't
-			// already broadcast this transaction
-			let new_status = ctx.get_exit_tx_status(exit).await?;
-			if matches!(new_status, ExitTxStatus::NeedsSignedPackage) {
-				debug!("Creating exit package for exit tx {}", exit.txid);
-				let child_tx = {
+		ExitTxStatus::AwaitingCpfpBroadcast => {
+			// Check whether another party has already broadcast this transaction before
+			// we pause and wait for the caller to provide a CPFP via provide_cpfp_tx.
+			ctx.get_exit_tx_status(exit).await
+		},
+		ExitTxStatus::AwaitingConfirmation { child_txid, .. } => {
+			let child_status = ctx.tx_manager.get_child_status(exit.txid).await?;
+			match child_status {
+				None => {
+					error!("Exit CPFP tx {} for exit tx {} has disappeared", child_txid, exit.txid);
+					Ok(ExitTxStatus::AwaitingCpfpBroadcast)
+				},
+				Some(ref c) if c.txid != *child_txid => {
+					warn!("Exit CPFP tx {} for exit tx {} has been replaced by {}",
+						child_txid, exit.txid, c.txid,
+					);
+					// Evict our dead CPFP immediately.
+					// Unlike others we don't have to wait for the grace period
+					if let Some(onchain) = ctx.wallet.inner.onchain.as_ref() {
+						if let Err(e) = onchain.write().await.evict_tx(*child_txid).await {
+							warn!("Failed to evict replaced CPFP {}: {:#}", child_txid, e);
+						}
+					}
+					ctx.get_exit_tx_status(exit).await
+				},
+				Some(ref c) if c.status == TxStatus::NotFound => {
+					debug!("Exit CPFP tx {} fell out of mempool, rebroadcasting", child_txid);
 					let package = ctx.tx_manager.get_package(exit.txid)?;
 					let guard = package.read().await;
-					assert_eq!(guard.child, None);
-
-					ctx.create_exit_cpfp_tx(&guard.exit.tx, onchain, None)?
-				};
-
-				// Update the transaction manager so our package can be broadcast later
-				let origin = ExitTxOrigin::Wallet { confirmed_in: None };
-				let child_txid = ctx.tx_manager.set_wallet_child_tx(
-					exit.txid, child_tx, origin,
-				).await?;
-
-				debug!("CPFP created with txid {} for exit tx {}", child_txid, exit.txid);
-				Ok(ExitTxStatus::NeedsBroadcasting { child_txid, origin })
-			} else {
-				debug!("Exit tx {} has likely been broadcast by another party", exit.txid);
-				Ok(new_status)
-			}
-		}
-		ExitTxStatus::NeedsReplacementPackage { .. } => {
-			// Ensure we still need to replace the package
-			match ctx.get_exit_tx_status(exit).await? {
-				ExitTxStatus::NeedsReplacementPackage { min_fee_rate, min_fee } => {
-					debug!("Creating replacement exit package with a fee rate of at least \
-						{}sats/kWu and a minimum fee of {} for exit tx {}",
-						min_fee_rate, min_fee, exit.txid,
-					);
-					let child_tx = ctx.create_exit_cpfp_tx(
-						&ctx.tx_manager.get_package(exit.txid)?.read().await.exit.tx,
-						onchain,
-						Some((min_fee_rate, min_fee)),
-					)?;
-
-					// Update the transaction manager so our package can be broadcast later
-					let origin = ExitTxOrigin::Wallet { confirmed_in: None };
-					let child_txid = ctx.tx_manager.set_wallet_child_tx(
-						exit.txid, child_tx, origin,
-					).await?;
-
-					debug!("RBF CPFP created with txid {} for exit tx {}", child_txid, exit.txid);
-					Ok(ExitTxStatus::NeedsBroadcasting { child_txid, origin })
-				},
-				s => {
-					debug!("Status has changed for exit tx {}, no longer creating a replacement \
-						package", exit.txid,
-					);
-					Ok(s)
-				},
-			}
-		},
-		ExitTxStatus::NeedsBroadcasting { child_txid, .. } => {
-			debug!("Checking if exit tx {} has been broadcast with CPFP tx {}",
-				exit.txid, child_txid,
-			);
-			let status = ctx.get_exit_child_status(&exit, *child_txid).await?;
-			match status {
-				ExitTxStatus::NeedsBroadcasting { child_txid: new_child_txid, .. } => {
-					if new_child_txid != *child_txid {
-						warn!("Exit tx {} has a different child txid. Expected: {} Found: {}",
-							exit.txid, child_txid, new_child_txid,
-						);
+					match ctx.tx_manager.broadcast_package(&*guard).await {
+						Ok(_) => ctx.get_exit_tx_status(exit).await,
+						// The stored CPFP can never confirm: one of its inputs is spent by a
+						// confirmed tx — for our own child that's its fee input, consumed by a
+						// sibling exit tx's CPFP that drew on the same wallet UTXO. Rebroadcasting
+						// can only keep failing, so abandon it and go back to AwaitingCpfpBroadcast
+						// to build a fresh CPFP from currently-spendable UTXOs. (A competing CPFP
+						// spending the shared anchor is instead detected and adopted by
+						// `update_package_from_network`, surfacing as the "replaced by" case above,
+						// so it never reaches here.)
+						Err(ExitError::ExitPackageBroadcastFailure {
+							error: BroadcastError::MissingOrSpentInputs, ..
+						}) => {
+							warn!("Exit CPFP tx {} for exit tx {} can't be rebroadcast (inputs \
+								already spent); requesting a fresh CPFP", child_txid, exit.txid,
+							);
+							Ok(ExitTxStatus::AwaitingCpfpBroadcast)
+						},
+						Err(e) => Err(e),
 					}
-					debug!("Attempting to broadcast exit tx {} with child tx {}",
-						exit.txid, child_txid,
-					);
-					let package = ctx.tx_manager.get_package(exit.txid)?;
-					let guard = package.read().await;
-					let status = ctx.tx_manager.broadcast_package(&*guard).await?;
-					if matches!(status, TxStatus::Mempool) {
-						debug!("Commiting exit CPFP {} to database", new_child_txid);
-						let tx = &guard.child.as_ref().expect("child can't be missing").info.tx;
-						onchain.store_signed_p2a_cpfp(tx).await
-							.map_err(|e| ExitError::ExitPackageStoreFailure {
-								txid: exit.txid,
-								error: e.to_string(),
-							})?;
-					}
-
-					// Finally, we can go to the next state
-					ctx.get_exit_child_status(&exit, new_child_txid).await
 				},
-				_ => {
-					debug!("Exit tx {} needed broadcasting but has changed status to: {}",
-						exit.txid, status,
-					);
-					Ok(status)
+				Some(_) => {
+					ctx.get_exit_tx_status(exit).await
 				},
 			}
-		},
-		ExitTxStatus::BroadcastWithCpfp { child_txid, .. } => {
-			let new_status = ctx.get_exit_child_status(exit, *child_txid).await?;
-			match new_status {
-				ExitTxStatus::Confirmed { block, .. } => {
-					debug!("Exit tx {} confirmed at height {}", exit.txid, block.height);
-				}
-				_ => {}
-			}
-			Ok(new_status)
 		},
 		ExitTxStatus::Confirmed { child_txid, block, .. } => {
 			// Handle cases where we might get a block-reorg so our transaction may unconfirm
-			let new_status = ctx.get_exit_child_status(exit, *child_txid).await?;
+			let new_status = ctx.get_exit_tx_status(exit).await?;
 			match &new_status {
 				ExitTxStatus::Confirmed { child_txid: new_txid, block: new_block, .. } => {
 					if new_block != block || new_txid != child_txid {
@@ -299,7 +246,6 @@ impl ExitStateProgress for ExitAwaitingDeltaState {
 	async fn progress(
 		self,
 		ctx: &mut ProgressContext<'_>,
-		_onchain: &mut dyn ExitUnilaterally,
 	) -> anyhow::Result<ExitState, ExitProgressError> {
 		let tip = ctx.tip_height().await?;
 
@@ -320,7 +266,7 @@ impl ExitStateProgress for ExitAwaitingDeltaState {
 			Ok(ExitState::new_claimable(tip, spendable_block, None))
 		} else {
 			info!("Waiting for {} more confirmations until exit for VTXO ({}) is spendable...",
-				self.claimable_height - tip, ctx.vtxo.id(),
+				self.claimable_height.checked_blocks_since(tip).unwrap_or(0), ctx.vtxo.id(),
 			);
 			Ok(self.into())
 		}
@@ -333,7 +279,6 @@ impl ExitStateProgress for ExitClaimableState {
 	async fn progress(
 		self,
 		ctx: &mut ProgressContext<'_>,
-		_onchain: &mut dyn ExitUnilaterally,
 	) -> anyhow::Result<ExitState, ExitProgressError> {
 		let tip = ctx.tip_height().await?;
 
@@ -357,7 +302,7 @@ impl ExitStateProgress for ExitClaimableState {
 
 		// Check if the VTXO exit has been spent
 		let point = ctx.vtxo.point();
-		let result = ctx.wallet.chain
+		let result = ctx.wallet.inner.chain
 			.txs_spending_inputs(
 				vec![point],
 				scan_height,
@@ -393,7 +338,6 @@ impl ExitStateProgress for ExitClaimInProgressState {
 	async fn progress(
 		self,
 		ctx: &mut ProgressContext<'_>,
-		_onchain: &mut dyn ExitUnilaterally,
 	) -> anyhow::Result<ExitState, ExitProgressError> {
 		// Wait for confirmation of the spending transaction
 		let tip = ctx.tip_height().await?;
@@ -422,9 +366,32 @@ impl ExitStateProgress for ExitClaimedState {
 	async fn progress(
 		self,
 		ctx: &mut ProgressContext<'_>,
-		_onchain: &mut dyn ExitUnilaterally,
 	) -> anyhow::Result<ExitState, ExitProgressError> {
 		trace!("Exit for VTXO {} is spent!", ctx.vtxo.id());
+		Ok(self.into())
+	}
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl ExitStateProgress for ExitVtxoAlreadySpentState {
+	async fn progress(
+		self,
+		ctx: &mut ProgressContext<'_>,
+	) -> anyhow::Result<ExitState, ExitProgressError> {
+		trace!("Exit for VTXO {} cannot proceed: VTXO was already spent.", ctx.vtxo.id());
+		Ok(self.into())
+	}
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl ExitStateProgress for ExitCanceledState {
+	async fn progress(
+		self,
+		ctx: &mut ProgressContext<'_>,
+	) -> anyhow::Result<ExitState, ExitProgressError> {
+		trace!("Exit for VTXO {} was canceled; nothing to progress.", ctx.vtxo.id());
 		Ok(self.into())
 	}
 }

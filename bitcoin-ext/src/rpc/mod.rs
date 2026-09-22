@@ -6,14 +6,22 @@ pub use bdk_bitcoind_rpc::bitcoincore_rpc::{self, json, jsonrpc, Auth, Client, E
 use std::borrow::Borrow;
 use std::collections::HashMap;
 
+#[cfg(feature = "rpc-async")]
+use async_trait::async_trait;
 use bdk_bitcoind_rpc::bitcoincore_rpc::Result as RpcResult;
+#[cfg(feature = "rpc-async")]
+use bitcoind_async_client::Client as AsyncClient;
+#[cfg(feature = "rpc-async")]
+use bitcoind_async_client::error::ClientError as AsyncClientError;
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::hex::FromHex;
-use bitcoin::{Address, Amount, FeeRate, Transaction, Txid, Weight};
+use bitcoin::{Address, Amount, Transaction, Txid};
+#[cfg(feature = "rpc-async")]
+use bitcoin::OutPoint;
 use serde::{self, Deserialize, Serialize};
 use serde::de::Error as SerdeError;
 
-use crate::{BlockHeight, BlockRef, FeeRateExt, TxStatus, DEEPLY_CONFIRMED};
+use crate::{BlockHeight, BlockRef, TxStatus, DEEPLY_CONFIRMED};
 
 #[cfg(all(feature = "wasm-web", feature = "rpc-socks5-proxy"))]
 compile_error!("`wasm-web` does not support the `rpc-socks5-proxy` feature");
@@ -25,19 +33,21 @@ pub const RPC_VERIFY_ALREADY_IN_UTXO_SET: i32 = -27;
 pub const RPC_INVALID_ADDRESS_OR_KEY: i32 = -5;
 
 /// Clonable bitcoind rpc client.
-#[derive(Debug)]
+///
+/// Clones share the underlying [Client] and its single TCP connection.
+/// The client can safely be used from multiple threads, but only one
+/// request is in flight at a time: concurrent callers take turns on the
+/// connection. Create separate clients if requests must run in parallel.
+/// The connection is re-established transparently when it drops.
+#[derive(Debug, Clone)]
 pub struct BitcoinRpcClient {
-	client: Client,
-	url: String,
-	auth: Auth,
+	client: std::sync::Arc<Client>,
 }
 
 impl BitcoinRpcClient {
 	pub fn new(url: &str, auth: Auth) -> Result<Self, Error> {
 		Ok(BitcoinRpcClient {
-			client: Client::new(url, auth.clone())?,
-			url: url.to_owned(),
-			auth: auth,
+			client: std::sync::Arc::new(Client::new(url, auth)?),
 		})
 	}
 }
@@ -47,12 +57,6 @@ impl RpcApi for BitcoinRpcClient {
 		&self, cmd: &str, args: &[serde_json::Value],
 	) -> Result<T, Error> {
 		self.client.call(cmd, args)
-	}
-}
-
-impl Clone for BitcoinRpcClient {
-	fn clone(&self) -> Self {
-		Self::new(&self.url, self.auth.clone()).unwrap()
 	}
 }
 
@@ -339,18 +343,18 @@ pub trait BitcoinRpcExt: RpcApi {
 	fn tip(&self) -> Result<BlockRef, Error> {
 		let height = self.get_block_count()?;
 		let hash = self.get_block_hash(height)?;
-		Ok(BlockRef { height: height as BlockHeight, hash })
+		Ok(BlockRef { height: BlockHeight::new(height as u32), hash })
 	}
 
 	fn deep_tip(&self) -> Result<BlockRef, Error> {
 		let tip = self.get_block_count()?;
-		let height = tip.saturating_sub(DEEPLY_CONFIRMED as u64);
+		let height = tip.saturating_sub(DEEPLY_CONFIRMED.into());
 		let hash = self.get_block_hash(height)?;
-		Ok(BlockRef { height: height as BlockHeight, hash })
+		Ok(BlockRef { height: BlockHeight::new(height as u32), hash })
 	}
 
 	fn get_block_by_height(&self, height: BlockHeight) -> Result<BlockRef, Error> {
-		let hash = self.get_block_hash(height as u64)?;
+		let hash = self.get_block_hash(height.into())?;
 		Ok(BlockRef { height, hash })
 	}
 
@@ -360,7 +364,7 @@ pub trait BitcoinRpcExt: RpcApi {
 				Some(hash) => {
 					let block = self.get_block_header_info(&hash)?;
 					if block.confirmations > 0 {
-						Ok(TxStatus::Confirmed(BlockRef { height: block.height as BlockHeight, hash: block.hash }))
+						Ok(TxStatus::Confirmed(BlockRef { height: BlockHeight::new(block.height as u32), hash: block.hash }))
 					} else {
 						Ok(TxStatus::Mempool)
 					}
@@ -398,49 +402,9 @@ pub trait BitcoinRpcExt: RpcApi {
 		}
 		Ok(None)
 	}
-
-	/// Estimate the effective feerate of a mempool transaction.
-	///
-	/// Returns the effective feerate considering ancestors and CPFP from direct descendants.
-	/// Returns None if the transaction is not in the mempool.
-	fn estimate_mempool_feerate(
-		&self,
-		txid: Txid,
-	) -> RpcResult<Option<FeeRate>> {
-		let entry = match self.get_mempool_entry(&txid) {
-			Ok(e) => e,
-			Err(e) if e.is_not_found() => return Ok(None),
-			Err(e) => return Err(e),
-		};
-
-		let entry_feerate = |e: &json::GetMempoolEntryResult| -> Result<FeeRate, Error> {
-			ancestor_feerate(e.fees.ancestor, e.ancestor_size)
-				.ok_or(Error::UnexpectedStructure)
-		};
-
-		// Start with this tx's ancestor fee rate
-		let mut feerate = entry_feerate(&entry)?;
-
-		// Check direct descendants - if any has better ancestor rate, use that (CPFP)
-		for descendant_txid in &entry.spent_by {
-			if let Ok(desc_entry) = self.get_mempool_entry(descendant_txid) {
-				feerate = std::cmp::max(feerate, entry_feerate(&desc_entry)?);
-			}
-		}
-
-		Ok(Some(feerate))
-	}
 }
 
 impl <T: RpcApi> BitcoinRpcExt for T {}
-
-/// Effective feerate for a mempool entry given its ancestor fee total and
-/// ancestor package size (in vbytes, as returned by `getmempoolentry`).
-/// Returns `None` if the size is zero or the math overflows.
-fn ancestor_feerate(ancestor_fee: Amount, ancestor_size_vb: u64) -> Option<FeeRate> {
-	let weight = Weight::from_vb(ancestor_size_vb)?;
-	FeeRate::from_amount_and_weight_ceil(ancestor_fee, weight)
-}
 
 /// Creates a bitcoind RPC client, optionally routing through a SOCKS5 proxy.
 ///
@@ -464,40 +428,72 @@ pub fn create_client(
 	Client::new(url, auth)
 }
 
-#[cfg(test)]
-mod test {
-	use super::*;
+/// Error from [BitcoinAsyncRpcExt::require_txindex].
+#[cfg(feature = "rpc-async")]
+#[derive(Debug, thiserror::Error)]
+pub enum TxindexError {
+	#[error("failed to getindexinfo from bitcoind")]
+	Rpc(#[from] AsyncClientError),
+	#[error("txindex is not enabled. Run bitcoind with txindex = 1")]
+	NotEnabled,
+}
 
-	// Regression: a previous implementation computed
-	// `sat * (250 / ancestor_size)` due to integer-division precedence,
-	// returning feerate 0 for any tx with `ancestor_size > 250` vbytes.
+/// How the async client reports a JSON-RPC `result` of `null`.
+///
+/// It has no typed representation for one: `Client::call` turns a missing result
+/// into `ClientError::Other` carrying this message, and `call_raw` delegates to
+/// `call`, so matching the message is the only way to tell a null result from a
+/// genuine failure. Keep it in one place — were the upstream wording to change,
+/// every caller of [BitcoinAsyncRpcExt::try_get_tx_out] would quietly stop recognising
+/// a spent output.
+#[cfg(feature = "rpc-async")]
+const ASYNC_CLIENT_NULL_RESULT: &str = "Empty data received";
 
-	#[test]
-	fn ancestor_feerate_above_250_vbytes_is_nonzero() {
-		// 1000 vbytes is well above the buggy threshold.
-		// sat/kwu = ceil(10_000 * 1000 / (1000 * 4)) = 2_500
-		let fr = ancestor_feerate(Amount::from_sat(10_000), 1_000).unwrap();
-		assert_eq!(fr.to_sat_per_kwu(), 2_500);
+/// Extension trait for the async bitcoind rpc client.
+#[cfg(feature = "rpc-async")]
+#[async_trait]
+pub trait BitcoinAsyncRpcExt {
+	/// Checks that the connected bitcoind runs with `txindex=1`.
+	async fn require_txindex(&self) -> Result<(), TxindexError>;
+
+	/// `gettxout`, reporting the `null` of a spent or unknown output as `Ok(None)`.
+	///
+	/// Distinct from `Reader::get_tx_out`, which surfaces that `null` as an error.
+	///
+	/// Without `include_mempool` this reads the confirmed utxo set alone, so an
+	/// output spent only by a mempool transaction still reports as present.
+	async fn try_get_tx_out(
+		&self,
+		outpoint: OutPoint,
+		include_mempool: bool,
+	) -> Result<Option<json::GetTxOutResult>, AsyncClientError>;
+}
+
+#[cfg(feature = "rpc-async")]
+#[async_trait]
+impl BitcoinAsyncRpcExt for AsyncClient {
+	async fn require_txindex(&self) -> Result<(), TxindexError> {
+		let info: json::GetIndexInfoResult = self.call_raw("getindexinfo", &[]).await?;
+		if info.txindex.is_none() {
+			return Err(TxindexError::NotEnabled);
+		}
+		Ok(())
 	}
 
-	#[test]
-	fn ancestor_feerate_just_above_threshold() {
-		// 251 vbytes - one above where the old code started returning 0.
-		// sat/kwu = ceil(10_000 * 1000 / 1004) = ceil(9960.16) = 9_961
-		let fr = ancestor_feerate(Amount::from_sat(10_000), 251).unwrap();
-		assert_eq!(fr.to_sat_per_kwu(), 9_961);
-	}
-
-	#[test]
-	fn ancestor_feerate_below_250_no_precision_loss() {
-		// 100 vbytes - old code gave sat * 2 instead of sat * 2.5 (20% off).
-		// sat/kwu = ceil(1_000 * 1000 / 400) = 2_500
-		let fr = ancestor_feerate(Amount::from_sat(1_000), 100).unwrap();
-		assert_eq!(fr.to_sat_per_kwu(), 2_500);
-	}
-
-	#[test]
-	fn ancestor_feerate_zero_size_is_none() {
-		assert_eq!(ancestor_feerate(Amount::from_sat(1_000), 0), None);
+	async fn try_get_tx_out(
+		&self,
+		outpoint: OutPoint,
+		include_mempool: bool,
+	) -> Result<Option<json::GetTxOutResult>, AsyncClientError> {
+		let params = [
+			serde_json::Value::String(outpoint.txid.to_string()),
+			outpoint.vout.into(),
+			include_mempool.into(),
+		];
+		match self.call_raw::<json::GetTxOutResult>("gettxout", &params).await {
+			Ok(res) => Ok(Some(res)),
+			Err(AsyncClientError::Other(msg)) if msg == ASYNC_CLIENT_NULL_RESULT => Ok(None),
+			Err(e) => Err(e),
+		}
 	}
 }

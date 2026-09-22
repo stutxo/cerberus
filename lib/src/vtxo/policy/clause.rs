@@ -63,7 +63,7 @@ pub struct DelayedSignClause {
 impl DelayedSignClause {
 	/// Returns the input sequence value for this clause.
 	pub fn sequence(&self) -> Sequence {
-		Sequence::from_height(self.block_delta)
+		self.block_delta.into()
 	}
 }
 
@@ -120,7 +120,7 @@ pub struct TimelockSignClause {
 impl TimelockSignClause {
 	/// Returns the absolute locktime for this clause.
 	pub fn locktime(&self) -> LockTime {
-		LockTime::from_height(self.timelock_height).expect("timelock height is valid")
+		self.timelock_height.to_locktime().expect("timelock height is valid")
 	}
 }
 
@@ -177,12 +177,12 @@ pub struct DelayedTimelockSignClause {
 impl DelayedTimelockSignClause {
 	/// Returns the input sequence for this clause.
 	pub fn sequence(&self) -> Sequence {
-		Sequence::from_height(self.block_delta)
+		self.block_delta.into()
 	}
 
 	/// Returns the absolute locktime for this clause.
 	pub fn locktime(&self) -> LockTime {
-		LockTime::from_height(self.timelock_height).expect("timelock height is valid")
+		self.timelock_height.to_locktime().expect("timelock height is valid")
 	}
 }
 
@@ -243,30 +243,27 @@ pub struct HashDelaySignClause {
 impl HashDelaySignClause {
 	/// Returns the input sequence for this clause.
 	pub fn sequence(&self) -> Sequence {
-		Sequence::from_height(self.block_delta)
+		self.block_delta.into()
 	}
 
 	/// Try to extract the preimage from a witness that spends this clause.
 	///
-	/// Witness layout: `[signature, preimage, tapscript, control_block]`.
-	/// Returns the preimage if it is 32 bytes and hashes to the given payment hash.
+	/// Our own clauses build the witness `[signature, preimage, tapscript,
+	/// control_block]`. Bitcoin accepts more than that one shape for the same spend.
+	/// BIP341 permits an optional annex as the final witness item, and script
+	/// execution removes the annex before the tapscript runs. So `[signature,
+	/// preimage, tapscript, control_block, annex]` satisfies the same clause, and
+	/// consensus accepts it.
+	///
+	/// A 32-byte item that hashes to the payment hash is the preimage, whatever its
+	/// position. The witness is already mined, so the preimage is public either way.
 	pub fn extract_preimage_from_witness(
 		witness: &Witness,
 		payment_hash: PaymentHash,
 	) -> Option<Preimage> {
-		if witness.len() != 4 {
-			return None;
-		}
-
-		let bytes = witness.nth(1)?;
-		let bytes: [u8; 32] = bytes.try_into().ok()?;
-
-		let preimage = Preimage::from(bytes);
-		if preimage.compute_payment_hash() != payment_hash {
-			return None;
-		}
-
-		Some(preimage)
+		witness.iter()
+			.filter_map(|item| Preimage::try_from(item).ok())
+			.find(|preimage| preimage.compute_payment_hash() == payment_hash)
 	}
 }
 
@@ -319,6 +316,92 @@ impl Into<VtxoClause> for HashDelaySignClause {
 	}
 }
 
+/// A clause that allows to sign and spend the UTXO after a relative
+/// timelock, if preimage matching the hash is provided.
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct HashDelaySignClause_v0 {
+	pub pubkey: PublicKey,
+	pub hash: sha256::Hash,
+	pub block_delta: BlockDelta,
+}
+
+impl HashDelaySignClause_v0 {
+	/// Returns the input sequence for this clause.
+	pub fn sequence(&self) -> Sequence {
+		self.block_delta.into()
+	}
+
+	/// Try to extract the preimage from a witness that spends this clause.
+	///
+	/// Our own clauses build the witness `[signature, preimage, tapscript,
+	/// control_block]`. Bitcoin accepts more than that one shape for the same spend.
+	/// BIP341 permits an optional annex as the final witness item, and script
+	/// execution removes the annex before the tapscript runs. So `[signature,
+	/// preimage, tapscript, control_block, annex]` satisfies the same clause, and
+	/// consensus accepts it.
+	///
+	/// A 32-byte item that hashes to the payment hash is the preimage, whatever its
+	/// position. The witness is already mined, so the preimage is public either way.
+	pub fn extract_preimage_from_witness(
+		witness: &Witness,
+		payment_hash: PaymentHash,
+	) -> Option<Preimage> {
+		witness.iter()
+			.filter_map(|item| Preimage::try_from(item).ok())
+			.find(|preimage| preimage.compute_payment_hash() == payment_hash)
+	}
+}
+
+impl TapScriptClause for HashDelaySignClause_v0 {
+	type WitnessData = (schnorr::Signature, [u8; 32]);
+
+	fn tapscript(&self) -> ScriptBuf {
+		scripts::hash_delay_sign_v0(
+			self.hash,
+			self.block_delta,
+			self.pubkey.x_only_public_key().0,
+		)
+	}
+
+	fn witness(
+		&self,
+		data: &Self::WitnessData,
+		control_block: &ControlBlock,
+	) -> Witness {
+		let (signature, preimage) = data;
+		Witness::from_slice(&[
+			&signature[..],
+			&preimage[..],
+			self.tapscript().as_bytes(),
+			&control_block.serialize()[..],
+		])
+	}
+
+	// See `TapScriptClause::witness_size` for the overflow analysis.
+	#[allow(clippy::arithmetic_side_effects)]
+	fn witness_size<G, P: Policy>(&self, vtxo: &Vtxo<G, P>) -> usize {
+		let cb_size = self.control_block(vtxo).size();
+		let tapscript_size = self.tapscript().as_bytes().len();
+
+		1 // byte for the number of witness elements
+		+ 1  // schnorr signature size byte
+		+ SCHNORR_SIGNATURE_SIZE // schnorr sig bytes
+		+ 1  // preimage size byte
+		+ 32 // preimage bytes
+		+ VarInt::from(tapscript_size).size()  // tapscript size bytes
+		+ tapscript_size // tapscript bytes
+		+ VarInt::from(cb_size).size()  // control block size bytes
+		+ cb_size // control block bytes
+	}
+}
+
+impl Into<VtxoClause> for HashDelaySignClause_v0 {
+	fn into(self) -> VtxoClause {
+		VtxoClause::HashDelaySign_v0(self)
+	}
+}
+
 /// A clause that allows spending by revealing a preimage and providing a signature.
 ///
 /// This is used for the unlock clause in hArk leaf outputs, where the aggregate
@@ -334,6 +417,62 @@ impl TapScriptClause for HashSignClause {
 
 	fn tapscript(&self) -> ScriptBuf {
 		scripts::hash_and_sign(self.hash, self.pubkey.x_only_public_key().0)
+	}
+
+	fn witness(
+		&self,
+		data: &Self::WitnessData,
+		control_block: &ControlBlock,
+	) -> Witness {
+		let (signature, preimage) = data;
+		Witness::from_slice(&[
+			&signature[..],
+			&preimage[..],
+			self.tapscript().as_bytes(),
+			&control_block.serialize()[..],
+		])
+	}
+
+	// See `TapScriptClause::witness_size` for the overflow analysis.
+	#[allow(clippy::arithmetic_side_effects)]
+	fn witness_size<G, P: Policy>(&self, vtxo: &Vtxo<G, P>) -> usize {
+		let cb_size = self.control_block(vtxo).size();
+		let tapscript_size = self.tapscript().as_bytes().len();
+
+		1 // byte for the number of witness elements
+		+ 1  // schnorr signature size byte
+		+ SCHNORR_SIGNATURE_SIZE // schnorr sig bytes
+		+ 1  // preimage size byte
+		+ 32 // preimage bytes
+		+ VarInt::from(tapscript_size).size()  // tapscript size bytes
+		+ tapscript_size // tapscript bytes
+		+ VarInt::from(cb_size).size()  // control block size bytes
+		+ cb_size // control block bytes
+	}
+}
+
+impl Into<VtxoClause> for HashSignClause {
+	fn into(self) -> VtxoClause {
+		VtxoClause::HashSign(self)
+	}
+}
+
+/// A clause that allows spending by revealing a preimage and providing a signature.
+///
+/// This is used for the unlock clause in hArk leaf outputs, where the aggregate
+/// pubkey of user+server must sign, and a preimage must be revealed.
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct HashSignClause_v0 {
+	pub pubkey: PublicKey,
+	pub hash: sha256::Hash,
+}
+
+impl TapScriptClause for HashSignClause_v0 {
+	type WitnessData = (schnorr::Signature, [u8; 32]);
+
+	fn tapscript(&self) -> ScriptBuf {
+		scripts::hash_and_sign_v0(self.hash, self.pubkey.x_only_public_key().0)
 	}
 
 	fn witness(
@@ -370,9 +509,9 @@ impl TapScriptClause for HashSignClause {
 	}
 }
 
-impl Into<VtxoClause> for HashSignClause {
+impl Into<VtxoClause> for HashSignClause_v0 {
 	fn into(self) -> VtxoClause {
-		VtxoClause::HashSign(self)
+		VtxoClause::HashSign_v0(self)
 	}
 }
 
@@ -383,6 +522,10 @@ pub enum VtxoClause {
 	DelayedTimelockSign(DelayedTimelockSignClause),
 	HashDelaySign(HashDelaySignClause),
 	HashSign(HashSignClause),
+	#[allow(non_camel_case_types)]
+	HashDelaySign_v0(HashDelaySignClause_v0),
+	#[allow(non_camel_case_types)]
+	HashSign_v0(HashSignClause_v0),
 }
 
 impl VtxoClause {
@@ -394,6 +537,8 @@ impl VtxoClause {
 			Self::DelayedTimelockSign(c) => c.pubkey,
 			Self::HashDelaySign(c) => c.pubkey,
 			Self::HashSign(c) => c.pubkey,
+			Self::HashDelaySign_v0(c) => c.pubkey,
+			Self::HashSign_v0(c) => c.pubkey,
 		}
 	}
 
@@ -406,6 +551,8 @@ impl VtxoClause {
 			Self::DelayedTimelockSign(c) => c.tapscript(),
 			Self::HashDelaySign(c) => c.tapscript(),
 			Self::HashSign(c) => c.tapscript(),
+			Self::HashDelaySign_v0(c) => c.tapscript(),
+			Self::HashSign_v0(c) => c.tapscript(),
 		}
 	}
 
@@ -417,6 +564,8 @@ impl VtxoClause {
 			Self::DelayedTimelockSign(c) => Some(c.sequence()),
 			Self::HashDelaySign(c) => Some(c.sequence()),
 			Self::HashSign(_) => None,
+			Self::HashDelaySign_v0(c) => Some(c.sequence()),
+			Self::HashSign_v0(_) => None,
 		}
 	}
 
@@ -428,6 +577,8 @@ impl VtxoClause {
 			Self::DelayedTimelockSign(c) => c.control_block(vtxo),
 			Self::HashDelaySign(c) => c.control_block(vtxo),
 			Self::HashSign(c) => c.control_block(vtxo),
+			Self::HashDelaySign_v0(c) => c.control_block(vtxo),
+			Self::HashSign_v0(c) => c.control_block(vtxo),
 		}
 	}
 
@@ -439,6 +590,8 @@ impl VtxoClause {
 			Self::DelayedTimelockSign(c) => c.witness_size(vtxo),
 			Self::HashDelaySign(c) => c.witness_size(vtxo),
 			Self::HashSign(c) => c.witness_size(vtxo),
+			Self::HashDelaySign_v0(c) => c.witness_size(vtxo),
+			Self::HashSign_v0(c) => c.witness_size(vtxo),
 		}
 	}
 }
@@ -472,6 +625,8 @@ mod tests {
 			VtxoClause::DelayedTimelockSign(_) => true,
 			VtxoClause::HashDelaySign(_) => true,
 			VtxoClause::HashSign(_) => true,
+			VtxoClause::HashDelaySign_v0(_) => true,
+			VtxoClause::HashSign_v0(_) => true,
 		}
 	}
 
@@ -525,7 +680,7 @@ mod tests {
 	fn test_delayed_sign_clause() {
 		let clause = DelayedSignClause {
 			pubkey: USER_KEYPAIR.public_key(),
-			block_delta: 100,
+			block_delta: BlockDelta::new(100),
 		};
 
 		// We compute taproot material for the clause
@@ -556,7 +711,7 @@ mod tests {
 	fn test_timelock_sign_clause() {
 		let clause = TimelockSignClause {
 			pubkey: USER_KEYPAIR.public_key(),
-			timelock_height: 100,
+			timelock_height: BlockHeight::new(100),
 		};
 
 		// We compute taproot material for the clause
@@ -588,8 +743,8 @@ mod tests {
 	fn test_delayed_timelock_clause() {
 		let clause = DelayedTimelockSignClause {
 			pubkey: USER_KEYPAIR.public_key(),
-			timelock_height: 100,
-			block_delta: 24,
+			timelock_height: BlockHeight::new(100),
+			block_delta: BlockDelta::new(24),
 		};
 
 		// We compute taproot material for the clause
@@ -621,10 +776,10 @@ mod tests {
 	fn test_hash_delay_clause() {
 		let preimage = [0; 32];
 
-		let clause = HashDelaySignClause {
+		let clause = HashDelaySignClause_v0 {
 			pubkey: USER_KEYPAIR.public_key(),
 			hash: sha256::Hash::hash(&preimage),
-			block_delta: 24,
+			block_delta: BlockDelta::new(24),
 		};
 
 		// We compute taproot material for the clause
@@ -656,10 +811,10 @@ mod tests {
 		let preimage_bytes = [42u8; 32];
 		let payment_hash = sha256::Hash::hash(&preimage_bytes);
 
-		let clause = HashDelaySignClause {
+		let clause = HashDelaySignClause_v0 {
 			pubkey: USER_KEYPAIR.public_key(),
 			hash: payment_hash,
-			block_delta: 24,
+			block_delta: BlockDelta::new(24),
 		};
 
 		// Build a valid witness via the clause
@@ -681,7 +836,7 @@ mod tests {
 		let witness = clause.witness(&(sig, preimage_bytes), &cb);
 
 		// Extract should succeed with correct payment hash
-		let extracted = HashDelaySignClause::extract_preimage_from_witness(
+		let extracted = HashDelaySignClause_v0::extract_preimage_from_witness(
 			&witness,
 			payment_hash.into(),
 		);
@@ -690,19 +845,120 @@ mod tests {
 
 		// Extract should fail with wrong payment hash
 		let wrong_hash = sha256::Hash::hash(&[0u8; 32]);
-		let extracted = HashDelaySignClause::extract_preimage_from_witness(
+		let extracted = HashDelaySignClause_v0::extract_preimage_from_witness(
 			&witness,
 			wrong_hash.into(),
 		);
 		assert!(extracted.is_none());
 
-		// Extract should fail with wrong witness length
-		let short_witness = Witness::from_slice(&[&sig[..], &preimage_bytes[..]]);
-		let extracted = HashDelaySignClause::extract_preimage_from_witness(
-			&short_witness,
+		// Extract should fail on a witness that reveals no matching preimage
+		let other_preimage = [7u8; 32];
+		let no_preimage = Witness::from_slice(&[
+			&sig[..],
+			&other_preimage[..],
+			clause.tapscript().as_bytes(),
+			&cb.serialize()[..],
+		]);
+		let extracted = HashDelaySignClause_v0::extract_preimage_from_witness(
+			&no_preimage,
 			payment_hash.into(),
 		);
 		assert!(extracted.is_none());
+	}
+
+	/// Build a script-path spend of a hash-delay tapscript that carries a BIP341
+	/// annex, and return its witness.
+	///
+	/// Panics if consensus rejects the spend. A caller therefore always asserts
+	/// against a witness that a miner can confirm.
+	fn annexed_hash_delay_spend(
+		tapscript: ScriptBuf,
+		sequence: Sequence,
+		preimage: [u8; 32],
+	) -> Witness {
+		let (taproot, cb) = taproot_material(tapscript.clone());
+		let tx_in = TxOut {
+			script_pubkey: taproot.script_pubkey(),
+			value: Amount::from_sat(1_000_000),
+		};
+
+		let mut tx = transaction();
+		tx.input.push(TxIn {
+			previous_output: OutPoint::new(Txid::all_zeros(), 0),
+			script_sig: ScriptBuf::default(),
+			sequence,
+			witness: Witness::new(),
+		});
+
+		// A final witness item that starts with 0x50 is the annex. The sighash
+		// commits to the annex, but script execution removes it before the
+		// tapscript runs. The stack the tapscript reads is unchanged.
+		let annex = [0x50u8, 0xde, 0xad, 0xbe, 0xef];
+
+		let leaf_hash = taproot::TapLeafHash::from_script(
+			&tapscript,
+			taproot::LeafVersion::TapScript,
+		);
+		let mut shc = sighash::SighashCache::new(&tx);
+		let sighash = shc.taproot_signature_hash(
+			0,
+			&sighash::Prevouts::All(&[tx_in.clone()]),
+			Some(sighash::Annex::new(&annex).unwrap()),
+			Some((leaf_hash, 0xFFFFFFFF)),
+			sighash::TapSighashType::Default,
+		).expect("all prevouts provided");
+		let sig = SECP.sign_schnorr(&sighash.into(), &*USER_KEYPAIR);
+
+		let witness = Witness::from_slice(&[
+			&sig[..],
+			&preimage[..],
+			tapscript.as_bytes(),
+			&cb.serialize()[..],
+			&annex[..],
+		]);
+		assert!(witness.taproot_annex().is_some());
+		tx.input[0].witness = witness.clone();
+
+		// The annex makes this spend nonstandard to relay, but not invalid.
+		// Consensus accepts it, so a miner can confirm a spend that a parser
+		// which expects a four-item witness does not recognize.
+		verify_tx(&[tx_in], 0, &tx).expect("annexed spend is invalid");
+
+		witness
+	}
+
+	#[test]
+	fn test_extract_preimage_from_annexed_witness() {
+		let preimage_bytes = [42u8; 32];
+		let payment_hash = sha256::Hash::hash(&preimage_bytes);
+
+		let clause = HashDelaySignClause {
+			pubkey: USER_KEYPAIR.public_key(),
+			hash: payment_hash,
+			block_delta: BlockDelta::new(24),
+		};
+		let witness = annexed_hash_delay_spend(
+			clause.tapscript(), clause.sequence(), preimage_bytes,
+		);
+		let extracted = HashDelaySignClause::extract_preimage_from_witness(
+			&witness,
+			payment_hash.into(),
+		).expect("no preimage extracted from annexed witness");
+		assert_eq!(extracted.as_ref(), &preimage_bytes);
+
+		let clause_v0 = HashDelaySignClause_v0 {
+			pubkey: USER_KEYPAIR.public_key(),
+			hash: payment_hash,
+			block_delta: BlockDelta::new(24),
+		};
+		let witness = annexed_hash_delay_spend(
+			clause_v0.tapscript(), clause_v0.sequence(), preimage_bytes,
+		);
+		let extracted = HashDelaySignClause_v0::extract_preimage_from_witness(
+			&witness,
+			payment_hash.into(),
+		).expect("no preimage extracted from annexed witness");
+		assert_eq!(extracted.as_ref(), &preimage_bytes);
 	}
 
 	#[test]
@@ -713,7 +969,7 @@ mod tests {
 		// HashSignClause uses an x-only aggregate public key
 		let agg_pk = musig::combine_keys([USER_KEYPAIR.public_key(), SERVER_KEYPAIR.public_key()]);
 
-		let clause = HashSignClause {
+		let clause = HashSignClause_v0 {
 			pubkey: agg_pk,
 			hash,
 		};

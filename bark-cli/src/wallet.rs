@@ -6,10 +6,10 @@
 //! - Reads a BIP-39 `mnemonic` file from the provided directory
 //! - Parses `config.toml` into a [`bark::Config`]
 //! - Opens `db.sqlite` as a [`bark::persist::sqlite::SqliteClient`] and loads persisted properties
-//! - Loads or creates the [`bark::onchain::OnchainWallet`]
-//! - Opens the [`bark::Wallet`] bound to the on-chain wallet
-//! - Returns `(bark::Wallet, bark::onchain::OnchainWallet)`
-//!
+//! - Loads or creates the [`bark::onchain::OnchainWallet`], wraps it in
+//!   `Arc<RwLock<_>>`, and stores it inside the [`bark::Wallet`] via
+//!   [`bark::OpenWalletArgs::onchain`] — BDK-specific methods are accessed
+//!   via downcasting through [`bark::Wallet::onchain`]
 //! ## Errors
 //! Returns an [`anyhow::Error`] with context describing the failing step (I/O, parsing,
 //! database access, or wallet initialization).
@@ -22,40 +22,44 @@
 //! # use bark_cli::wallet::open_wallet;
 //! # async fn example() -> anyhow::Result<()> {
 //!     let datadir = Path::new("./bark_data");
-//!     let (bark_wallet, onchain_wallet) = open_wallet(datadir).await?.unwrap();
-//!     // Use the wallets...
+//!     let bark_wallet = open_wallet(datadir, "myapp/1.0").await?.unwrap();
+//!     // Use the wallet...
 //!     Ok(())
 //! # }
 //! ```
 
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::str::FromStr;
 
 use anyhow::{Context, bail};
+use bark::chain::ChainSource;
+use bark::fs_perms;
 use bark::persist::adaptor::StorageAdaptorWrapper;
 use bitcoin::Network;
 use clap::Args;
 use log::{debug, info, warn};
 use tonic::transport::Uri;
 
-use bark::{BarkNetwork, Config, Wallet as BarkWallet};
+use bark::{BarkNetwork, Config, OpenWalletArgs, Wallet as BarkWallet, WalletSeed};
 use bark::lock_manager::{self, LockManager, PidLockError};
 use bark::lock_manager::pid_flock::LOCK_FILE;
 use bark::onchain::OnchainWallet;
 use bark::persist::BarkPersister;
-use bark::persist::sqlite::SqliteClient;
+use bark::persist::sqlite::{SqliteClient, DEFAULT_DB_FILE};
 use bark::persist::adaptor::filestore::FileStorageAdaptor;
 
 use bitcoin_ext::BlockHeight;
 
+use crate::connection::{self, BARKD_LOCK_FILE};
 use crate::util;
 
 /// File name of the mnemonic file.
 const MNEMONIC_FILE: &str = "mnemonic";
 
 /// File name of the database file.
-const DB_FILE: &str = "db.sqlite";
+const DB_FILE: &str = DEFAULT_DB_FILE;
 /// File name of the filestore database file.
 const FILESTORE_FILE: &str = "wallet.json";
 
@@ -76,7 +80,7 @@ const STDERR_LOG_FILE: &str = "stderr.log";
 /// Take the datadir lock via [`lock_manager::platform_default`], surfacing
 /// the "already held" case as-is so the CLI prints a clean error.
 fn open_lock_manager(datadir: &Path) -> anyhow::Result<Box<dyn LockManager>> {
-	match lock_manager::platform_default(datadir) {
+	match lock_manager::platform_default(Some(datadir), None) {
 		Ok(m) => Ok(m),
 		Err(e) if e.is::<PidLockError>() => Err(e),
 		Err(e) => Err(e.context("failed to acquire datadir lock")),
@@ -90,8 +94,9 @@ pub struct ConfigOpts {
 	#[arg(long)]
 	pub ark: Option<String>,
 
-	/// The access token for a private server
-	#[arg(long)]
+	/// [DEPRECATED] The access token for a private server.
+	/// Access tokens are no longer enforced by the server; this flag will be removed.
+	#[arg(long, hide = true)]
 	pub access_token: Option<String>,
 
 	/// The address of the Esplora HTTP server to use.
@@ -128,16 +133,25 @@ pub struct ConfigOpts {
 	/// Automatically bypassed for localhost connections.
 	#[arg(long)]
 	pub socks5_proxy: Option<String>,
+
+	/// How many consecutive unused key indices a VTXO key scan may cross before
+	/// it concludes the wallet doesn't own a recovered/imported VTXO.
+	#[arg(long)]
+	pub gap_limit: Option<u32>,
 }
 
 impl ConfigOpts {
 	/// Fill the default required config fields based on network
-	fn fill_network_defaults(&mut self, net: BarkNetwork) {
+	pub fn fill_network_defaults(&mut self, net: BarkNetwork) {
 		// Fallback to our default mainnet
 		if net == BarkNetwork::Mainnet {
 			// Only do it when the user did *not* specify either --esplora or --bitcoind.
 			if self.esplora.is_none() && self.bitcoind.is_none() {
 				self.esplora = Some("https://mempool.second.tech/api".to_owned());
+			}
+
+			if self.ark.is_none() {
+				self.ark = Some("https://ark.second.tech/".to_owned());
 			}
 		}
 
@@ -178,6 +192,13 @@ impl ConfigOpts {
 			(_, true, _, _) => bail!("Bitcoind user/pass shouldn't be provided together with cookie file"),
 			(_, _, true, true) => {},
 			_ => bail!("When providing --bitcoind, you need to provide auth args as well."),
+		}
+
+		if let Some(gap_limit) = self.gap_limit {
+			if gap_limit > bark::MAX_VTXO_KEY_GAP_LIMIT {
+				bail!("--gap-limit {} is above the maximum of {}",
+					gap_limit, bark::MAX_VTXO_KEY_GAP_LIMIT);
+			}
 		}
 
 		if let Some(ref proxy) = self.socks5_proxy {
@@ -225,11 +246,13 @@ impl ConfigOpts {
 		if let Some(ref v) = self.socks5_proxy {
 			writeln!(conf, "socks5_proxy = \"{}\"", v).unwrap();
 		}
+		if let Some(v) = self.gap_limit {
+			writeln!(conf, "vtxo_key_gap_limit = {}", v).unwrap();
+		}
 
 		let path = path.as_ref();
-		std::fs::write(path, conf).with_context(|| format!(
-			"error writing new config file to {}", path.display(),
-		))?;
+
+		fs_perms::write_atomic_owner_only(path, conf.as_bytes())?;
 
 		// new let's try load it to make sure it's sane
 		Ok(Config::load(network, path).context("problematic config flags provided")?)
@@ -276,6 +299,27 @@ pub struct CreateOpts {
 	pub config: ConfigOpts,
 }
 
+/// Non-wallet files barkd leaves in the datadir; they must survive a wallet create.
+const EXPECTED_DATADIR_FILES: [&str; 6] = [
+	DEBUG_LOG_FILE,
+	STDOUT_LOG_FILE,
+	STDERR_LOG_FILE,
+	LOCK_FILE,
+	AUTH_TOKEN_FILE,
+	BARKD_LOCK_FILE,
+];
+
+/// Whether `name` is an expected datadir file or an atomic-write temp
+/// sibling of one (`.<name>.temp.<nanos>.<n>.tmp`).
+fn is_expected_datadir_file(name: &str) -> bool {
+	EXPECTED_DATADIR_FILES.iter().chain(&[CONFIG_FILE]).any(|expected| {
+		name == *expected || name.strip_prefix('.')
+			.and_then(|s| s.strip_prefix(expected))
+			.and_then(|s| s.strip_prefix(".temp."))
+			.is_some_and(|s| s.ends_with(".tmp"))
+	})
+}
+
 /// Checks the config file and maybe cleans it
 /// - returns whether a config file was present
 /// - if clean is false, errors if any file not config or logs is present
@@ -290,16 +334,7 @@ async fn check_clean_datadir(datadir: &Path, clean: bool) -> anyhow::Result<bool
 				has_config = true;
 				continue;
 			}
-			if item.file_name() == DEBUG_LOG_FILE
-				|| item.file_name() == STDOUT_LOG_FILE
-				|| item.file_name() == STDERR_LOG_FILE
-			{
-				continue;
-			}
-			if item.file_name() == LOCK_FILE {
-				continue;
-			}
-			if item.file_name() == AUTH_TOKEN_FILE {
+			if is_expected_datadir_file(&item.file_name().to_string_lossy()) {
 				continue;
 			}
 
@@ -322,7 +357,11 @@ async fn check_clean_datadir(datadir: &Path, clean: bool) -> anyhow::Result<bool
 	Ok(has_config)
 }
 
-pub async fn create_wallet(datadir: &Path, opts: CreateOpts) -> anyhow::Result<()> {
+pub async fn create_wallet(
+	datadir: &Path,
+	user_agent: &str,
+	opts: CreateOpts,
+) -> anyhow::Result<()> {
 	debug!("Creating wallet in {}", datadir.display());
 
 	let net = match (opts.mainnet, opts.signet, opts.regtest, opts.mutinynet) {
@@ -337,16 +376,19 @@ pub async fn create_wallet(datadir: &Path, opts: CreateOpts) -> anyhow::Result<(
 	let config_existed = check_clean_datadir(datadir, opts.force).await?;
 
 	// Everything that errors after this will wipe the datadir again.
-	let result = try_create_wallet(datadir, net, opts).await;
+	let result = try_create_wallet(datadir, net, user_agent, opts).await;
 	if let Err(e) = result {
 		if config_existed {
 			if let Err(e) = check_clean_datadir(datadir, true).await {
 				warn!("Error cleaning datadir after failure: {:#}", e);
 			}
 		} else {
-			if let Err(e) = tokio::fs::remove_dir_all(datadir).await {
-				warn!("Error removing datadir after failure: {:#}", e);
+			// A barkd serving this datadir must keep its lock and auth
+			// token; drop the datadir itself only when nothing is left.
+			if let Err(e) = connection::wipe_datadir_except_barkd_files(datadir) {
+				warn!("Error cleaning datadir after failure: {:#}", e);
 			}
+			let _ = fs::remove_dir(datadir);
 		}
 
 		bail!("Error while creating wallet: {:#}", e);
@@ -358,28 +400,39 @@ pub async fn create_wallet(datadir: &Path, opts: CreateOpts) -> anyhow::Result<(
 async fn try_create_wallet(
 	datadir: &Path,
 	net: BarkNetwork,
+	user_agent: &str,
 	mut opts: CreateOpts,
 ) -> anyhow::Result<()> {
 	info!("Creating new bark Wallet at {}", datadir.display());
 
 	tokio::fs::create_dir_all(datadir).await.context("can't create dir")?;
 
+	fs_perms::harden(datadir, 0o700)?;
+
 	let config_path = datadir.join(CONFIG_FILE);
 	let has_config_args = opts.config != ConfigOpts::default();
-	let config = match (config_path.exists(), has_config_args) {
+	let mut config = match (config_path.exists(), has_config_args) {
 		(true, false) => {
 			Config::load(net.as_bitcoin(), &config_path).with_context(|| format!(
 				"error loading existing config file at {}", config_path.display(),
 			))?
 		},
-		(false, true) => {
+		// Without config args the network defaults alone can suffice;
+		// validate rejects networks that lack a default chain source
+		// (e.g. regtest).
+		(false, _) => {
 			opts.config.fill_network_defaults(net);
 			opts.config.validate().context("invalid config options")?;
 			opts.config.write_to_file(net.as_bitcoin(), config_path)?
 		},
-		(false, false) => bail!("You need to provide config flags or a config file"),
 		(true, true) => bail!("Cannot provide an existing config file and config flags"),
 	};
+
+	// Default the wire-level client identity to the calling binary unless the
+	// operator pinned one in config.toml.
+	if config.user_agent.is_none() {
+		config.user_agent = Some(user_agent.to_owned());
+	}
 
 	// A mnemonic implies that the user wishes to recover an existing wallet.
 	if opts.mnemonic.is_some() {
@@ -391,19 +444,27 @@ async fn try_create_wallet(
 		} else if config.esplora_address.is_some() {
 			warn!("The given --birthday-height will be ignored because you're using Esplora.");
 		}
-		warn!("Recovering from mnemonic currently only supports recovering on-chain funds!");
 	} else {
 		if opts.birthday_height.is_some() {
 			bail!("Can't set --birthday-height if --mnemonic is not set.");
 		}
 	}
 
+	// chain source client
+	let chain_spec = config.chain_source()
+		.context("failed to create a chain source client with the config")?;
+	let chain = ChainSource::new(chain_spec, net.as_bitcoin(), None, None).await
+		.context("failed to create a chain source client with the config")?;
+	chain.require_version().await.context("chain source version check failed")?;
+
 	// generate seed
 	let is_new_wallet = opts.mnemonic.is_none();
 	let mnemonic = opts.mnemonic.unwrap_or_else(|| bip39::Mnemonic::generate(12).expect("12 is valid"));
 	let seed = mnemonic.to_seed("");
-	tokio::fs::write(datadir.join(MNEMONIC_FILE), mnemonic.to_string().as_bytes()).await
-		.context("failed to write mnemonic")?;
+
+	fs_perms::create_new_owner_only(
+		&datadir.join(MNEMONIC_FILE), mnemonic.to_string().as_bytes(),
+	)?;
 
 	// open db
 	let db: Arc<dyn BarkPersister + Send + Sync> = if opts.use_filestore {
@@ -412,28 +473,54 @@ async fn try_create_wallet(
 		Arc::new(StorageAdaptorWrapper::new(adaptor))
 	} else {
 		debug!("Using sqlite backend");
-		Arc::new(SqliteClient::open(datadir.join(DB_FILE))?)
+		let db = SqliteClient::open(datadir.join(DB_FILE))?;
+		fs_perms::harden(&datadir.join(DB_FILE), 0o600)?;
+		Arc::new(db)
 	};
 
 	let mut onchain = OnchainWallet::load_or_create(net.as_bitcoin(), seed, db.clone()).await?;
 	let lock_manager = open_lock_manager(&datadir)?;
-	let wallet = BarkWallet::create_with_onchain(
-		&mnemonic, net.as_bitcoin(), config, db, lock_manager, &onchain, opts.force,
-	).await.context("error creating wallet")?;
 
 	// Skip initial block sync if we generated a new wallet.
 	let birthday_height = if is_new_wallet {
-		Some(wallet.chain.tip().await?)
+		Some(chain.tip().await?)
 	} else {
 		opts.birthday_height
 	};
-	onchain.initial_wallet_scan(&wallet.chain, birthday_height).await?;
+	onchain.initial_wallet_scan(&chain, birthday_height).await?;
+
+	// Create the wallet by opening with `create_if_not_exists` rather than
+	// calling `Wallet::create` directly: opening is what runs seed recovery, so
+	// a wallet restored from a mnemonic rebuilds its spendable VTXO set from the
+	// recovery mailbox. The on-chain scan above has already run, so recovery can
+	// validate recovered VTXOs against their chain anchors. `run_daemon` stays
+	// off — this only needs to create and recover.
+	BarkWallet::open(
+		net.as_bitcoin(),
+		WalletSeed::new_from_mnemonic(net.as_bitcoin(), &mnemonic),
+		config,
+		OpenWalletArgs {
+			persister: Some(db),
+			lock_manager: Some(lock_manager),
+			create_if_not_exists: true,
+			create_without_server: opts.force,
+			run_daemon: false,
+			..Default::default()
+		},
+	).await.context("error creating wallet")?;
 	Ok(())
 }
 
-pub async fn open_wallet(datadir: &Path) -> anyhow::Result<Option<(BarkWallet, OnchainWallet)>> {
-	debug!("Opening bark wallet in {}", datadir.display());
+/// Read the raw mnemonic phrase from the wallet datadir.
+pub async fn read_mnemonic(datadir: &Path) -> anyhow::Result<String> {
+	let path = datadir.join(MNEMONIC_FILE);
+	let s = tokio::fs::read_to_string(&path).await
+		.with_context(|| format!("failed to read mnemonic file at {}", path.display()))?;
+	Ok(s.trim().to_string())
+}
 
+pub async fn open_wallet(datadir: &Path, user_agent: &str) -> anyhow::Result<Option<BarkWallet>> {
+	debug!("Opening bark wallet in {}", datadir.display());
 
 	// read mnemonic file
 	let mnemonic_path = datadir.join(MNEMONIC_FILE);
@@ -445,6 +532,11 @@ pub async fn open_wallet(datadir: &Path) -> anyhow::Result<Option<(BarkWallet, O
 	if !tokio::fs::try_exists(&mnemonic_path).await? {
 		return Ok(None);
 	}
+
+	// The backend db (sqlite or filestore) is checked by its adaptor on open.
+	fs_perms::warn_if_loose(datadir, 0o700);
+	fs_perms::warn_if_loose(&mnemonic_path, 0o600);
+	fs_perms::warn_if_loose(&datadir.join(CONFIG_FILE), 0o600);
 
 	let mnemonic_str = tokio::fs::read_to_string(&mnemonic_path).await
 		.with_context(|| format!("failed to read mnemonic file at {}", mnemonic_path.display()))?;
@@ -464,17 +556,127 @@ pub async fn open_wallet(datadir: &Path) -> anyhow::Result<Option<(BarkWallet, O
 
 	// Read the config
 	let config_path = datadir.join("config.toml");
-	let config = Config::load(properties.network, config_path)
+	let mut config = Config::load(properties.network, config_path)
 		.context("error loading bark config file")?;
 
-	let bdk_wallet = OnchainWallet::load_or_create(properties.network, seed, db.clone()).await?;
-	let lock_manager = open_lock_manager(datadir)?;
-	let bark_wallet = BarkWallet::open_with_onchain(&mnemonic, db, &bdk_wallet, config, lock_manager).await?;
-
-	if let Err(e) = bark_wallet.require_chainsource_version().await {
-		warn!("{}", e);
+	// Default the wire-level client identity to the calling binary unless the
+	// operator pinned one in config.toml.
+	if config.user_agent.is_none() {
+		config.user_agent = Some(user_agent.to_owned());
 	}
 
-	Ok(Some((bark_wallet, bdk_wallet)))
+	let bdk_wallet = OnchainWallet::load_or_create(properties.network, seed, db.clone()).await?;
+	let onchain = Arc::new(tokio::sync::RwLock::new(bdk_wallet));
+	let lock_manager = open_lock_manager(datadir)?;
+	let bark_wallet = BarkWallet::open(
+		properties.network,
+		WalletSeed::new_from_mnemonic(properties.network, &mnemonic),
+		config,
+		OpenWalletArgs {
+			persister: Some(db),
+			lock_manager: Some(lock_manager),
+			onchain: Some(onchain.clone()),
+			run_daemon: false,
+			..Default::default()
+		},
+	).await?;
+
+	Ok(Some(bark_wallet))
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	fn tmp_dir() -> std::path::PathBuf {
+		let dir = std::env::temp_dir()
+			.join(format!("bark-wallet-{}", std::process::id()))
+			.join(format!("{}", std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+		fs::create_dir_all(&dir).unwrap();
+		dir
+	}
+
+	/// Options that fail wallet creation with "provide config flags or a
+	/// config file", after the datadir checks.
+	fn failing_create_opts() -> CreateOpts {
+		CreateOpts {
+			force: false,
+			use_filestore: false,
+			mainnet: false,
+			regtest: false,
+			signet: true,
+			mutinynet: false,
+			mnemonic: None,
+			birthday_height: None,
+			config: ConfigOpts::default(),
+		}
+	}
+
+	/// --gap-limit is config, not a one-shot: it must land in config.toml so
+	/// later commands (imports, a re-created wallet) see the same limit.
+	#[test]
+	fn gap_limit_is_written_to_config() {
+		let dir = tmp_dir();
+		let path = dir.join(CONFIG_FILE);
+		let opts = ConfigOpts {
+			ark: Some("http://127.0.0.1:3535".into()),
+			esplora: Some("http://127.0.0.1:3002".into()),
+			gap_limit: Some(10_000),
+			..ConfigOpts::default()
+		};
+
+		let config = opts.write_to_file(Network::Signet, &path)
+			.expect("writing the config should succeed");
+
+		assert_eq!(config.vtxo_key_gap_limit, 10_000, "the written config should carry the limit");
+		let written = fs::read_to_string(&path).expect("config file should exist");
+		assert!(written.contains("vtxo_key_gap_limit = 10000"), "unexpected config: {written}");
+
+		// Omitting the flag leaves the network default in place.
+		let bare_path = dir.join("bare.toml");
+		let bare = ConfigOpts { gap_limit: None, ..opts }
+			.write_to_file(Network::Signet, &bare_path)
+			.expect("writing the config should succeed");
+		assert_eq!(bare.vtxo_key_gap_limit, bark::DEFAULT_VTXO_KEY_GAP_LIMIT,
+			"without the flag the default should stand");
+	}
+
+	#[tokio::test]
+	async fn failed_create_keeps_barkd_files() {
+		let dir = tmp_dir();
+		fs::write(dir.join(AUTH_TOKEN_FILE), "tok").unwrap();
+		fs::write(dir.join(BARKD_LOCK_FILE), "42").unwrap();
+
+		create_wallet(&dir, "test", failing_create_opts()).await.unwrap_err();
+
+		assert!(dir.join(AUTH_TOKEN_FILE).exists());
+		assert!(dir.join(BARKD_LOCK_FILE).exists());
+
+		let _ = fs::remove_dir_all(&dir);
+	}
+
+	#[tokio::test]
+	async fn failed_create_removes_empty_datadir() {
+		let dir = tmp_dir();
+
+		create_wallet(&dir, "test", failing_create_opts()).await.unwrap_err();
+
+		assert!(!dir.exists());
+	}
+
+	#[test]
+	fn expected_datadir_files_and_their_temps() {
+		assert!(is_expected_datadir_file("auth_token"));
+		assert!(is_expected_datadir_file("barkd.lock"));
+		// Atomic-write temp siblings, mid-write or left by a crash.
+		assert!(is_expected_datadir_file(".auth_token.temp.42.3.tmp"));
+		assert!(is_expected_datadir_file(".config.toml.temp.42.0.tmp"));
+
+		assert!(!is_expected_datadir_file("mnemonic"));
+		assert!(!is_expected_datadir_file("db.sqlite"));
+		assert!(!is_expected_datadir_file(".mnemonic.temp.42.0.tmp"));
+		assert!(!is_expected_datadir_file("barkd.lock.bak"));
+	}
 }
 
