@@ -991,13 +991,18 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 	// Only the first signature uses the input policy. All remaining signatures
 	// share the checkpoint policy, including an optional isolation fanout.
 	fn signing_pubkeys(&self) -> impl Iterator<Item = PublicKey> + '_ {
+		let aggregate = musig::key_agg([self.user_pubkey(), self.server_pubkey()]);
 		let mut key = None;
 		(0..self.nb_sigs()).map(move |idx| {
 			if idx < 2 {
-				key = Some(musig::tweaked_key_agg(
-					[self.user_pubkey(), self.server_pubkey()],
+				// Apply each policy tweak to the untweaked aggregate independently.
+				let mut tweaked = aggregate;
+				let tweak = secp256k1_musig::Scalar::from_be_bytes(
 					self.taptweak_at(idx).to_byte_array(),
-				).1);
+				).expect("validated Taproot tweak");
+				key = Some(musig::pubkey_from(
+					tweaked.pubkey_xonly_tweak_add(&tweak).expect("valid tweaked signing key"),
+				));
 			}
 			key.expect("the first signature initializes its signing key")
 		})
