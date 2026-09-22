@@ -256,22 +256,11 @@ impl TransferableAdaptorArkoorPackage {
 				return Err(TransferPackageVerificationError::SignatureMaterialCountMismatch);
 			}
 
-			for signature_index in 0..nb_pre_sigs {
-				let aggregate_key = crate::musig::tweaked_key_agg(
-					[
-						package.builder.user_pubkey(),
-						package.builder.server_pubkey(),
-					],
-					package.builder.taptweak_at(signature_index).to_byte_array(),
-				)
-				.1
-				.x_only_public_key()
-				.0;
-
+			for (signature_index, aggregate_key) in package.builder.signing_pubkeys().enumerate() {
 				package.pre_signatures()[signature_index]
 					.verify_adaptor(
 						expected_adaptor_point,
-						aggregate_key,
+						aggregate_key.x_only_public_key().0,
 						package.builder.sighashes[signature_index].to_byte_array(),
 					)
 					.map_err(

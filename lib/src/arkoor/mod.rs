@@ -333,15 +333,12 @@ fn finalize_adaptor_builder(
 	}
 
 	let mut sigs = Vec::with_capacity(pre_signatures.len());
-	for (idx, pre_sig) in pre_signatures.iter().enumerate() {
-		let aggregate_key = musig::tweaked_key_agg(
-			[builder.user_pubkey(), builder.server_pubkey()],
-			builder.taptweak_at(idx).to_byte_array(),
-		).1.x_only_public_key().0;
-
+	for (idx, (pre_sig, aggregate_key)) in pre_signatures.iter()
+		.zip(builder.signing_pubkeys()).enumerate()
+	{
 		sigs.push(pre_sig.finalize_with_secret(
 			secret,
-			aggregate_key,
+			aggregate_key.x_only_public_key().0,
 			builder.sighashes[idx].to_byte_array(),
 		)?);
 	}
@@ -989,6 +986,21 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 
 	fn taptweak_at(&self, idx: usize) -> TapTweakHash {
 		if idx == 0 { self.input_tweak } else { self.checkpoint_policy_tweak }
+	}
+
+	// Only the first signature uses the input policy. All remaining signatures
+	// share the checkpoint policy, including an optional isolation fanout.
+	fn signing_pubkeys(&self) -> impl Iterator<Item = PublicKey> + '_ {
+		let mut key = None;
+		(0..self.nb_sigs()).map(move |idx| {
+			if idx < 2 {
+				key = Some(musig::tweaked_key_agg(
+					[self.user_pubkey(), self.server_pubkey()],
+					self.taptweak_at(idx).to_byte_array(),
+				).1);
+			}
+			key.expect("the first signature initializes its signing key")
+		})
 	}
 
 	fn user_pubkey(&self) -> PublicKey {
